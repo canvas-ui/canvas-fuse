@@ -31,6 +31,9 @@ pub struct MountOptions {
     /// When set, the mount is rooted at this single context (its schema dirs at
     /// the mount's top level, no `Contexts/` wrapper).
     pub context_root: Option<String>,
+    /// When set, mount a workspace's trees (context + directory) read/write,
+    /// mirroring each tree's path hierarchy. Mutually exclusive with contexts.
+    pub workspace: Option<String>,
     /// In-memory blob cache budget for file content, in bytes
     pub blob_cache_bytes: usize,
 }
@@ -83,12 +86,28 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
 
     let names = Arc::new(names::NameStore::open(&opts.data_dir.join("names.redb"))?);
     let api = Arc::new(api::ApiClient::new(&opts.server, &opts.token)?);
-    let tree = Arc::new(RwLock::new(match &opts.context_root {
-        Some(id) => state::Tree::context_rooted(id.clone()),
-        None => state::Tree::new(),
+
+    // Workspace mode roots the mount at a workspace's trees; resolve it up front
+    // so the tree is built in the right mode. Workspace events aren't on the
+    // per-context ws channel, so these mounts refresh via the resync loop.
+    let workspace_mode = opts.workspace.is_some();
+    let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
+        let ws = api
+            .get_workspace(ws_name)
+            .with_context(|| format!("resolving workspace {ws_name}"))?;
+        state::Tree::workspace_rooted(ws.id, ws.name)
+    } else {
+        match &opts.context_root {
+            Some(id) => state::Tree::context_rooted(id.clone()),
+            None => state::Tree::new(),
+        }
     }));
-    let context_filter: Option<HashSet<String>> =
-        opts.contexts.as_ref().map(|c| c.iter().cloned().collect());
+    let enable_ws = opts.enable_ws && !workspace_mode;
+    let context_filter: Option<HashSet<String>> = if workspace_mode {
+        None
+    } else {
+        opts.contexts.as_ref().map(|c| c.iter().cloned().collect())
+    };
 
     // Populate before mounting so the first readdir is already correct.
     // Server being down is not fatal: the resync loop recovers.
@@ -130,7 +149,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     // connects late, or a workspace that starts after mount, still ends up
     // subscribed — the first successful refresh triggers the subscribe.
     let subscriber = events::Subscriber::default();
-    let ensure_subscribed: Option<worker::NewContextCallback> = if opts.enable_ws {
+    let ensure_subscribed: Option<worker::NewContextCallback> = if enable_ws {
         let s = subscriber.clone();
         Some(Box::new(move |ctx_id: &str| s.subscribe(ctx_id)))
     } else {
@@ -153,7 +172,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     // ws supervisor: retries the initial connect until it succeeds, then holds
     // the (auto-reconnecting) client until stop. Survives a server/workspace
     // that is still starting at mount time.
-    if opts.enable_ws {
+    if enable_ws {
         let server = opts.server.clone();
         let token = opts.token.clone();
         let ws_tx = job_tx.clone();

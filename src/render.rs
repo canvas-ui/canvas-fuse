@@ -33,6 +33,24 @@ impl Rendered {
     }
 }
 
+/// Flat rendering for workspace tree mounts: a document maps to a single file
+/// in its path's directory (no schema-bucket subdir). The display name prefers
+/// `data.filename` (set by our own writes so re-saves round-trip to the same
+/// doc), else the per-schema base name. Content is identical to `render()`.
+pub fn flat(doc: &Document) -> (String, Content) {
+    let r = render(doc);
+    if let Some(name) = doc
+        .data
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return (sanitize_filename(name), r.content);
+    }
+    (r.base_name, r.content)
+}
+
 pub fn render(doc: &Document) -> Rendered {
     match doc.schema.as_str() {
         "data/abstraction/tab" => render_link(doc, "Tabs"),

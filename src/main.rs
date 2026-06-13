@@ -58,6 +58,12 @@ enum Command {
         #[arg(short = 'c', long = "context")]
         contexts: Vec<String>,
 
+        /// Mount a whole workspace's trees (read/write) instead of contexts.
+        /// Mirrors each tree's folder hierarchy; supports markdown + folder
+        /// create/rename/remove. Mutually exclusive with --context.
+        #[arg(short = 'w', long = "workspace", conflicts_with = "contexts")]
+        workspace: Option<String>,
+
         /// Run in the background (logs to the state dir)
         #[arg(short = 'd', long)]
         detach: bool,
@@ -121,6 +127,7 @@ fn main() -> Result<()> {
             mountpoint,
             connect,
             contexts,
+            workspace,
             detach,
             no_ws,
             resync,
@@ -130,6 +137,7 @@ fn main() -> Result<()> {
             mountpoint,
             connect,
             contexts,
+            workspace,
             detach,
             no_ws,
             resync,
@@ -153,6 +161,7 @@ fn cmd_mount(
     mountpoint: PathBuf,
     connect: ConnectArgs,
     contexts: Vec<String>,
+    workspace: Option<String>,
     detach: bool,
     no_ws: bool,
     resync: u64,
@@ -161,17 +170,18 @@ fn cmd_mount(
 ) -> Result<()> {
     let endpoint = connect.endpoint()?;
 
-    // A single -c <ctx> roots the mount at that context: the given path is the
-    // parent, and we mount at <path>/<ctx> with the context's schema dirs at the
-    // top level. Multiple/no -c stays a global mount at the given path.
-    let context_root = if contexts.len() == 1 {
+    // -w <ws> roots the mount at a workspace: we mount at <path>/<ws> with the
+    // workspace's trees at the top level. Otherwise a single -c <ctx> roots at
+    // that context; multiple/no -c stays a global mount at the given path.
+    let context_root = if workspace.is_none() && contexts.len() == 1 {
         Some(contexts[0].clone())
     } else {
         None
     };
-    let mountpoint = match &context_root {
-        Some(ctx) => mountpoint.join(ctx),
-        None => mountpoint,
+    let mountpoint = match (&workspace, &context_root) {
+        (Some(ws), _) => mountpoint.join(ws),
+        (None, Some(ctx)) => mountpoint.join(ctx),
+        (None, None) => mountpoint,
     };
 
     // Canonicalize before any daemonize/fork so relative paths stay valid
@@ -194,7 +204,10 @@ fn cmd_mount(
                 .unwrap_or("server")
                 .to_string()
         });
-        runtime::mount_data_dir(&remote_label, &contexts, &mountpoint)
+        match &workspace {
+            Some(ws) => runtime::workspace_data_dir(&remote_label, ws),
+            None => runtime::mount_data_dir(&remote_label, &contexts, &mountpoint),
+        }
     });
 
     // Refuse to steal a mountpoint from a live daemon
@@ -251,6 +264,7 @@ fn cmd_mount(
             Some(contexts.clone())
         },
         context_root: context_root.clone(),
+        workspace: workspace.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
     })?;
 

@@ -58,6 +58,10 @@ impl Worker {
     }
 
     pub fn refresh_all(&self) {
+        if self.tree.read().is_workspace() {
+            self.refresh_workspace();
+            return;
+        }
         let mut contexts = match self.api.list_contexts() {
             Ok(c) => c,
             Err(e) => {
@@ -76,6 +80,62 @@ impl Worker {
         let _ = added; // subscription now happens after a successful per-context refresh
         for ctx in &contexts {
             self.refresh_context(&ctx.id);
+        }
+    }
+
+    /// Workspace mount refresh: reconcile trees, each tree's path hierarchy,
+    /// then the documents at every path. Held under the write-sync lock so a
+    /// concurrent write doesn't get diffed away mid-mutation.
+    fn refresh_workspace(&self) {
+        let ws = match self.tree.read().ws_id() {
+            Some(id) => id,
+            None => return,
+        };
+        let _guard = self.refresh_lock.as_ref().map(|l| l.lock());
+
+        let trees = match self.api.list_trees(&ws) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("workspace {ws}: tree list fetch failed: {e:#}");
+                return;
+            }
+        };
+        let inv = self.tree.write().apply_trees(&trees);
+        self.notify(inv);
+
+        // Reconcile each tree's directory hierarchy from its path list.
+        for t in &trees {
+            match self.api.list_tree_paths(&ws, &t.id) {
+                Ok(paths) => {
+                    let inv = self.tree.write().apply_tree_paths(&t.name, &paths);
+                    self.notify(inv);
+                }
+                Err(e) => log::warn!("workspace {ws} tree {}: paths fetch failed: {e:#}", t.name),
+            }
+        }
+
+        // Populate documents at every known path.
+        for (tree_name, path) in self.tree.read().ws_paths() {
+            let Some((tree_id, tree_type)) = self.tree.read().ws_tree_meta(&tree_name) else {
+                continue;
+            };
+            match self
+                .api
+                .list_tree_documents(&ws, &tree_id, &tree_type, &path)
+            {
+                Ok(docs) => {
+                    let inv = self
+                        .tree
+                        .write()
+                        .apply_tree_documents(&tree_name, &path, &docs);
+                    self.notify(inv);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "workspace {ws} tree {tree_name} path {path}: docs fetch failed: {e:#}"
+                    )
+                }
+            }
         }
     }
 

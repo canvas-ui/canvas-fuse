@@ -195,6 +195,41 @@ impl Filesystem for CanvasFs {
         }
     }
 
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        log::debug!("fs mkdir parent={parent} name={name}");
+        match self.writes.mkdir(parent, name) {
+            Ok(ino) => {
+                let attr = self.file_attr(ino, 0, SystemTime::now(), true);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+        log::debug!("fs rmdir parent={parent} name={name}");
+        match self.writes.rmdir(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
     fn write(
         &mut self,
         _req: &Request<'_>,

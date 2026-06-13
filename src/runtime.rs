@@ -69,6 +69,18 @@ pub fn mount_data_dir(remote: &str, contexts: &[String], mountpoint: &Path) -> P
     }
 }
 
+/// Per-mount state dir for a workspace mount, keyed by workspace name so sticky
+/// names persist across remounts of the same workspace.
+pub fn workspace_data_dir(remote: &str, workspace: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".canvas")
+        .join(sanitize_segment(remote))
+        .join("fuse")
+        .join("workspaces")
+        .join(sanitize_segment(workspace))
+}
+
 fn state_file_for(mountpoint: &Path) -> PathBuf {
     // Readable prefix + short hash to avoid collisions after sanitizing
     let raw = mountpoint.to_string_lossy();

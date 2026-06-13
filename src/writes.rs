@@ -30,6 +30,23 @@ enum FlushTarget {
         dir_ino: u64,
         name: String,
     },
+    /// Update an existing document in a workspace tree path
+    WsExisting {
+        tree_name: String,
+        tree_id: String,
+        tree_type: String,
+        path: String,
+        doc_id: u64,
+    },
+    /// Create a new document in a workspace tree path on first flush
+    WsCreate {
+        tree_name: String,
+        tree_id: String,
+        tree_type: String,
+        path: String,
+        dir_ino: u64,
+        name: String,
+    },
 }
 
 struct OpenWrite {
@@ -188,31 +205,47 @@ impl WriteStore {
 
     /// Prepare a write state for an existing tree file (open with write access).
     pub fn open_existing(&self, ino: u64, truncate: bool) -> WResult<()> {
-        let (parent, content) = {
+        let content = {
             let tree = self.tree.read();
             let node = tree.get(ino).ok_or(WriteError::NotFound)?;
             if node.is_dir() {
                 return Err(WriteError::NotPermitted);
             }
-            let content = match &node.content {
+            match &node.content {
                 crate::state::NodeContent::Inline(bytes) => bytes.as_ref().clone(),
                 _ => return Err(WriteError::NotPermitted), // blobs are read-only
-            };
-            (node.parent, content)
+            }
         };
-        let (ctx, dir) = self.writable_dir(parent).ok_or(WriteError::NotPermitted)?;
-        let (_, doc_id) = self
-            .tree
-            .read()
-            .doc_for_ino(ino)
-            .ok_or(WriteError::NotPermitted)?; // .context.json etc. have no doc
+        let target = if self.tree.read().is_workspace() {
+            let (tree_name, tree_id, tree_type, path, doc_id) = self
+                .tree
+                .read()
+                .tree_file(ino)
+                .ok_or(WriteError::NotPermitted)?;
+            FlushTarget::WsExisting {
+                tree_name,
+                tree_id,
+                tree_type,
+                path,
+                doc_id,
+            }
+        } else {
+            let parent = self.tree.read().get(ino).map(|n| n.parent).unwrap_or(0);
+            let (ctx, dir) = self.writable_dir(parent).ok_or(WriteError::NotPermitted)?;
+            let (_, doc_id) = self
+                .tree
+                .read()
+                .doc_for_ino(ino)
+                .ok_or(WriteError::NotPermitted)?; // .context.json etc. have no doc
+            FlushTarget::Existing { ctx, dir, doc_id }
+        };
 
         let mut inner = self.inner.lock();
         let state = inner.states.entry(ino).or_insert_with(|| OpenWrite {
             buffer: content,
             dirty: false,
             refs: 0,
-            target: FlushTarget::Existing { ctx, dir, doc_id },
+            target,
         });
         state.refs += 1;
         if truncate {
@@ -235,7 +268,32 @@ impl WriteStore {
     }
 
     pub fn create(&self, dir_ino: u64, name: &str) -> WResult<OverlayEntry> {
-        let (ctx, dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
+        let target = if self.tree.read().is_workspace() {
+            let (tree_name, tree_id, tree_type, path) = self
+                .tree
+                .read()
+                .locate_tree_dir(dir_ino)
+                .ok_or(WriteError::NotPermitted)?;
+            if ws_doc_schema(name).is_none() {
+                return Err(WriteError::NotPermitted); // only .md / .todo.json / .url
+            }
+            FlushTarget::WsCreate {
+                tree_name,
+                tree_id,
+                tree_type,
+                path,
+                dir_ino,
+                name: name.to_string(),
+            }
+        } else {
+            let (ctx, dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
+            FlushTarget::Create {
+                ctx,
+                dir,
+                dir_ino,
+                name: name.to_string(),
+            }
+        };
         if self.tree.read().lookup(dir_ino, name).is_some() {
             return Err(WriteError::Exists);
         }
@@ -257,12 +315,7 @@ impl WriteStore {
                 buffer: Vec::new(),
                 dirty: true,
                 refs: 1,
-                target: FlushTarget::Create {
-                    ctx,
-                    dir,
-                    dir_ino,
-                    name: name.to_string(),
-                },
+                target,
             },
         );
         Ok(OverlayEntry {
@@ -337,7 +390,10 @@ impl WriteStore {
             // defer empty creates to the final flush (where `touch` needs them).
             if !final_flush
                 && state.buffer.is_empty()
-                && matches!(state.target, FlushTarget::Create { .. })
+                && matches!(
+                    state.target,
+                    FlushTarget::Create { .. } | FlushTarget::WsCreate { .. }
+                )
             {
                 return Ok(());
             }
@@ -363,6 +419,42 @@ impl WriteStore {
                             state.target = FlushTarget::Existing {
                                 ctx: ctx.clone(),
                                 dir: dir.clone(),
+                                doc_id,
+                            };
+                        }
+                        inner.overlay.remove(&ino);
+                        inner.overlay_names.remove(&(*dir_ino, name.clone()));
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            FlushTarget::WsExisting {
+                tree_name,
+                tree_id,
+                tree_type,
+                path,
+                doc_id,
+            } => self.flush_ws_update(tree_name, tree_id, tree_type, path, *doc_id, &buffer),
+            FlushTarget::WsCreate {
+                tree_name,
+                tree_id,
+                tree_type,
+                path,
+                dir_ino,
+                name,
+            } => {
+                match self.flush_ws_create(
+                    tree_name, tree_id, tree_type, path, *dir_ino, name, &buffer, ino,
+                ) {
+                    Ok(doc_id) => {
+                        let mut inner = self.inner.lock();
+                        if let Some(state) = inner.states.get_mut(&ino) {
+                            state.target = FlushTarget::WsExisting {
+                                tree_name: tree_name.clone(),
+                                tree_id: tree_id.clone(),
+                                tree_type: tree_type.clone(),
+                                path: path.clone(),
                                 doc_id,
                             };
                         }
@@ -407,9 +499,8 @@ impl WriteStore {
 
     pub fn unlink(&self, dir_ino: u64, name: &str) -> WResult<()> {
         let _sync = self.sync.lock();
-        let (ctx, _dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
 
-        // Pending overlay file: purely local
+        // Pending overlay file: purely local, applies to either mode.
         {
             let mut inner = self.inner.lock();
             if let Some(ino) = inner.overlay_names.remove(&(dir_ino, name.to_string())) {
@@ -418,6 +509,11 @@ impl WriteStore {
                 return Ok(());
             }
         }
+
+        if self.tree.read().is_workspace() {
+            return self.unlink_ws(dir_ino, name);
+        }
+        let (ctx, _dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
 
         let ino = {
             let tree = self.tree.read();
@@ -452,6 +548,9 @@ impl WriteStore {
         dst_dir: u64,
         dst_name: &str,
     ) -> WResult<()> {
+        if self.tree.read().is_workspace() {
+            return self.rename_ws(src_dir, src_name, dst_dir, dst_name);
+        }
         if src_dir != dst_dir {
             // EXDEV makes `mv` fall back to copy+unlink, which composes from
             // primitives we already support
@@ -571,6 +670,359 @@ impl WriteStore {
                 Ok(())
             }
         }
+    }
+
+    // ── workspace tree write path ─────────────────────────────────────────────
+
+    /// Create a directory node (mkdir) — inserts a tree path on the server.
+    pub fn mkdir(&self, parent_ino: u64, name: &str) -> WResult<u64> {
+        let _sync = self.sync.lock();
+        let (tree_name, tree_id, _tt, parent_path) = self
+            .tree
+            .read()
+            .locate_tree_dir(parent_ino)
+            .ok_or(WriteError::NotPermitted)?;
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+        if self.tree.read().lookup(parent_ino, name).is_some() {
+            return Err(WriteError::Exists);
+        }
+        let child = join_path(&parent_path, name);
+        self.api
+            .insert_tree_path(&ws, &tree_id, &child)
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        let ino = self
+            .tree
+            .write()
+            .adopt_tree_dir(parent_ino, name, &tree_name, &child);
+        Ok(ino)
+    }
+
+    /// Remove a directory node (rmdir) — removes the tree path on the server.
+    pub fn rmdir(&self, parent_ino: u64, name: &str) -> WResult<()> {
+        let _sync = self.sync.lock();
+        let (_tn, tree_id, _tt, _pp) = self
+            .tree
+            .read()
+            .locate_tree_dir(parent_ino)
+            .ok_or(WriteError::NotPermitted)?;
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+        let child_ino = self
+            .tree
+            .read()
+            .lookup(parent_ino, name)
+            .map(|n| n.ino)
+            .ok_or(WriteError::NotFound)?;
+        let (_tn2, _id2, _tt2, child_path) = self
+            .tree
+            .read()
+            .locate_tree_dir(child_ino)
+            .ok_or(WriteError::NotPermitted)?;
+        self.api
+            .remove_tree_path(&ws, &tree_id, &child_path, true)
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        // The kernel drops the dentry itself on a successful rmdir; we only need
+        // to keep our local view consistent.
+        let _ = self.tree.write().remove_tree_dir(child_ino);
+        Ok(())
+    }
+
+    fn unlink_ws(&self, dir_ino: u64, name: &str) -> WResult<()> {
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+        let ino = self
+            .tree
+            .read()
+            .lookup(dir_ino, name)
+            .map(|n| n.ino)
+            .ok_or(WriteError::NotFound)?;
+        let (_tn, tree_id, tree_type, path, doc_id) = self
+            .tree
+            .read()
+            .tree_file(ino)
+            .ok_or(WriteError::NotPermitted)?;
+        // `rm` detaches the document from this tree path (safe default), never
+        // destroys — it survives in the DB and any other path it's linked into.
+        self.api
+            .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[doc_id])
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        self.tree.write().remove_tree_file(ino);
+        self.inner.lock().states.remove(&ino);
+        Ok(())
+    }
+
+    fn rename_ws(&self, src_dir: u64, src_name: &str, dst_dir: u64, dst_name: &str) -> WResult<()> {
+        let _sync = self.sync.lock();
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+
+        // Pending create renamed before close (editor tmp -> target).
+        let src_overlay = self
+            .inner
+            .lock()
+            .overlay_names
+            .get(&(src_dir, src_name.to_string()))
+            .copied();
+        if let Some(src_ino) = src_overlay {
+            let (tree_name, tree_id, tree_type, path) = self
+                .tree
+                .read()
+                .locate_tree_dir(dst_dir)
+                .ok_or(WriteError::NotPermitted)?;
+            let dst_doc = self
+                .tree
+                .read()
+                .lookup(dst_dir, dst_name)
+                .and_then(|n| self.tree.read().tree_file(n.ino))
+                .map(|(_, _, _, _, id)| id);
+            let mut inner = self.inner.lock();
+            inner.overlay_names.remove(&(src_dir, src_name.to_string()));
+            if let Some(entry) = inner.overlay.get_mut(&src_ino) {
+                entry.0 = dst_dir;
+                entry.1 = dst_name.to_string();
+            }
+            match dst_doc {
+                Some(doc_id) => {
+                    if let Some(state) = inner.states.get_mut(&src_ino) {
+                        state.target = FlushTarget::WsExisting {
+                            tree_name,
+                            tree_id,
+                            tree_type,
+                            path,
+                            doc_id,
+                        };
+                        state.dirty = true;
+                    }
+                }
+                None => {
+                    inner
+                        .overlay_names
+                        .insert((dst_dir, dst_name.to_string()), src_ino);
+                    if let Some(state) = inner.states.get_mut(&src_ino) {
+                        if let FlushTarget::WsCreate {
+                            tree_name: tn,
+                            tree_id: ti,
+                            tree_type: tt,
+                            path: p,
+                            dir_ino,
+                            name,
+                        } = &mut state.target
+                        {
+                            *tn = tree_name;
+                            *ti = tree_id;
+                            *tt = tree_type;
+                            *p = path;
+                            *dir_ino = dst_dir;
+                            *name = dst_name.to_string();
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let src_ino = self
+            .tree
+            .read()
+            .lookup(src_dir, src_name)
+            .map(|n| n.ino)
+            .ok_or(WriteError::NotFound)?;
+        let src_is_dir = self
+            .tree
+            .read()
+            .get(src_ino)
+            .map(|n| n.is_dir())
+            .unwrap_or(false);
+
+        if src_is_dir {
+            // Folder rename. Cross-parent moves fall back to copy+unlink (EXDEV);
+            // same-parent rename maps to a tree path move.
+            if src_dir != dst_dir {
+                return Err(WriteError::CrossDir);
+            }
+            if self.tree.read().lookup(dst_dir, dst_name).is_some() {
+                return Err(WriteError::Exists);
+            }
+            let (tree_name, tree_id, _tt, src_path) = self
+                .tree
+                .read()
+                .locate_tree_dir(src_ino)
+                .ok_or(WriteError::NotPermitted)?;
+            let parent = parent_of(&src_path);
+            let dst_path = join_path(&parent, dst_name);
+            self.api
+                .move_tree_path(&ws, &tree_id, &src_path, &dst_path)
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            self.tree
+                .write()
+                .rename_tree_path(src_ino, dst_name, &tree_name);
+            return Ok(());
+        }
+
+        // A document file rename.
+        let (tree_name, tree_id, tree_type, path, src_doc) = self
+            .tree
+            .read()
+            .tree_file(src_ino)
+            .ok_or(WriteError::NotPermitted)?;
+        if src_dir != dst_dir {
+            return Err(WriteError::CrossDir); // mv falls back to copy+unlink
+        }
+        let dst_ino = self.tree.read().lookup(dst_dir, dst_name).map(|n| n.ino);
+
+        match dst_ino {
+            None => {
+                // Plain rename: pin the new filename so the view round-trips.
+                self.ws_set_filename(&ws, &tree_id, &tree_type, &path, src_doc, dst_name)?;
+                self.tree.write().rename_entry(src_ino, dst_name);
+                Ok(())
+            }
+            Some(dst_ino) => {
+                // Overwrite-rename (atomic save): copy src content into dst's
+                // doc, detach src. POSIX requires the dst NAME to carry the SRC
+                // inode afterwards, so the surviving node lives at src_ino.
+                let (_n, _i, _t, _p, dst_doc) = self
+                    .tree
+                    .read()
+                    .tree_file(dst_ino)
+                    .ok_or(WriteError::NotPermitted)?;
+                let content = match self.tree.read().get(src_ino).map(|n| n.content.clone()) {
+                    Some(crate::state::NodeContent::Inline(b)) => b.as_ref().clone(),
+                    _ => return Err(WriteError::NotPermitted),
+                };
+                self.flush_ws_update(&tree_name, &tree_id, &tree_type, &path, dst_doc, &content)?;
+                self.ws_set_filename(&ws, &tree_id, &tree_type, &path, dst_doc, dst_name)?;
+                self.api
+                    .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[src_doc])
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                {
+                    let mut tree = self.tree.write();
+                    tree.remove_tree_file(dst_ino);
+                    tree.rename_entry(src_ino, dst_name);
+                    tree.rebind_tree_file(src_ino, dst_doc);
+                    tree.set_inline_content(src_ino, Arc::new(content));
+                }
+                let mut inner = self.inner.lock();
+                if let Some(state) = inner.states.get_mut(&src_ino) {
+                    state.target = FlushTarget::WsExisting {
+                        tree_name,
+                        tree_id,
+                        tree_type,
+                        path,
+                        doc_id: dst_doc,
+                    };
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// GET-merge-PUT just the `data.filename` of a workspace document.
+    fn ws_set_filename(
+        &self,
+        ws: &str,
+        tree_id: &str,
+        tree_type: &str,
+        path: &str,
+        doc_id: u64,
+        filename: &str,
+    ) -> WResult<()> {
+        let existing = self
+            .api
+            .get_workspace_document(ws, doc_id)
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        let schema = existing
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("data/abstraction/note")
+            .to_string();
+        let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
+        data["filename"] = json!(filename);
+        self.api
+            .update_workspace_documents(
+                ws,
+                tree_id,
+                tree_type,
+                path,
+                vec![json!({ "id": doc_id, "schema": schema, "data": data })],
+            )
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        Ok(())
+    }
+
+    fn flush_ws_update(
+        &self,
+        tree_name: &str,
+        tree_id: &str,
+        tree_type: &str,
+        path: &str,
+        doc_id: u64,
+        buffer: &[u8],
+    ) -> WResult<()> {
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+        let existing = self
+            .api
+            .get_workspace_document(&ws, doc_id)
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        let schema = existing
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("data/abstraction/note")
+            .to_string();
+        let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
+        let dir = if schema.ends_with("todo") {
+            "Todos"
+        } else {
+            "Notes"
+        };
+        apply_buffer_to_data(dir, &mut data, buffer);
+        self.api
+            .update_workspace_documents(
+                &ws,
+                tree_id,
+                tree_type,
+                path,
+                vec![json!({ "id": doc_id, "schema": schema, "data": data })],
+            )
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+
+        let ino = self.tree.read().ws_ino_for_doc(tree_name, path, doc_id);
+        if let Some(ino) = ino {
+            self.tree
+                .write()
+                .set_inline_content(ino, Arc::new(buffer.to_vec()));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flush_ws_create(
+        &self,
+        tree_name: &str,
+        tree_id: &str,
+        tree_type: &str,
+        path: &str,
+        dir_ino: u64,
+        name: &str,
+        buffer: &[u8],
+        ino: u64,
+    ) -> WResult<u64> {
+        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+        let doc = build_ws_document(name, buffer).ok_or(WriteError::NotPermitted)?;
+        let ids = self
+            .api
+            .put_tree_document(&ws, tree_id, tree_type, path, doc)
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        let doc_id = *ids
+            .first()
+            .ok_or_else(|| WriteError::Io("create returned no document id".to_string()))?;
+        self.tree.write().adopt_tree_file(
+            dir_ino,
+            name,
+            tree_name,
+            path,
+            doc_id,
+            ino,
+            Arc::new(buffer.to_vec()),
+        );
+        Ok(doc_id)
     }
 
     // ── server I/O ───────────────────────────────────────────────────────────
@@ -705,6 +1157,91 @@ fn build_new_document(dir: &str, name: &str, buffer: &[u8]) -> Value {
             })
         }
     }
+}
+
+/// Join a normalized parent path with a child name ("/" + "x" -> "/x").
+fn join_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Parent of a normalized path ("/a/b" -> "/a", "/a" -> "/").
+fn parent_of(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((head, _)) if !head.is_empty() => head.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
+/// Schema a writable filename maps to in a workspace tree, or None if the
+/// extension isn't one we materialize as an editable document.
+fn ws_doc_schema(name: &str) -> Option<&'static str> {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".todo.json") {
+        Some("data/abstraction/todo")
+    } else if lower.ends_with(".md") {
+        Some("data/abstraction/note")
+    } else if lower.ends_with(".url") {
+        Some("data/abstraction/tab")
+    } else {
+        None
+    }
+}
+
+/// Build a new workspace document from a filename + body. `data.filename` pins
+/// the on-disk name so re-saves round-trip to the same document.
+fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
+    let schema = ws_doc_schema(name)?;
+    let text = String::from_utf8_lossy(buffer);
+    match schema {
+        "data/abstraction/todo" => {
+            let stem = name.strip_suffix(".todo.json").unwrap_or(name);
+            let (mut title, done, description) = parse_todo_markdown(&text);
+            if title.is_empty() {
+                title = stem.to_string();
+            }
+            let mut data = json!({ "title": title, "completed": done, "filename": name });
+            if let Some(d) = description {
+                data["description"] = json!(d);
+            }
+            Some(json!({ "schema": schema, "data": data }))
+        }
+        "data/abstraction/tab" => {
+            let stem = name.strip_suffix(".url").unwrap_or(name);
+            let url = extract_url(&text)?;
+            Some(json!({
+                "schema": schema,
+                "data": { "title": stem, "url": url, "filename": name }
+            }))
+        }
+        _ => {
+            let stem = name.strip_suffix(".md").unwrap_or(name);
+            let title = first_markdown_h1(&text).unwrap_or_else(|| stem.to_string());
+            Some(json!({
+                "schema": schema,
+                "data": { "title": title, "content": text, "filename": name }
+            }))
+        }
+    }
+}
+
+/// Extract a URL from a plain line or a Windows [InternetShortcut] body.
+fn extract_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.split_whitespace().next().map(str::to_string);
+    }
+    for line in trimmed.lines() {
+        if let Some(rest) = line.trim().strip_prefix("URL=") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// First ATX H1 ("# Title") in a markdown body, scanning the whole document and
