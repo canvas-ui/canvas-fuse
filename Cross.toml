@@ -1,0 +1,8 @@
+# Vendored OpenSSL (pulled in by rust_socketio's native-tls) is compiled from
+# source inside the cross image, which needs perl + make. Install them per
+# target before the build.
+[target.x86_64-unknown-linux-musl]
+pre-build = ["apt-get update && apt-get install -y --no-install-recommends perl make"]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = ["apt-get update && apt-get install -y --no-install-recommends perl make"]

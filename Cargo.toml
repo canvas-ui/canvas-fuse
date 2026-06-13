@@ -16,10 +16,15 @@ path = "src/main.rs"
 # default-features off: skip libfuse linkage, mount via fusermount3 directly
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust_socketio = "0.6"
+# rust_socketio/rust_engineio hardcode native-tls (no rustls feature). Rather
+# than carry two TLS stacks, reqwest also uses native-tls (its default) and we
+# vendor OpenSSL — compiled statically from source per target — so cross/musl/
+# macOS builds need no system OpenSSL sysroot.
+openssl = { version = "0.10", features = ["vendored"] }
 redb = "2"
 clap = { version = "4", features = ["derive", "env"] }
 parking_lot = "0.12"

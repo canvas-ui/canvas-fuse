@@ -39,12 +39,15 @@ jobs:
         include:
           # Linux: dynamic glibc build (smallest, needs host glibc) and a
           # fully static musl build (download-and-run on any Linux — fuser is
-          # built without libfuse linkage, rustls instead of OpenSSL, so the
+          # built without libfuse linkage and OpenSSL is vendored static, so the
           # only runtime dependency is the fusermount3 helper at mount time).
+          # musl + aarch64 go through `cross` so the per-target C toolchain (and
+          # perl/make for vendored OpenSSL, see Cross.toml) is available.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
@@ -68,10 +71,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cross
         if: matrix.cross
