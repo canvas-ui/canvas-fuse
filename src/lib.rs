@@ -28,6 +28,9 @@ pub struct MountOptions {
     pub resync_secs: u64,
     /// Only materialize these context ids (None = all accessible contexts)
     pub contexts: Option<Vec<String>>,
+    /// When set, the mount is rooted at this single context (its schema dirs at
+    /// the mount's top level, no `Contexts/` wrapper).
+    pub context_root: Option<String>,
     /// In-memory blob cache budget for file content, in bytes
     pub blob_cache_bytes: usize,
 }
@@ -36,7 +39,6 @@ pub struct MountOptions {
 /// ws client, refresh threads, and the kernel mount itself.
 pub struct MountHandle {
     session: Option<fuser::BackgroundSession>,
-    ws: Option<events::EventClient>,
     job_tx: Sender<worker::Job>,
     stop: Arc<AtomicBool>,
     pub mountpoint: PathBuf,
@@ -52,16 +54,13 @@ impl MountHandle {
     }
 
     fn teardown(&mut self) {
+        // Signals the ws supervisor and resync threads to stop; the supervisor
+        // disconnects its ws client on seeing this.
         self.stop.store(true, Ordering::Relaxed);
-        // Kernel mount first — the user-visible part must not wait on network
-        // cleanup; rust_socketio teardown can block on its reconnect thread
         if let Some(session) = self.session.take() {
             drop(session); // joins the FUSE thread and unmounts
         }
         log::info!("unmounted {}", self.mountpoint.display());
-        if let Some(ws) = self.ws.take() {
-            ws.disconnect();
-        }
     }
 }
 
@@ -84,7 +83,10 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
 
     let names = Arc::new(names::NameStore::open(&opts.data_dir.join("names.redb"))?);
     let api = Arc::new(api::ApiClient::new(&opts.server, &opts.token)?);
-    let tree = Arc::new(RwLock::new(state::Tree::new()));
+    let tree = Arc::new(RwLock::new(match &opts.context_root {
+        Some(id) => state::Tree::context_rooted(id.clone()),
+        None => state::Tree::new(),
+    }));
     let context_filter: Option<HashSet<String>> =
         opts.contexts.as_ref().map(|c| c.iter().cloned().collect());
 
@@ -122,26 +124,21 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let ws = if opts.enable_ws {
-        match events::connect(&opts.server, &opts.token, job_tx.clone(), tree.clone()) {
-            Ok(ws) => Some(ws),
-            Err(e) => {
-                log::warn!("ws connect failed, falling back to polling only: {e:#}");
-                None
-            }
-        }
+    // Subscriber is created up front and shared: the worker subscribes newly
+    // discovered contexts through it (on_new_context), and the ws supervisor
+    // fills its client slot whenever the connection comes up. So a ws that
+    // connects late (server/workspace still starting) still ends up subscribed.
+    let subscriber = events::Subscriber::default();
+    let on_new_context: Option<worker::NewContextCallback> = if opts.enable_ws {
+        let s = subscriber.clone();
+        Some(Box::new(move |ctx_id: &str| s.subscribe(ctx_id)))
     } else {
         None
     };
 
-    let on_new_context: Option<worker::NewContextCallback> = ws.as_ref().map(|ws| {
-        let subscriber = ws.subscriber.clone();
-        Box::new(move |ctx_id: &str| subscriber.subscribe(ctx_id)) as _
-    });
-
     let worker = worker::Worker {
         api,
-        tree,
+        tree: tree.clone(),
         names,
         notifier: Some(session.notifier()),
         on_new_context,
@@ -151,6 +148,20 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     std::thread::Builder::new()
         .name("canvas-fuse-worker".into())
         .spawn(move || worker.run(job_rx))?;
+
+    // ws supervisor: retries the initial connect until it succeeds, then holds
+    // the (auto-reconnecting) client until stop. Survives a server/workspace
+    // that is still starting at mount time.
+    if opts.enable_ws {
+        let server = opts.server.clone();
+        let token = opts.token.clone();
+        let ws_tx = job_tx.clone();
+        let ws_tree = tree.clone();
+        let ws_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("canvas-fuse-ws".into())
+            .spawn(move || events::supervise(server, token, ws_tx, ws_tree, subscriber, ws_stop))?;
+    }
 
     // Periodic resync: belt and braces under ws, sole refresh path without it
     let resync_tx = job_tx.clone();
@@ -170,7 +181,6 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
 
     Ok(MountHandle {
         session: Some(session),
-        ws,
         job_tx,
         stop,
         mountpoint: opts.mountpoint,

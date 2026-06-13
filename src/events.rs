@@ -60,9 +60,8 @@ pub fn connect(
     token: &str,
     tx: Sender<Job>,
     tree: Arc<RwLock<Tree>>,
+    subscriber: Subscriber,
 ) -> Result<EventClient> {
-    let subscriber = Subscriber::default();
-
     let sub_slot = subscriber.clone();
     let auth_tree = tree;
     let auth_tx = tx.clone();
@@ -119,4 +118,59 @@ pub fn connect(
         .connect()?;
 
     Ok(EventClient { client, subscriber })
+}
+
+/// Supervise the ws connection: retry the initial connect with backoff until it
+/// succeeds (a server/workspace still starting up must not leave the mount
+/// permanently ws-less). Once connected, rust_socketio auto-reconnects, so we
+/// just hold the client alive until `stop`. The shared `subscriber` means the
+/// worker's on_new_context subscribes correctly whenever the ws comes up.
+pub fn supervise(
+    server: String,
+    token: String,
+    tx: Sender<Job>,
+    tree: Arc<RwLock<Tree>>,
+    subscriber: Subscriber,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let mut delay = Duration::from_secs(1);
+    let client = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match connect(
+            &server,
+            &token,
+            tx.clone(),
+            tree.clone(),
+            subscriber.clone(),
+        ) {
+            Ok(c) => break c,
+            Err(e) => {
+                log::warn!(
+                    "ws connect failed ({e:#}); retrying in {}s (resync still covers updates)",
+                    delay.as_secs()
+                );
+                // Sleep in short steps so stop is honored promptly
+                let mut slept = Duration::ZERO;
+                while slept < delay {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    slept += Duration::from_millis(250);
+                }
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    };
+    log::info!("ws connected");
+    // Hold the client alive (dropping it disconnects) until teardown.
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    client.disconnect();
 }

@@ -76,6 +76,11 @@ pub struct Tree {
     ctx_inos: HashMap<String, u64>,
     /// context id -> workspaceId, needed to address the content route
     ctx_workspaces: HashMap<String, String>,
+    /// When set, the mount is rooted at a single context: that context's schema
+    /// dirs hang directly off ROOT (no `Contexts/<id>` wrapper), so mounting
+    /// `-c mbag <path>` yields `<path>/mbag/{Notes,Tabs,…}`. None = global mount
+    /// (root holds `Contexts/`, and later `Workspaces/`).
+    context_root: Option<String>,
 }
 
 impl Default for Tree {
@@ -85,23 +90,10 @@ impl Default for Tree {
 }
 
 impl Tree {
+    /// Global mount: root holds the `Contexts/` directory.
     pub fn new() -> Self {
-        let mut t = Self {
-            nodes: HashMap::new(),
-            children: HashMap::new(),
-            next_ino: FIRST_DYNAMIC_INO,
-            doc_inos: HashMap::new(),
-            ctx_inos: HashMap::new(),
-            ctx_workspaces: HashMap::new(),
-        };
+        let mut t = Self::bare(None);
         let now = SystemTime::now();
-        t.insert_node(Node {
-            ino: ROOT_INO,
-            parent: ROOT_INO,
-            name: String::new(),
-            mtime: now,
-            content: NodeContent::Dir,
-        });
         t.insert_node(Node {
             ino: CONTEXTS_INO,
             parent: ROOT_INO,
@@ -110,6 +102,42 @@ impl Tree {
             content: NodeContent::Dir,
         });
         t
+    }
+
+    /// Single-context mount: the context's schema dirs are materialized directly
+    /// under ROOT (no `Contexts/` wrapper, no per-context dir).
+    pub fn context_rooted(ctx_id: String) -> Self {
+        Self::bare(Some(ctx_id))
+    }
+
+    fn bare(context_root: Option<String>) -> Self {
+        let mut t = Self {
+            nodes: HashMap::new(),
+            children: HashMap::new(),
+            next_ino: FIRST_DYNAMIC_INO,
+            doc_inos: HashMap::new(),
+            ctx_inos: HashMap::new(),
+            ctx_workspaces: HashMap::new(),
+            context_root,
+        };
+        t.insert_node(Node {
+            ino: ROOT_INO,
+            parent: ROOT_INO,
+            name: String::new(),
+            mtime: SystemTime::now(),
+            content: NodeContent::Dir,
+        });
+        t
+    }
+
+    /// The directory whose listing changes when contexts appear/disappear:
+    /// ROOT in context-rooted mode, the `Contexts/` dir in global mode.
+    fn contexts_parent(&self) -> u64 {
+        if self.context_root.is_some() {
+            ROOT_INO
+        } else {
+            CONTEXTS_INO
+        }
     }
 
     fn alloc_ino(&mut self) -> u64 {
@@ -172,6 +200,14 @@ impl Tree {
         if !node.is_dir() || !SCHEMA_DIRS.contains(&node.name.as_str()) {
             return None;
         }
+        // Context-rooted: schema dirs hang off ROOT, which is the context.
+        if let Some(root_ctx) = &self.context_root {
+            if node.parent == ROOT_INO {
+                return Some((root_ctx.clone(), node.name.clone()));
+            }
+            return None;
+        }
+        // Global: schema dir -> context dir -> Contexts.
         let ctx_node = self.get(node.parent)?;
         if ctx_node.parent != CONTEXTS_INO {
             return None;
@@ -268,15 +304,25 @@ impl Tree {
         for ctx_id in stale {
             let ino = self.ctx_inos.remove(&ctx_id).unwrap();
             self.remove_subtree(ino, &mut inv);
-            if let Some(node) = self.remove_node(ino) {
+            if ino == ROOT_INO {
+                // Context-rooted mount whose context vanished: clear the schema
+                // dirs under ROOT but keep ROOT itself (it is the mountpoint).
+                inv.dirty_dirs.push(ROOT_INO);
+            } else if let Some(node) = self.remove_node(ino) {
                 inv.removed.push((node.parent, ino, node.name));
             }
             self.doc_inos.retain(|(c, _), _| c != &ctx_id);
             self.ctx_workspaces.remove(&ctx_id);
-            inv.dirty_dirs.push(CONTEXTS_INO);
+            inv.dirty_dirs.push(self.contexts_parent());
         }
 
         for ctx in contexts {
+            // In context-rooted mode, ignore every context but the rooted one.
+            if let Some(root_ctx) = &self.context_root {
+                if root_ctx != &ctx.id {
+                    continue;
+                }
+            }
             let meta = render_context_meta(ctx);
             match self.ctx_inos.get(&ctx.id).copied() {
                 Some(ctx_ino) => {
@@ -300,18 +346,26 @@ impl Tree {
                     }
                 }
                 None => {
-                    let ctx_ino = self.alloc_ino();
+                    // The context's "directory": ROOT itself when context-rooted
+                    // (its schema dirs become the mount's top level), else a new
+                    // named dir under Contexts/.
+                    let ctx_ino = if self.context_root.is_some() {
+                        ROOT_INO
+                    } else {
+                        let i = self.alloc_ino();
+                        self.insert_node(Node {
+                            ino: i,
+                            parent: CONTEXTS_INO,
+                            name: ctx.id.clone(),
+                            mtime: now,
+                            content: NodeContent::Dir,
+                        });
+                        i
+                    };
                     self.ctx_inos.insert(ctx.id.clone(), ctx_ino);
                     if let Some(ws) = &ctx.workspace_id {
                         self.ctx_workspaces.insert(ctx.id.clone(), ws.clone());
                     }
-                    self.insert_node(Node {
-                        ino: ctx_ino,
-                        parent: CONTEXTS_INO,
-                        name: ctx.id.clone(),
-                        mtime: now,
-                        content: NodeContent::Dir,
-                    });
                     for dir in SCHEMA_DIRS {
                         let ino = self.alloc_ino();
                         self.insert_node(Node {
@@ -330,7 +384,7 @@ impl Tree {
                         mtime: now,
                         content: NodeContent::Inline(Arc::new(meta)),
                     });
-                    inv.dirty_dirs.push(CONTEXTS_INO);
+                    inv.dirty_dirs.push(self.contexts_parent());
                     added.push(ctx.id.clone());
                 }
             }

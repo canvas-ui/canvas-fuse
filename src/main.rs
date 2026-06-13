@@ -161,6 +161,19 @@ fn cmd_mount(
 ) -> Result<()> {
     let endpoint = connect.endpoint()?;
 
+    // A single -c <ctx> roots the mount at that context: the given path is the
+    // parent, and we mount at <path>/<ctx> with the context's schema dirs at the
+    // top level. Multiple/no -c stays a global mount at the given path.
+    let context_root = if contexts.len() == 1 {
+        Some(contexts[0].clone())
+    } else {
+        None
+    };
+    let mountpoint = match &context_root {
+        Some(ctx) => mountpoint.join(ctx),
+        None => mountpoint,
+    };
+
     // Canonicalize before any daemonize/fork so relative paths stay valid
     std::fs::create_dir_all(&mountpoint)
         .with_context(|| format!("creating mountpoint {}", mountpoint.display()))?;
@@ -237,6 +250,7 @@ fn cmd_mount(
         } else {
             Some(contexts.clone())
         },
+        context_root: context_root.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
     })?;
 

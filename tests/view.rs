@@ -1,6 +1,6 @@
 use canvas_fuse::api::{ContextInfo, Document};
 use canvas_fuse::names::NameStore;
-use canvas_fuse::state::{NodeContent, Tree, CONTEXTS_INO};
+use canvas_fuse::state::{NodeContent, Tree, CONTEXTS_INO, ROOT_INO};
 use serde_json::json;
 use std::time::SystemTime;
 
@@ -249,4 +249,45 @@ fn file_doc_without_size_degrades_to_metadata_json() {
         .lookup(files_ino, "notes.txt.json")
         .expect("json fallback");
     assert!(matches!(node.content, NodeContent::Inline(_)));
+}
+
+#[test]
+fn context_rooted_mount_puts_schema_dirs_at_root() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::context_rooted("mbag".to_string());
+    tree.apply_contexts(&[ctx("mbag", "/work")]);
+    tree.apply_documents("mbag", &[note(1, "Hello", "hi")], &names);
+
+    // The context's schema dirs hang directly off ROOT — no "Contexts" wrapper.
+    let root_entries = names_in(&tree, ROOT_INO);
+    assert!(root_entries.contains(&"Notes".to_string()));
+    assert!(root_entries.contains(&"Tabs".to_string()));
+    assert!(root_entries.contains(&".context.json".to_string()));
+    assert!(!root_entries.contains(&"Contexts".to_string()));
+
+    // The context dir IS root.
+    assert_eq!(tree.context_ino("mbag"), Some(ROOT_INO));
+
+    // The note materializes under the root-level Notes dir, and the write path
+    // still classifies it as belonging to the rooted context.
+    let notes_ino = tree.lookup(ROOT_INO, "Notes").unwrap().ino;
+    assert_eq!(names_in(&tree, notes_ino), vec!["Hello.md"]);
+    assert_eq!(
+        tree.locate_schema_dir(notes_ino),
+        Some(("mbag".to_string(), "Notes".to_string()))
+    );
+}
+
+#[test]
+fn global_mount_keeps_contexts_wrapper() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("a", "/a"), ctx("b", "/b")]);
+    tree.apply_documents("a", &[], &names);
+
+    // Global mount: root holds "Contexts", which holds the per-context dirs.
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["Contexts".to_string()]);
+    let mut ctxs = names_in(&tree, CONTEXTS_INO);
+    ctxs.sort();
+    assert_eq!(ctxs, vec!["a".to_string(), "b".to_string()]);
 }
