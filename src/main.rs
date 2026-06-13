@@ -160,12 +160,29 @@ fn cmd_mount(
     blob_cache_mb: usize,
 ) -> Result<()> {
     let endpoint = connect.endpoint()?;
-    let data_dir = data_dir.unwrap_or_else(runtime::default_data_dir);
 
     // Canonicalize before any daemonize/fork so relative paths stay valid
     std::fs::create_dir_all(&mountpoint)
         .with_context(|| format!("creating mountpoint {}", mountpoint.display()))?;
     let mountpoint = mountpoint.canonicalize()?;
+
+    // Per-mount state dir (own sticky-name redb). Explicit --data-dir wins;
+    // otherwise derive from remote + context so concurrent mounts don't share
+    // (and lock) one redb. Remote label: --remote name, else the server host.
+    let data_dir = data_dir.unwrap_or_else(|| {
+        let remote_label = connect.remote.clone().unwrap_or_else(|| {
+            endpoint
+                .server
+                .rsplit("://")
+                .next()
+                .unwrap_or(&endpoint.server)
+                .split('/')
+                .next()
+                .unwrap_or("server")
+                .to_string()
+        });
+        runtime::mount_data_dir(&remote_label, &contexts, &mountpoint)
+    });
 
     // Refuse to steal a mountpoint from a live daemon
     if let Some(state) = runtime::read_state(&mountpoint) {

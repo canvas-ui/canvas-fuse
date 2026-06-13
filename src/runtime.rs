@@ -22,10 +22,45 @@ pub fn state_dir() -> PathBuf {
         .join("canvas-fuse")
 }
 
-pub fn default_data_dir() -> PathBuf {
-    dirs::data_dir()
+fn sanitize_segment(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '@') { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', '_']).to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Per-mount local state dir (holds the sticky-name redb). Each mount needs its
+/// own redb — it is single-writer, so a shared dir would lock out concurrent
+/// mounts. Scoped under ~/.canvas/<remote>/ so it's discoverable, and keyed by
+/// context when a single context is mounted (sticky names then persist across
+/// remounts of that context regardless of mountpoint); otherwise by mountpoint.
+pub fn mount_data_dir(remote: &str, contexts: &[String], mountpoint: &Path) -> PathBuf {
+    let base = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("canvas-fuse")
+        .join(".canvas")
+        .join(sanitize_segment(remote))
+        .join("fuse");
+    if contexts.len() == 1 {
+        base.join("contexts").join(sanitize_segment(&contexts[0]))
+    } else {
+        // All-contexts or multi-context mount: key by mountpoint instead.
+        let raw = mountpoint.to_string_lossy();
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in raw.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        base.join("mounts").join(format!(
+            "{}.{hash:08x}",
+            sanitize_segment(raw.trim_matches('/'))
+        ))
+    }
 }
 
 fn state_file_for(mountpoint: &Path) -> PathBuf {
