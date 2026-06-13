@@ -30,9 +30,9 @@ kernel invalidations via FUSE reverse notification. A periodic full resync
 Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
 `v*`). Linux: `x86_64`/`aarch64` glibc, plus a fully static `x86_64` musl build
 that runs on any distro (only the `fusermount3` helper is needed at mount time).
-macOS builds are experimental and require [macFUSE](https://macfuse.io). Or
-build from source with `cargo build --release` — no `libfuse` dev package is
-needed (`fuser` is built without it).
+Linux only — `fuser`'s pure-Rust backend (no libfuse) is not supported on macOS
+or Windows. Build from source with `cargo build --release` (no `libfuse` dev
+package needed).
 
 ## CLI
 
@@ -154,4 +154,3 @@ append, atomic tmp+rename (sed -i, vim), mid-edit stat, touch, mv, rm.
 - mkdir = attach layer, rmdir = detach (tree-structure writes)
 - Editing file blobs (Files/ is read-only)
 - Workspace/directory-type tree mounts
-- macOS backend (macFUSE; fuse-t incompatible with kernel-protocol fuser)

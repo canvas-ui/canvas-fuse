@@ -37,12 +37,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: dynamic glibc build (smallest, needs host glibc) and a
-          # fully static musl build (download-and-run on any Linux — fuser is
-          # built without libfuse linkage and OpenSSL is vendored static, so the
-          # only runtime dependency is the fusermount3 helper at mount time).
-          # musl + aarch64 go through `cross` so the per-target C toolchain (and
-          # perl/make for vendored OpenSSL, see Cross.toml) is available.
+          # Linux only: fuser's pure-Rust (no-libfuse) backend is Linux-only,
+          # so macOS/Windows can't build this config. Dynamic glibc build plus a
+          # fully static musl build (download-and-run on any Linux — no libfuse
+          # link and OpenSSL vendored static, so the only runtime dependency is
+          # the fusermount3 helper at mount time). musl + aarch64 go through
+          # `cross` for the per-target C toolchain (and perl/make for vendored
+          # OpenSSL, see Cross.toml).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
@@ -51,16 +52,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
-          # macOS: builds cleanly (no libfuse link); running the mount needs
-          # macFUSE installed on the user's machine. Experimental — allowed to
-          # fail without blocking the Linux release.
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            experimental: true
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            experimental: true
-    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@v4
 
