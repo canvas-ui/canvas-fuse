@@ -97,7 +97,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         tree: tree.clone(),
         names: names.clone(),
         notifier: None,
-        on_new_context: None,
+        ensure_subscribed: None,
         context_filter: context_filter.clone(),
         refresh_lock: None,
     };
@@ -124,12 +124,13 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Subscriber is created up front and shared: the worker subscribes newly
-    // discovered contexts through it (on_new_context), and the ws supervisor
+    // Subscriber is created up front and shared: the worker (re)subscribes a
+    // context through it after each successful refresh, and the ws supervisor
     // fills its client slot whenever the connection comes up. So a ws that
-    // connects late (server/workspace still starting) still ends up subscribed.
+    // connects late, or a workspace that starts after mount, still ends up
+    // subscribed — the first successful refresh triggers the subscribe.
     let subscriber = events::Subscriber::default();
-    let on_new_context: Option<worker::NewContextCallback> = if opts.enable_ws {
+    let ensure_subscribed: Option<worker::NewContextCallback> = if opts.enable_ws {
         let s = subscriber.clone();
         Some(Box::new(move |ctx_id: &str| s.subscribe(ctx_id)))
     } else {
@@ -141,7 +142,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         tree: tree.clone(),
         names,
         notifier: Some(session.notifier()),
-        on_new_context,
+        ensure_subscribed,
         context_filter,
         refresh_lock: Some(write_store.sync_handle()),
     };

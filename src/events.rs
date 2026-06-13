@@ -4,25 +4,61 @@ use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use rust_socketio::{client::Client, ClientBuilder, Event, Payload, RawClient, TransportType};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-/// Holds the latest connected RawClient so threads outside socket.io
-/// callbacks (the refresh worker) can subscribe to new context channels.
+#[derive(Default)]
+struct SubscriberInner {
+    client: Option<RawClient>,
+    /// Contexts the server has *confirmed* subscribed (via its `subscribed`
+    /// event). A subscribe that was denied (e.g. workspace still starting →
+    /// "Access denied") never lands here, so `subscribe` keeps retrying it.
+    confirmed: HashSet<String>,
+}
+
+/// Tracks the live ws client + confirmed subscriptions so any thread (the
+/// refresh worker) can idempotently ensure a context is subscribed.
 #[derive(Clone, Default)]
-pub struct Subscriber(Arc<Mutex<Option<RawClient>>>);
+pub struct Subscriber(Arc<Mutex<SubscriberInner>>);
 
 impl Subscriber {
+    fn set_client(&self, client: RawClient) {
+        self.0.lock().client = Some(client);
+    }
+
+    /// New socket (fresh connect/reconnect): nothing is subscribed anymore.
+    fn reset_confirmed(&self) {
+        self.0.lock().confirmed.clear();
+    }
+
+    /// Server acked a subscription.
+    fn confirm(&self, ctx_id: &str) {
+        self.0.lock().confirmed.insert(ctx_id.to_string());
+        log::debug!("ws subscription confirmed for {ctx_id}");
+    }
+
+    /// Ensure `ctx_id` is subscribed. No-op if already confirmed; otherwise
+    /// (re)emits the subscribe. Safe to call on every successful refresh — the
+    /// confirmed set throttles it to one emit per actual subscription.
     pub fn subscribe(&self, ctx_id: &str) {
-        if let Some(client) = self.0.lock().as_ref() {
+        let inner = self.0.lock();
+        if inner.confirmed.contains(ctx_id) {
+            return;
+        }
+        if let Some(client) = inner.client.as_ref() {
             let channel = format!("context:{ctx_id}");
             if let Err(e) = client.emit("subscribe", json!({ "channel": channel })) {
                 log::warn!("ws subscribe {channel} failed: {e}");
-            } else {
-                log::debug!("ws subscribed to {channel}");
             }
         }
     }
+}
+
+fn context_id_from_channel(payload: &Payload) -> Option<String> {
+    let value = first_payload_value(payload)?;
+    let channel = value.get("channel").and_then(Value::as_str)?;
+    channel.strip_prefix("context:").map(|id| id.to_string())
 }
 
 pub struct EventClient {
@@ -62,21 +98,30 @@ pub fn connect(
     tree: Arc<RwLock<Tree>>,
     subscriber: Subscriber,
 ) -> Result<EventClient> {
-    let sub_slot = subscriber.clone();
+    let sub_auth = subscriber.clone();
     let auth_tree = tree;
     let auth_tx = tx.clone();
     let on_authenticated = move |_payload: Payload, raw: RawClient| {
         log::info!("ws authenticated, subscribing to context channels");
-        *sub_slot.0.lock() = Some(raw.clone());
-        let contexts = auth_tree.read().context_ids();
-        for ctx_id in contexts {
-            let channel = format!("context:{ctx_id}");
-            if let Err(e) = raw.emit("subscribe", json!({ "channel": channel })) {
-                log::warn!("ws subscribe {channel} failed: {e}");
-            }
+        sub_auth.set_client(raw);
+        // Fresh socket: prior confirmations are void. Attempt current contexts;
+        // any that the server isn't ready for (workspace down) stay unconfirmed
+        // and get retried after their next successful refresh.
+        sub_auth.reset_confirmed();
+        for ctx_id in auth_tree.read().context_ids() {
+            sub_auth.subscribe(&ctx_id);
         }
         // Catch up on anything missed while disconnected
         let _ = auth_tx.send(Job::RefreshAll);
+    };
+
+    // Server acks each subscription with a `subscribed` event; record it so the
+    // worker stops re-issuing that subscribe.
+    let sub_ack = subscriber.clone();
+    let on_subscribed = move |payload: Payload, _: RawClient| {
+        if let Some(ctx_id) = context_id_from_channel(&payload) {
+            sub_ack.confirm(&ctx_id);
+        }
     };
 
     let event_tx = tx;
@@ -111,8 +156,27 @@ pub fn connect(
         .reconnect_on_disconnect(true)
         .reconnect_delay(1_000, 30_000)
         .on("authenticated", on_authenticated)
+        .on("subscribed", on_subscribed)
         .on(Event::Error, |payload: Payload, _| {
-            log::warn!("ws error: {payload:?}");
+            // Retryable errors (e.g. workspace still starting) are expected and
+            // self-heal via the next successful refresh — log them quietly.
+            let val = first_payload_value(&payload);
+            let retryable = val
+                .as_ref()
+                .and_then(|v| v.get("retryable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let msg = val
+                .as_ref()
+                .and_then(|v| v.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{payload:?}"));
+            if retryable {
+                log::debug!("ws not-ready (will retry): {msg}");
+            } else {
+                log::warn!("ws error: {msg}");
+            }
         })
         .on_any(on_any)
         .connect()?;

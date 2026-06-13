@@ -59,11 +59,25 @@ impl CanvasFs {
 
     fn attr(&self, node: &crate::state::Node) -> FileAttr {
         // An active write buffer wins over tree content: editors stat
-        // between write() and close() and must see the buffered size
-        let size = self
-            .writes
-            .size_override(node.ino)
-            .unwrap_or_else(|| node.size());
+        // between write() and close() and must see the buffered size.
+        let size = if let Some(buffered) = self.writes.size_override(node.ino) {
+            buffered
+        } else if let NodeContent::Remote {
+            size: None,
+            workspace_id,
+            doc_id,
+            checksum,
+        } = &node.content
+        {
+            // File with no metadata.size — resolve from the blob (cached after
+            // the first stat) so it's shown as the real file, not a stub.
+            let key = checksum
+                .clone()
+                .unwrap_or_else(|| format!("{workspace_id}/{doc_id}"));
+            self.blobs.resolve_size(&key, workspace_id, *doc_id)
+        } else {
+            node.size()
+        };
         self.file_attr(node.ino, size, node.mtime, node.is_dir())
     }
 
@@ -379,6 +393,11 @@ impl Filesystem for CanvasFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+        // Report ample free space. Writes don't consume local disk (they go to
+        // the server), but file managers and copy tools pre-check statvfs and
+        // refuse with "not enough space" if free blocks are zero.
+        const BLOCKS: u64 = 1 << 32; // ~16 TiB at 4 KiB blocks
+                                     // (blocks, bfree, bavail, files, ffree, bsize, namelen, frsize)
+        reply.statfs(BLOCKS, BLOCKS, BLOCKS, 0, 1 << 20, 4096, 255, 4096);
     }
 }

@@ -228,7 +228,7 @@ fn file_docs_use_location_basename_and_remote_content() {
         } => {
             assert_eq!(workspace_id, "ws-test");
             assert_eq!(*doc_id, 7);
-            assert_eq!(*size, 123456);
+            assert_eq!(*size, Some(123456));
             assert_eq!(checksum.as_deref(), Some("sha256/abc123"));
         }
         other => panic!("expected remote content, got {other:?}"),
@@ -236,7 +236,7 @@ fn file_docs_use_location_basename_and_remote_content() {
 }
 
 #[test]
-fn file_doc_without_size_degrades_to_metadata_json() {
+fn file_doc_without_size_shown_as_is_size_unresolved() {
     let (_tmp, names) = store();
     let mut tree = Tree::new();
     tree.apply_contexts(&[ctx("work", "/w")]);
@@ -244,11 +244,14 @@ fn file_doc_without_size_degrades_to_metadata_json() {
     let f = file(8, "file://{WORKSPACE_ROOT}/notes.txt", None, "sha256/def");
     tree.apply_documents("work", &[f], &names);
 
+    // Shown as the real file (not a .json stub) with size unresolved (None) —
+    // fsimpl resolves it from the blob on first stat.
     let files_ino = schema_dir_ino(&tree, "work", "Files");
-    let node = tree
-        .lookup(files_ino, "notes.txt.json")
-        .expect("json fallback");
-    assert!(matches!(node.content, NodeContent::Inline(_)));
+    let node = tree.lookup(files_ino, "notes.txt").expect("file entry");
+    assert!(matches!(
+        node.content,
+        NodeContent::Remote { size: None, .. }
+    ));
 }
 
 #[test]

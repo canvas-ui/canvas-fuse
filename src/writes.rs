@@ -3,7 +3,7 @@ use crate::names::NameStore;
 use crate::state::Tree;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -55,9 +55,6 @@ struct Inner {
     overlay: HashMap<u64, (u64, String, SystemTime)>,
     overlay_names: HashMap<(u64, String), u64>,
     next_overlay_ino: u64,
-    /// doc ids created by this mount — safe to destroy when an editor's
-    /// atomic-rename save pattern replaces them
-    own_docs: HashSet<u64>,
 }
 
 pub struct WriteStore {
@@ -106,7 +103,6 @@ impl WriteStore {
                 overlay: HashMap::new(),
                 overlay_names: HashMap::new(),
                 next_overlay_ino: FIRST_OVERLAY_INO,
-                own_docs: HashSet::new(),
             }),
             sync: Arc::new(Mutex::new(())),
         }
@@ -372,7 +368,6 @@ impl WriteStore {
                         }
                         inner.overlay.remove(&ino);
                         inner.overlay_names.remove(&(*dir_ino, name.clone()));
-                        inner.own_docs.insert(doc_id);
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -436,14 +431,14 @@ impl WriteStore {
             .doc_for_ino(ino)
             .ok_or(WriteError::NotPermitted)?;
 
-        let own = self.inner.lock().own_docs.contains(&doc_id);
-        let res = if own {
-            self.api.delete_documents(&ctx, &[doc_id])
-        } else {
-            // Organizational removal: detach from this context, never destroy
-            self.api.remove_documents(&ctx, &[doc_id])
-        };
-        res.map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        // `rm` DETACHES from this context (removes the path tick), never
+        // destroys: FUSE can't distinguish `rm` from `shift+delete`, so the
+        // safe default is view-scoped removal — the document survives in the DB
+        // and in any other context it's linked into. (A directory-type mount,
+        // where the folder IS the doc's home, could destroy instead — future.)
+        self.api
+            .remove_documents(&ctx, &[doc_id])
+            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
 
         self.tree.write().remove_doc_node(ino);
         self.inner.lock().states.remove(&ino);
@@ -549,16 +544,12 @@ impl WriteStore {
                         _ => return Err(WriteError::NotPermitted),
                     }
                 };
-                // dst keeps its (stable) id, gains src's content.
+                // dst keeps its (stable) id, gains src's content; src is
+                // detached from this context (safe default; survives in DB).
                 self.flush_update(&ctx, &dir, dst_doc, &content)?;
-
-                let own = self.inner.lock().own_docs.contains(&src_doc);
-                let res = if own {
-                    self.api.delete_documents(&ctx, &[src_doc])
-                } else {
-                    self.api.remove_documents(&ctx, &[src_doc])
-                };
-                res.map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                self.api
+                    .remove_documents(&ctx, &[src_doc])
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
 
                 {
                     let mut tree = self.tree.write();

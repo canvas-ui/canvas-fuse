@@ -20,7 +20,8 @@ pub enum NodeContent {
     Remote {
         workspace_id: String,
         doc_id: u64,
-        size: u64,
+        /// None until resolved from the blob (doc carried no metadata.size).
+        size: Option<u64>,
         checksum: Option<String>,
     },
 }
@@ -43,7 +44,9 @@ impl Node {
         match &self.content {
             NodeContent::Dir => 0,
             NodeContent::Inline(bytes) => bytes.len() as u64,
-            NodeContent::Remote { size, .. } => *size,
+            // None (unresolved) reports 0 here; fsimpl resolves it lazily via
+            // the blob store before answering getattr.
+            NodeContent::Remote { size, .. } => size.unwrap_or(0),
         }
     }
 }

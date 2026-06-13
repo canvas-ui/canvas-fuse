@@ -22,9 +22,10 @@ pub struct Worker {
     pub tree: Arc<RwLock<Tree>>,
     pub names: Arc<NameStore>,
     pub notifier: Option<Notifier>,
-    /// Called when a refresh discovers a context that wasn't mounted yet,
-    /// so the ws layer can subscribe to its event channel.
-    pub on_new_context: Option<NewContextCallback>,
+    /// Idempotently ensure a context's ws channel is subscribed. Called after a
+    /// *successful* document refresh (the workspace is then up, so the server
+    /// will accept the subscribe — unlike at mount time when it may be down).
+    pub ensure_subscribed: Option<NewContextCallback>,
     /// When set, only these context ids are materialized (agent containers
     /// typically mount a single context).
     pub context_filter: Option<HashSet<String>>,
@@ -72,11 +73,7 @@ impl Worker {
             tree.apply_contexts(&contexts)
         };
         self.notify(inv);
-        if let Some(cb) = &self.on_new_context {
-            for ctx_id in &added {
-                cb(ctx_id);
-            }
-        }
+        let _ = added; // subscription now happens after a successful per-context refresh
         for ctx in &contexts {
             self.refresh_context(&ctx.id);
         }
@@ -108,6 +105,11 @@ impl Worker {
         };
         drop(_guard);
         self.notify(inv);
+        // Docs fetched OK ⇒ the workspace is up ⇒ a subscribe will be accepted.
+        // Idempotent (confirmed set), so this is a no-op once subscribed.
+        if let Some(cb) = &self.ensure_subscribed {
+            cb(ctx_id);
+        }
     }
 
     // Push invalidations into the kernel. Errors are expected noise: ENOENT

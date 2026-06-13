@@ -124,6 +124,29 @@ impl BlobStore {
         store
     }
 
+    /// Resolve a blob's byte length for `getattr`/`lookup` when the document
+    /// carried no `metadata.size`. Returns the cached length if present, else
+    /// fetches the blob once (blocking — this path only runs for size-unknown
+    /// files, which should be rare) and caches it so the subsequent read is a
+    /// hit. On fetch failure reports 0 rather than failing the stat.
+    pub fn resolve_size(&self, key: &str, workspace_id: &str, doc_id: u64) -> u64 {
+        if let Some(blob) = self.cache.lock().get(key) {
+            return blob.len() as u64;
+        }
+        match self.api.fetch_content(workspace_id, doc_id) {
+            Ok(bytes) => {
+                let blob = Arc::new(bytes);
+                let len = blob.len() as u64;
+                self.cache.lock().put(key.to_string(), blob);
+                len
+            }
+            Err(e) => {
+                log::warn!("blob size resolve {key} failed: {e:#}");
+                0
+            }
+        }
+    }
+
     /// Serve a read: from cache if possible, otherwise queue it on the blob's
     /// (possibly new) download. Never blocks on the network.
     pub fn read(

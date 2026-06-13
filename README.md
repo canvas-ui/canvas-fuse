@@ -70,14 +70,17 @@ binary is self-contained.
 
 ## Design notes
 
-- **File blobs are real files.** A file doc's name comes from its location URL
-  basename, size from `metadata.size` (no known size → degrade to a `.json`
-  metadata stub so getattr never lies). Bytes are fetched lazily through
+- **File blobs are real files, shown as-is.** A file doc's name comes from its
+  location URL basename (real extension preserved, so players/editors open it),
+  size from `metadata.size`. When the doc carries no size, the file is still
+  shown as-is and the size is resolved lazily from the blob on first `stat`
+  (cached thereafter) — never a `.json` stub. Bytes are fetched lazily through
   `GET /workspaces/:id/documents/:docId/content` (the server resolves
   `stored://` / `file://{WORKSPACE_ROOT}` locations) on first read, via a fetch
   pool — the FUSE session loop never blocks on the network, concurrent kernel
   readahead of the same blob is deduplicated into one download, and blobs are
   cached in memory by checksum (LRU, `--blob-cache-mb`, default 256).
+  `Files/` is read-only.
 
 - **Hot path is local.** `lookup`/`readdir`/`getattr`/`read` are served from an
   in-memory tree behind a `parking_lot::RwLock`; the network is only touched by

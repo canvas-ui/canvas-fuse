@@ -11,8 +11,10 @@ pub const SCHEMA_DIRS: &[&str] = &[
 pub enum Content {
     /// Bytes rendered locally from the document JSON
     Inline(Vec<u8>),
-    /// Blob served by the workspace content route, fetched lazily on read
-    Remote { size: u64 },
+    /// Blob served by the workspace content route, fetched lazily on read.
+    /// `size` is None when the document carries no metadata.size — resolved
+    /// lazily from the blob so the file is still shown as-is (not a .json stub).
+    Remote { size: Option<u64> },
 }
 
 pub struct Rendered {
@@ -48,22 +50,18 @@ pub fn render(doc: &Document) -> Rendered {
 /// come from the server's content route. Without a known size we cannot
 /// promise reads (getattr must match), so fall back to JSON metadata.
 fn render_file(doc: &Document) -> Rendered {
+    // Always show a file as-is: real filename (with extension) + blob bytes, so
+    // media players / spreadsheets / etc. open it directly. Size comes from
+    // metadata.size when present; otherwise None → resolved lazily on stat/read.
     let name = doc
         .locations
         .iter()
         .find_map(|url| location_basename(url))
         .unwrap_or_else(|| format!("file-{}", doc.id));
-    match doc.size {
-        Some(size) => Rendered {
-            dir: "Files",
-            base_name: sanitize_filename(&name),
-            content: Content::Remote { size },
-        },
-        None => Rendered {
-            dir: "Files",
-            base_name: format!("{}.json", sanitize_filename(&name)),
-            content: Content::Inline(serde_json::to_vec_pretty(&doc.data).unwrap_or_default()),
-        },
+    Rendered {
+        dir: "Files",
+        base_name: sanitize_filename(&name),
+        content: Content::Remote { size: doc.size },
     }
 }
 
