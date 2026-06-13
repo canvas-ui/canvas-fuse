@@ -84,7 +84,9 @@ fn skeleton_dirs_always_present() {
 
     let ctx_ino = tree.context_ino("work").unwrap();
     let entries = names_in(&tree, ctx_ino);
-    for dir in ["Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other"] {
+    for dir in [
+        "Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other",
+    ] {
         assert!(entries.contains(&dir.to_string()), "missing {dir}");
     }
     assert!(entries.contains(&".context.json".to_string()));
@@ -100,7 +102,10 @@ fn title_collisions_get_id_suffix_and_stick() {
     tree.apply_documents("work", &docs, &names);
 
     let notes_ino = schema_dir_ino(&tree, "work", "Notes");
-    assert_eq!(names_in(&tree, notes_ino), vec!["Meeting.2.md", "Meeting.md"]);
+    assert_eq!(
+        names_in(&tree, notes_ino),
+        vec!["Meeting.2.md", "Meeting.md"]
+    );
 
     // Doc 1 leaves; doc 2 must NOT inherit the clean name (sticky map)
     tree.apply_documents("work", &[note(2, "Meeting", "b")], &names);
@@ -136,9 +141,15 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
         &names,
     );
 
-    assert_eq!(names_in(&tree, tabs_ino), vec!["Docs.url", "Other-ticket.url"]);
+    assert_eq!(
+        names_in(&tree, tabs_ino),
+        vec!["Docs.url", "Other-ticket.url"]
+    );
     // surviving doc keeps its inode → open handles stay valid
-    assert_eq!(tree.lookup(tabs_ino, "Docs.url").unwrap().ino, shared_tab_ino);
+    assert_eq!(
+        tree.lookup(tabs_ino, "Docs.url").unwrap().ino,
+        shared_tab_ino
+    );
     // removals are reported for inotify push
     let removed: Vec<&str> = inv.removed.iter().map(|(_, _, n)| n.as_str()).collect();
     assert!(removed.contains(&"Jira-ticket.url"));
@@ -172,10 +183,7 @@ fn removed_context_disappears() {
     let (inv, _) = tree.apply_contexts(&[ctx("b", "/b")]);
     assert!(tree.context_ino("a").is_none());
     assert!(!inv.removed.is_empty());
-    assert_eq!(
-        names_in(&tree, CONTEXTS_INO),
-        vec!["b".to_string()]
-    );
+    assert_eq!(names_in(&tree, CONTEXTS_INO), vec!["b".to_string()]);
 }
 
 #[test]
@@ -237,6 +245,8 @@ fn file_doc_without_size_degrades_to_metadata_json() {
     tree.apply_documents("work", &[f], &names);
 
     let files_ino = schema_dir_ino(&tree, "work", "Files");
-    let node = tree.lookup(files_ino, "notes.txt.json").expect("json fallback");
+    let node = tree
+        .lookup(files_ino, "notes.txt.json")
+        .expect("json fallback");
     assert!(matches!(node.content, NodeContent::Inline(_)));
 }

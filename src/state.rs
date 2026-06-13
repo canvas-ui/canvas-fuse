@@ -78,6 +78,12 @@ pub struct Tree {
     ctx_workspaces: HashMap<String, String>,
 }
 
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tree {
     pub fn new() -> Self {
         let mut t = Self {
@@ -143,7 +149,12 @@ impl Tree {
 
     pub fn list(&self, ino: u64) -> Option<Vec<&Node>> {
         let children = self.children.get(&ino)?;
-        Some(children.values().filter_map(|i| self.nodes.get(i)).collect())
+        Some(
+            children
+                .values()
+                .filter_map(|i| self.nodes.get(i))
+                .collect(),
+        )
     }
 
     pub fn context_ids(&self) -> Vec<String> {
@@ -152,6 +163,89 @@ impl Tree {
 
     pub fn context_ino(&self, ctx: &str) -> Option<u64> {
         self.ctx_inos.get(ctx).copied()
+    }
+
+    /// If ino is a schema dir (e.g. Notes under a context), return
+    /// (context id, dir label). Used by the write path to classify targets.
+    pub fn locate_schema_dir(&self, ino: u64) -> Option<(String, String)> {
+        let node = self.get(ino)?;
+        if !node.is_dir() || !SCHEMA_DIRS.contains(&node.name.as_str()) {
+            return None;
+        }
+        let ctx_node = self.get(node.parent)?;
+        if ctx_node.parent != CONTEXTS_INO {
+            return None;
+        }
+        Some((ctx_node.name.clone(), node.name.clone()))
+    }
+
+    pub fn ino_for_doc(&self, ctx: &str, doc_id: u64) -> Option<u64> {
+        self.doc_inos.get(&(ctx.to_string(), doc_id)).copied()
+    }
+
+    /// Reverse of doc_inos: which (context, doc) does this ino materialize?
+    pub fn doc_for_ino(&self, ino: u64) -> Option<(String, u64)> {
+        self.doc_inos
+            .iter()
+            .find(|(_, &i)| i == ino)
+            .map(|((ctx, doc), _)| (ctx.clone(), *doc))
+    }
+
+    /// Materialize a document node directly (used right after the write path
+    /// creates a doc, so the file exists before the next server refresh).
+    /// The caller supplies the ino to keep open kernel handles stable.
+    pub fn adopt_document(
+        &mut self,
+        dir_ino: u64,
+        name: &str,
+        ctx_id: &str,
+        doc_id: u64,
+        ino: u64,
+        content: Arc<Vec<u8>>,
+    ) {
+        self.doc_inos.insert((ctx_id.to_string(), doc_id), ino);
+        self.insert_node(Node {
+            ino,
+            parent: dir_ino,
+            name: name.to_string(),
+            mtime: SystemTime::now(),
+            content: NodeContent::Inline(content),
+        });
+    }
+
+    /// Replace a file node's inline content (post-flush local truth).
+    pub fn set_inline_content(&mut self, ino: u64, content: Arc<Vec<u8>>) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.content = NodeContent::Inline(content);
+            node.mtime = SystemTime::now();
+        }
+    }
+
+    /// Rename an entry within its directory (write-path organizational rename).
+    pub fn rename_entry(&mut self, ino: u64, new_name: &str) {
+        let Some(node) = self.nodes.get_mut(&ino) else {
+            return;
+        };
+        let parent = node.parent;
+        let old = std::mem::replace(&mut node.name, new_name.to_string());
+        if let Some(siblings) = self.children.get_mut(&parent) {
+            siblings.remove(&old);
+            siblings.insert(new_name.to_string(), ino);
+        }
+    }
+
+    /// Remove a document node (write-path unlink). Cleans the doc_inos map.
+    pub fn remove_doc_node(&mut self, ino: u64) {
+        self.remove_node(ino);
+        self.doc_inos.retain(|_, &mut i| i != ino);
+    }
+
+    pub fn bind_doc(&mut self, ctx: &str, doc_id: u64, ino: u64) {
+        self.doc_inos.insert((ctx.to_string(), doc_id), ino);
+    }
+
+    pub fn unbind_doc(&mut self, ctx: &str, doc_id: u64) {
+        self.doc_inos.remove(&(ctx.to_string(), doc_id));
     }
 
     /// Sync the set of context dirs (incl. schema-dir skeleton + .context.json).
@@ -358,8 +452,8 @@ impl Tree {
                 match want.get(&name) {
                     Some((doc_id, content, mtime)) => {
                         let node = self.nodes.get_mut(&ino).unwrap();
-                        let same_doc = self.doc_inos.get(&(ctx_id.to_string(), *doc_id))
-                            == Some(&ino);
+                        let same_doc =
+                            self.doc_inos.get(&(ctx_id.to_string(), *doc_id)) == Some(&ino);
                         if same_doc {
                             if node.content != *content {
                                 node.content = content.clone();
@@ -377,7 +471,8 @@ impl Tree {
                     }
                     None => {
                         self.remove_node(ino);
-                        self.doc_inos.retain(|(c, _), i| !(c == ctx_id && *i == ino));
+                        self.doc_inos
+                            .retain(|(c, _), i| !(c == ctx_id && *i == ino));
                         inv.removed.push((dir_ino, ino, name));
                         dirty = true;
                     }

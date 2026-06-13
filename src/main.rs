@@ -127,7 +127,14 @@ fn main() -> Result<()> {
             data_dir,
             blob_cache_mb,
         } => cmd_mount(
-            mountpoint, connect, contexts, detach, no_ws, resync, data_dir, blob_cache_mb,
+            mountpoint,
+            connect,
+            contexts,
+            detach,
+            no_ws,
+            resync,
+            data_dir,
+            blob_cache_mb,
         ),
         Command::Unmount { mountpoint } => cmd_unmount(mountpoint),
         Command::Status { json } => cmd_status(json),
@@ -137,10 +144,8 @@ fn main() -> Result<()> {
 }
 
 fn init_logger() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("canvas_fuse=info"),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("canvas_fuse=info"))
+        .init();
 }
 
 #[allow(clippy::too_many_arguments)]

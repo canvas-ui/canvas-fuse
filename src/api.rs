@@ -99,6 +99,79 @@ impl ApiClient {
         Ok(out)
     }
 
+    fn send_json(&self, method: reqwest::Method, path: &str, body: &Value) -> Result<Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self
+            .http
+            .request(method.clone(), &url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .with_context(|| format!("{method} {url}"))?;
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .with_context(|| format!("{method} {url}: invalid JSON (HTTP {status})"))?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "{method} {url}: HTTP {status}: {}",
+                body.get("message").and_then(Value::as_str).unwrap_or("?")
+            );
+        }
+        Ok(body)
+    }
+
+    /// Full document JSON (payload of GET /contexts/:id/documents/:docId).
+    pub fn get_document(&self, context_id: &str, doc_id: u64) -> Result<Value> {
+        let body = self.get_json(&format!(
+            "/rest/v2/contexts/{context_id}/documents/{doc_id}"
+        ))?;
+        Ok(body.get("payload").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Insert new documents into a context; returns created doc ids.
+    pub fn create_documents(&self, context_id: &str, docs: Vec<Value>) -> Result<Vec<u64>> {
+        let body = self.send_json(
+            reqwest::Method::POST,
+            &format!("/rest/v2/contexts/{context_id}/documents"),
+            &serde_json::json!({ "documents": docs }),
+        )?;
+        Ok(extract_result_ids(&body))
+    }
+
+    /// Update existing documents (objects must carry id). Returns the
+    /// resulting doc ids — synapsd mints a NEW id when checksum-relevant
+    /// fields change (content-addressed versioning), so callers must rebind.
+    pub fn update_documents(&self, context_id: &str, docs: Vec<Value>) -> Result<Vec<u64>> {
+        let body = self.send_json(
+            reqwest::Method::PUT,
+            &format!("/rest/v2/contexts/{context_id}/documents"),
+            &serde_json::json!({ "documents": docs }),
+        )?;
+        Ok(extract_result_ids(&body))
+    }
+
+    /// Unlink documents from this context (organizational removal).
+    pub fn remove_documents(&self, context_id: &str, ids: &[u64]) -> Result<()> {
+        self.send_json(
+            reqwest::Method::DELETE,
+            &format!("/rest/v2/contexts/{context_id}/documents/remove"),
+            &serde_json::json!(ids),
+        )?;
+        Ok(())
+    }
+
+    /// Destroy documents in the database (used only for our own transient
+    /// docs left behind by editors' atomic-rename save pattern).
+    pub fn delete_documents(&self, context_id: &str, ids: &[u64]) -> Result<()> {
+        self.send_json(
+            reqwest::Method::DELETE,
+            &format!("/rest/v2/contexts/{context_id}/documents"),
+            &serde_json::json!(ids),
+        )?;
+        Ok(())
+    }
+
     /// Unauthenticated server ping; returns (payload, round-trip time).
     pub fn ping(&self) -> Result<(Value, std::time::Duration)> {
         let started = std::time::Instant::now();
@@ -163,10 +236,7 @@ impl ApiClient {
             let batch = extract_documents(&body);
             let batch_len = batch.len();
             docs.extend(batch.iter().filter_map(parse_document));
-            let total = body
-                .get("totalCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
+            let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             offset += batch_len;
             if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
                 break;
@@ -174,6 +244,28 @@ impl ApiClient {
         }
         Ok(docs)
     }
+}
+
+// putMany/linkMany result: {successful: [{index, id}], failed: [...]} — but
+// tolerate a bare array of ids or docs
+fn extract_result_ids(body: &Value) -> Vec<u64> {
+    let payload = match body.get("payload") {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    if let Some(arr) = payload.get("successful").and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(|e| e.get("id").and_then(Value::as_u64).or_else(|| e.as_u64()))
+            .collect();
+    }
+    if let Some(arr) = payload.as_array() {
+        return arr
+            .iter()
+            .filter_map(|e| e.as_u64().or_else(|| e.get("id").and_then(Value::as_u64)))
+            .collect();
+    }
+    Vec::new()
 }
 
 // payload is usually the document array itself, but tolerate it being

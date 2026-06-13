@@ -160,11 +160,7 @@ impl BlobStore {
 
     fn run_fetch(&self, job: FetchJob) {
         let result = self.api.fetch_content(&job.workspace_id, job.doc_id);
-        let waiters = self
-            .in_flight
-            .lock()
-            .remove(&job.key)
-            .unwrap_or_default();
+        let waiters = self.in_flight.lock().remove(&job.key).unwrap_or_default();
         match result {
             Ok(bytes) => {
                 let blob = Arc::new(bytes);

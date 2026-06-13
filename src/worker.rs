@@ -14,6 +14,9 @@ pub enum Job {
     RefreshContext(String),
 }
 
+/// Notifies the ws layer to subscribe to a newly discovered context's channel.
+pub type NewContextCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 pub struct Worker {
     pub api: Arc<ApiClient>,
     pub tree: Arc<RwLock<Tree>>,
@@ -21,10 +24,13 @@ pub struct Worker {
     pub notifier: Option<Notifier>,
     /// Called when a refresh discovers a context that wasn't mounted yet,
     /// so the ws layer can subscribe to its event channel.
-    pub on_new_context: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub on_new_context: Option<NewContextCallback>,
     /// When set, only these context ids are materialized (agent containers
     /// typically mount a single context).
     pub context_filter: Option<HashSet<String>>,
+    /// Held across fetch+apply so refreshes serialize with write-path tree
+    /// mutations (WriteStore::sync_handle).
+    pub refresh_lock: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl Worker {
@@ -85,6 +91,9 @@ impl Worker {
             };
             self.notify(inv);
         }
+        // Fetch inside the lock: a list fetched before a concurrent write but
+        // applied after it would diff against a stale view.
+        let _guard = self.refresh_lock.as_ref().map(|l| l.lock());
         let docs = match self.api.list_documents(ctx_id) {
             Ok(d) => d,
             Err(e) => {
@@ -97,6 +106,7 @@ impl Worker {
             let mut tree = self.tree.write();
             tree.apply_documents(ctx_id, &docs, &self.names)
         };
+        drop(_guard);
         self.notify(inv);
     }
 

@@ -1,0 +1,113 @@
+name: build
+
+# Pre-build canvas-fuse binaries for download. Runs CI on every push/PR
+# (Linux), and on a version tag (v*) builds release artifacts for all targets
+# and attaches them to the GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast feedback: fmt + clippy + tests on Linux only.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # attach artifacts to the GitHub Release on tags
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: dynamic glibc build (smallest, needs host glibc) and a
+          # fully static musl build (download-and-run on any Linux — fuser is
+          # built without libfuse linkage, rustls instead of OpenSSL, so the
+          # only runtime dependency is the fusermount3 helper at mount time).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          # macOS: builds cleanly (no libfuse link); running the mount needs
+          # macFUSE installed on the user's machine. Experimental — allowed to
+          # fail without blocking the Linux release.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            experimental: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            experimental: true
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          bin=canvas-fuse
+          dist="canvas-fuse-${{ matrix.target }}"
+          mkdir "$dist"
+          cp "target/${{ matrix.target }}/release/$bin" "$dist/"
+          cp README.md LICENSE "$dist/" 2>/dev/null || true
+          tar czf "$dist.tar.gz" "$dist"
+          sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256" 2>/dev/null \
+            || shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canvas-fuse-${{ matrix.target }}
+          path: |
+            canvas-fuse-${{ matrix.target }}.tar.gz
+            canvas-fuse-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            canvas-fuse-${{ matrix.target }}.tar.gz
+            canvas-fuse-${{ matrix.target }}.tar.gz.sha256

@@ -25,6 +25,15 @@ canvas-server socket.io bridge (`context.url.set`, `document.*`) and pushes
 kernel invalidations via FUSE reverse notification. A periodic full resync
 (default 30 s) covers missed events and discovers new contexts.
 
+## Install
+
+Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
+`v*`). Linux: `x86_64`/`aarch64` glibc, plus a fully static `x86_64` musl build
+that runs on any distro (only the `fusermount3` helper is needed at mount time).
+macOS builds are experimental and require [macFUSE](https://macfuse.io). Or
+build from source with `cargo build --release` — no `libfuse` dev package is
+needed (`fuser` is built without it).
+
 ## CLI
 
 ```sh
@@ -114,9 +123,35 @@ calling `unmount()`) tears down ws client, threads, and the kernel mount.
 names, inode stability across URL switches, content invalidation, context
 removal.
 
+## Write path (Notes/, Todos/)
+
+Notes and Todos are writable: create/edit/rename/delete markdown files and the
+daemon maps them to document operations (notes: file = `data.content`, title
+untouched; todos: `- [x] title` + description body round-trips). Verified
+against real editor save patterns: in-place truncate+write (Obsidian, VS Code),
+append, atomic tmp+rename (sed -i, vim), mid-edit stat, touch, mv, rm.
+
+- Writes are buffered per open file and flushed on close (flush/fsync/release);
+  close-time errors reach the application. Requires a device or JWT token
+  (server `authenticateClient`).
+- synapsd mints a NEW doc id on every content change (content-addressed
+  versioning). The daemon rides this: rebinds the inode, re-pins the filename,
+  and detaches the superseded version from the context — the folder always
+  shows exactly the latest version; history stays in the DB.
+- Flush chains serialize against refresh cycles (shared lock) and in-flight
+  entries are frozen out of view diffs, so server-driven refreshes can never
+  drop or rename a file mid-save.
+- `rm` detaches the document from the context (never destroys user data);
+  only transient docs the mount itself created (atomic-save tmp files) are
+  destroyed. `mv` within a dir is a sticky-name rename; cross-dir returns
+  EXDEV so `mv` falls back to copy+unlink.
+- Obsidian: point the vault at a local dir and symlink
+  `Contexts/<id>/Notes` into it (Obsidian needs a writable vault root for
+  `.obsidian/`; the mount only accepts note files).
+
 ## Not yet
 
-- Write path: `mkdir` = attach layer, `mv` = placement-local detach/attach,
-  `rmdir` = detach only (semantics agreed, phase 2)
+- mkdir = attach layer, rmdir = detach (tree-structure writes)
+- Editing file blobs (Files/ is read-only)
 - Workspace/directory-type tree mounts
 - macOS backend (macFUSE; fuse-t incompatible with kernel-protocol fuser)

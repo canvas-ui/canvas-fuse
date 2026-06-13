@@ -4,7 +4,9 @@ use serde_json::Value;
 /// Schema dirs always present under every context dir, even when empty —
 /// apps anchor to these paths (e.g. an Obsidian vault rooted at Notes/),
 /// so the skeleton must not vanish on a context switch.
-pub const SCHEMA_DIRS: &[&str] = &["Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other"];
+pub const SCHEMA_DIRS: &[&str] = &[
+    "Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other",
+];
 
 pub enum Content {
     /// Bytes rendered locally from the document JSON
@@ -146,7 +148,11 @@ fn render_note(doc: &Document) -> Rendered {
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    Rendered::inline("Notes", format!("{}.md", slug(&title)), content.into_bytes())
+    Rendered::inline(
+        "Notes",
+        format!("{}.md", slug(&title)),
+        content.into_bytes(),
+    )
 }
 
 fn render_todo(doc: &Document) -> Rendered {
@@ -162,11 +168,15 @@ fn render_todo(doc: &Document) -> Rendered {
     let mark = if done { "x" } else { " " };
     let mut content = format!("- [{mark}] {title}\n");
     if let Some(desc) = str_field(&doc.data, &["description"]) {
-        content.push_str("\n");
+        content.push('\n');
         content.push_str(desc);
         content.push('\n');
     }
-    Rendered::inline("Todos", format!("{}.md", slug(&title)), content.into_bytes())
+    Rendered::inline(
+        "Todos",
+        format!("{}.md", slug(&title)),
+        content.into_bytes(),
+    )
 }
 
 fn render_json(doc: &Document, dir: &'static str) -> Rendered {

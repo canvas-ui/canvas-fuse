@@ -41,7 +41,9 @@ fn state_file_for(mountpoint: &Path) -> PathBuf {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    state_dir().join("mounts").join(format!("{name}.{hash:08x}.json"))
+    state_dir()
+        .join("mounts")
+        .join(format!("{name}.{hash:08x}.json"))
 }
 
 pub fn write_state(state: &MountState) -> Result<PathBuf> {

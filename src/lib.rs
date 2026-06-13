@@ -8,6 +8,7 @@ pub mod render;
 pub mod runtime;
 pub mod state;
 pub mod worker;
+pub mod writes;
 
 use anyhow::{Context as _, Result};
 use parking_lot::RwLock;
@@ -96,16 +97,21 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         notifier: None,
         on_new_context: None,
         context_filter: context_filter.clone(),
+        refresh_lock: None,
     };
     bootstrap.refresh_all();
 
     let blobs = blobs::BlobStore::new(api.clone(), opts.blob_cache_bytes, 4);
-    let fs = fsimpl::CanvasFs::new(tree.clone(), blobs);
+    let write_store = Arc::new(writes::WriteStore::new(
+        api.clone(),
+        tree.clone(),
+        names.clone(),
+    ));
+    let fs = fsimpl::CanvasFs::new(tree.clone(), blobs, write_store.clone());
     let session = fuser::spawn_mount2(
         fs,
         &opts.mountpoint,
         &[
-            fuser::MountOption::RO,
             fuser::MountOption::FSName("canvas".to_string()),
             fuser::MountOption::Subtype("canvasfs".to_string()),
         ],
@@ -128,7 +134,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         None
     };
 
-    let on_new_context: Option<Box<dyn Fn(&str) + Send + Sync>> = ws.as_ref().map(|ws| {
+    let on_new_context: Option<worker::NewContextCallback> = ws.as_ref().map(|ws| {
         let subscriber = ws.subscriber.clone();
         Box::new(move |ctx_id: &str| subscriber.subscribe(ctx_id)) as _
     });
@@ -140,6 +146,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         notifier: Some(session.notifier()),
         on_new_context,
         context_filter,
+        refresh_lock: Some(write_store.sync_handle()),
     };
     std::thread::Builder::new()
         .name("canvas-fuse-worker".into())

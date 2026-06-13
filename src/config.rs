@@ -58,15 +58,16 @@ pub fn resolve(
             .context("no --remote given and no boundRemote in cli-session.json")?,
     };
 
-    let remote = remotes
-        .get(&remote_name)
-        .with_context(|| {
-            let known: Vec<String> = remotes
-                .as_object()
-                .map(|o| o.keys().cloned().collect())
-                .unwrap_or_default();
-            format!("remote \"{remote_name}\" not found in remotes.json (known: {})", known.join(", "))
-        })?;
+    let remote = remotes.get(&remote_name).with_context(|| {
+        let known: Vec<String> = remotes
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        format!(
+            "remote \"{remote_name}\" not found in remotes.json (known: {})",
+            known.join(", ")
+        )
+    })?;
 
     let remote_server = server
         .or_else(|| {
