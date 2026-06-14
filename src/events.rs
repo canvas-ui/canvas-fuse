@@ -11,9 +11,10 @@ use std::sync::Arc;
 #[derive(Default)]
 struct SubscriberInner {
     client: Option<RawClient>,
-    /// Contexts the server has *confirmed* subscribed (via its `subscribed`
-    /// event). A subscribe that was denied (e.g. workspace still starting →
-    /// "Access denied") never lands here, so `subscribe` keeps retrying it.
+    /// Channels the server has *confirmed* subscribed (via its `subscribed`
+    /// event), stored by full channel name (`context:<id>` / `workspace:<id>`).
+    /// A subscribe that was denied (e.g. workspace still starting → "Access
+    /// denied") never lands here, so the subscribe keeps getting retried.
     confirmed: HashSet<String>,
 }
 
@@ -32,33 +33,42 @@ impl Subscriber {
         self.0.lock().confirmed.clear();
     }
 
-    /// Server acked a subscription.
-    fn confirm(&self, ctx_id: &str) {
-        self.0.lock().confirmed.insert(ctx_id.to_string());
-        log::debug!("ws subscription confirmed for {ctx_id}");
+    /// Server acked a subscription (keyed by full channel name).
+    fn confirm(&self, channel: &str) {
+        self.0.lock().confirmed.insert(channel.to_string());
+        log::debug!("ws subscription confirmed for {channel}");
     }
 
-    /// Ensure `ctx_id` is subscribed. No-op if already confirmed; otherwise
-    /// (re)emits the subscribe. Safe to call on every successful refresh — the
-    /// confirmed set throttles it to one emit per actual subscription.
-    pub fn subscribe(&self, ctx_id: &str) {
+    /// Emit a subscribe for an arbitrary channel, deduped by the confirmed set.
+    fn subscribe_raw(&self, channel: &str) {
         let inner = self.0.lock();
-        if inner.confirmed.contains(ctx_id) {
+        if inner.confirmed.contains(channel) {
             return;
         }
         if let Some(client) = inner.client.as_ref() {
-            let channel = format!("context:{ctx_id}");
             if let Err(e) = client.emit("subscribe", json!({ "channel": channel })) {
                 log::warn!("ws subscribe {channel} failed: {e}");
             }
         }
     }
+
+    /// Ensure a context channel is subscribed. Safe to call on every refresh.
+    pub fn subscribe(&self, ctx_id: &str) {
+        self.subscribe_raw(&format!("context:{ctx_id}"));
+    }
+
+    /// Ensure a workspace channel is subscribed (workspace-mount live updates).
+    pub fn subscribe_workspace(&self, ws_id: &str) {
+        self.subscribe_raw(&format!("workspace:{ws_id}"));
+    }
 }
 
-fn context_id_from_channel(payload: &Payload) -> Option<String> {
+fn channel_from_payload(payload: &Payload) -> Option<String> {
     let value = first_payload_value(payload)?;
-    let channel = value.get("channel").and_then(Value::as_str)?;
-    channel.strip_prefix("context:").map(|id| id.to_string())
+    value
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 pub struct EventClient {
@@ -98,18 +108,29 @@ pub fn connect(
     tree: Arc<RwLock<Tree>>,
     subscriber: Subscriber,
 ) -> Result<EventClient> {
+    // Mount mode is fixed for the life of the process; decide once.
+    let ws_mode = tree.read().is_workspace();
+
     let sub_auth = subscriber.clone();
     let auth_tree = tree;
     let auth_tx = tx.clone();
     let on_authenticated = move |_payload: Payload, raw: RawClient| {
-        log::info!("ws authenticated, subscribing to context channels");
         sub_auth.set_client(raw);
-        // Fresh socket: prior confirmations are void. Attempt current contexts;
-        // any that the server isn't ready for (workspace down) stay unconfirmed
-        // and get retried after their next successful refresh.
+        // Fresh socket: prior confirmations are void.
         sub_auth.reset_confirmed();
-        for ctx_id in auth_tree.read().context_ids() {
-            sub_auth.subscribe(&ctx_id);
+        if ws_mode {
+            // Workspace mount: one channel carries every tree/document change.
+            if let Some(ws_id) = auth_tree.read().ws_id() {
+                log::info!("ws authenticated, subscribing to workspace:{ws_id}");
+                sub_auth.subscribe_workspace(&ws_id);
+            }
+        } else {
+            log::info!("ws authenticated, subscribing to context channels");
+            // Any context the server isn't ready for (workspace down) stays
+            // unconfirmed and gets retried after its next successful refresh.
+            for ctx_id in auth_tree.read().context_ids() {
+                sub_auth.subscribe(&ctx_id);
+            }
         }
         // Catch up on anything missed while disconnected
         let _ = auth_tx.send(Job::RefreshAll);
@@ -119,8 +140,8 @@ pub fn connect(
     // worker stops re-issuing that subscribe.
     let sub_ack = subscriber.clone();
     let on_subscribed = move |payload: Payload, _: RawClient| {
-        if let Some(ctx_id) = context_id_from_channel(&payload) {
-            sub_ack.confirm(&ctx_id);
+        if let Some(channel) = channel_from_payload(&payload) {
+            sub_ack.confirm(&channel);
         }
     };
 
@@ -130,6 +151,15 @@ pub fn connect(
             Event::Custom(name) => name.as_str(),
             _ => return,
         };
+        // Workspace mounts reconcile the whole tree on any structural or
+        // document change — there's no per-context job to target.
+        if ws_mode {
+            if name.starts_with("tree.") || name.starts_with("document.") {
+                log::debug!("ws event (workspace): {name}");
+                let _ = event_tx.send(Job::RefreshAll);
+            }
+            return;
+        }
         let relevant = name.starts_with("document.")
             || name == "context.url.set"
             || name == "context.updated"

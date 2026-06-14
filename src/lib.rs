@@ -88,8 +88,8 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     let api = Arc::new(api::ApiClient::new(&opts.server, &opts.token)?);
 
     // Workspace mode roots the mount at a workspace's trees; resolve it up front
-    // so the tree is built in the right mode. Workspace events aren't on the
-    // per-context ws channel, so these mounts refresh via the resync loop.
+    // so the tree is built in the right mode. Live updates ride the
+    // `workspace:<id>` ws channel (every tree/document change is forwarded there).
     let workspace_mode = opts.workspace.is_some();
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
         let ws = api
@@ -102,7 +102,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
             None => state::Tree::new(),
         }
     }));
-    let enable_ws = opts.enable_ws && !workspace_mode;
+    let enable_ws = opts.enable_ws;
     let context_filter: Option<HashSet<String>> = if workspace_mode {
         None
     } else {
@@ -149,7 +149,9 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     // connects late, or a workspace that starts after mount, still ends up
     // subscribed — the first successful refresh triggers the subscribe.
     let subscriber = events::Subscriber::default();
-    let ensure_subscribed: Option<worker::NewContextCallback> = if enable_ws {
+    // Per-context resubscribe is a context-mode concern; workspace mounts
+    // subscribe their single `workspace:<id>` channel on ws authenticate.
+    let ensure_subscribed: Option<worker::NewContextCallback> = if enable_ws && !workspace_mode {
         let s = subscriber.clone();
         Some(Box::new(move |ctx_id: &str| s.subscribe(ctx_id)))
     } else {
