@@ -717,8 +717,10 @@ impl WriteStore {
             .read()
             .locate_tree_dir(child_ino)
             .ok_or(WriteError::NotPermitted)?;
+        // Non-recursive: a bare `rmdir` on a non-empty folder must fail. `rm -r`
+        // still works — the kernel unlinks children first, then rmdir the empty dir.
         self.api
-            .remove_tree_path(&ws, &tree_id, &child_path, true)
+            .remove_tree_path(&ws, &tree_id, &child_path, false)
             .map_err(|e| WriteError::Io(format!("{e:#}")))?;
         // The kernel drops the dentry itself on a successful rmdir; we only need
         // to keep our local view consistent.

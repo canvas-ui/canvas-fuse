@@ -114,9 +114,14 @@ impl Worker {
             }
         }
 
-        // Populate documents at every known path.
-        for (tree_name, path) in self.tree.read().ws_paths() {
-            let Some((tree_id, tree_type)) = self.tree.read().ws_tree_meta(&tree_name) else {
+        // Populate documents at every known path. Snapshot the path list into an
+        // owned Vec first: holding a read guard as the for-loop iterator
+        // temporary would deadlock against the per-path tree.write() below
+        // (parking_lot is not reentrant).
+        let paths = self.tree.read().ws_paths();
+        for (tree_name, path) in paths {
+            let meta = self.tree.read().ws_tree_meta(&tree_name);
+            let Some((tree_id, tree_type)) = meta else {
                 continue;
             };
             match self
