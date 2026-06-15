@@ -1,8 +1,12 @@
 # canvas-fuse
 
-FUSE-based Canvas context mount — materializes **context views** as live folders.
-A universal helper: usable by users from a shell, by agent containers, and as a
-sidecar/library by other apps (canvas desktop UI).
+FUSE-based Canvas mount — materializes context views and workspace trees as live
+folders. A universal helper: usable by users from a shell, by agent containers,
+and as a sidecar/library by other apps (canvas desktop UI).
+
+Two mount modes:
+
+**Context mode** (default): materializes one or more context views.
 
 ```
 <mountpoint>/
@@ -13,7 +17,7 @@ sidecar/library by other apps (canvas desktop UI).
         ├── Notes/   *.md          # data/abstraction/note
         ├── Todos/   *.md          # data/abstraction/todo
         ├── Links/   *.url         # data/abstraction/link
-        ├── Files/   real files     # data/abstraction/file — blob content, lazy-fetched
+        ├── Files/   real files    # data/abstraction/file — blob content, lazy-fetched
         ├── Emails/  *.json
         └── Other/   *.json        # any unmapped schema
 ```
@@ -24,6 +28,30 @@ the view updates in place within ~1s: the daemon subscribes to the
 canvas-server socket.io bridge (`context.url.set`, `document.*`) and pushes
 kernel invalidations via FUSE reverse notification. A periodic full resync
 (default 30 s) covers missed events and discovers new contexts.
+
+**Workspace mode** (`-w <name>`): mounts all trees of a workspace (both
+`tree:Context` and `tree:Directory` types) read/write, recreating each tree's
+folder hierarchy at the top level.
+
+```
+<mountpoint>/<workspace-name>/
+├── <tree-name>/
+│   ├── <folder>/
+│   │   ├── <subfolder>/
+│   │   │   └── document.md
+│   │   └── document.md
+│   └── document.md
+└── <another-tree>/
+    └── ...
+```
+
+Documents appear as flat files named by their `data.filename` (round-trips
+safely through create/rename). Live updates arrive via the `workspace:<id>`
+socket.io channel — any tree or document change (path insert/remove, document
+insert/update/remove) triggers a full tree reconcile within ~1s. Supports
+markdown write path: create files, edit content, rename and delete files, mkdir,
+rmdir (non-recursive, matching POSIX semantics). Designed for bulk wiki/folder
+imports.
 
 ## Install
 
@@ -39,12 +67,25 @@ package needed).
 ```sh
 canvas-fuse mount ~/Canvas                 # foreground; ctrl-c unmounts
 canvas-fuse mount -d ~/Canvas              # detached daemon, logs to state dir
-canvas-fuse mount -d -c work ~/ctx/work    # only specific context(s)
+canvas-fuse mount -d -c work ~/ctx/work    # only specific context(s); single -c roots at that context
+canvas-fuse mount -w universe ~/mnt        # workspace mount at ~/mnt/universe/
 canvas-fuse unmount ~/Canvas               # SIGTERM daemon, escalates if needed
 canvas-fuse status [--json]                # known mounts + health (ok/orphaned/...)
 canvas-fuse ping [--json]                  # server reachability, version, auth check
 canvas-fuse contexts [--json]              # list accessible contexts
 ```
+
+### mount flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-c/--context <id>` | (all) | Only mount specific context ids (repeatable). Single `-c` roots the mount at that context (schema dirs at top level, no `Contexts/` wrapper). Mutually exclusive with `-w`. |
+| `-w/--workspace <name>` | — | Mount a whole workspace's trees read/write. Mounts at `<mountpoint>/<name>/`. Mutually exclusive with `-c`. |
+| `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
+| `--no-ws` | false | Disable the websocket event bridge (poll-only mode). |
+| `--resync <secs>` | 30 | Full resync interval in seconds. |
+| `--data-dir <path>` | `~/.canvas/<remote>/fuse/…` | Override the per-mount state directory (sticky filename map). Also `CANVAS_FUSE_DATA_DIR`. |
+| `--blob-cache-mb <n>` | 256 | In-memory cache budget for file content. |
 
 ### Connection resolution
 
@@ -126,34 +167,40 @@ calling `unmount()`) tears down ws client, threads, and the kernel mount.
 names, inode stability across URL switches, content invalidation, context
 removal.
 
-## Write path (Notes/, Todos/)
+## Write path
 
-Notes and Todos are writable: create/edit/rename/delete markdown files and the
-daemon maps them to document operations (notes: file = `data.content`, title
+**Context mode (Notes/, Todos/):** create/edit/rename/delete markdown files;
+daemon maps to document operations (notes: file = `data.content`, title
 untouched; todos: `- [x] title` + description body round-trips). Verified
 against real editor save patterns: in-place truncate+write (Obsidian, VS Code),
 append, atomic tmp+rename (sed -i, vim), mid-edit stat, touch, mv, rm.
 
+**Workspace mode:** full read/write over the workspace's tree hierarchy.
+
+- `mkdir` → creates a tree path (folder) on the server.
+- `rmdir` → removes the path (non-recursive; `rm -r` still works via POSIX
+  layer: files unlinked first, then empty dirs removed bottom-up).
+- create file → new document inserted into the tree at that path.
+- edit/save → document content updated; synapsd mints a new doc id (content-
+  addressed versioning) and the daemon rebinds the inode transparently.
+- `mv` within a dir → document filename rename. `mv` across dirs → tree path
+  move (folder) or EXDEV (file; `mv` falls back to copy+unlink).
+- `rm` → document detached from the tree (never destroys user data; only
+  transient tmp files created by the mount itself are hard-deleted).
+
+Common to both modes:
+
 - Writes are buffered per open file and flushed on close (flush/fsync/release);
-  close-time errors reach the application. Requires a device or JWT token
-  (server `authenticateClient`).
-- synapsd mints a NEW doc id on every content change (content-addressed
-  versioning). The daemon rides this: rebinds the inode, re-pins the filename,
-  and detaches the superseded version from the context — the folder always
-  shows exactly the latest version; history stays in the DB.
+  close-time errors reach the application. Requires a device or JWT token.
 - Flush chains serialize against refresh cycles (shared lock) and in-flight
-  entries are frozen out of view diffs, so server-driven refreshes can never
-  drop or rename a file mid-save.
-- `rm` detaches the document from the context (never destroys user data);
-  only transient docs the mount itself created (atomic-save tmp files) are
-  destroyed. `mv` within a dir is a sticky-name rename; cross-dir returns
-  EXDEV so `mv` falls back to copy+unlink.
+  entries are frozen out of view diffs, so server-driven refreshes never drop
+  or rename a file mid-save.
 - Obsidian: point the vault at a local dir and symlink
-  `Contexts/<id>/Notes` into it (Obsidian needs a writable vault root for
-  `.obsidian/`; the mount only accepts note files).
+  `Contexts/<id>/Notes` into it, or point a workspace mount directly (Obsidian
+  needs a writable vault root for `.obsidian/`; keep it outside the mount).
 
 ## Not yet
 
-- mkdir = attach layer, rmdir = detach (tree-structure writes)
-- Editing file blobs (Files/ is read-only)
-- Workspace/directory-type tree mounts
+- Editing file blobs (`Files/` is read-only)
+- Global `Workspaces/` umbrella in the all-contexts mount (only rooted single `-w` is supported)
+- Eager per-path document refresh (workspace mode issues one request per tree path; fine for wiki scale, optimize later)
