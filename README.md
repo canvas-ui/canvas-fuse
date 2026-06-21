@@ -1,6 +1,6 @@
 # canvas-fuse
 
-FUSE-based Canvas mount — materializes context views and workspace trees as live
+FUSE-based Canvas mount - materializes context views and workspace trees as live
 folders. A universal helper: usable by users from a shell, by agent containers,
 and as a sidecar/library by other apps (canvas desktop UI).
 
@@ -17,13 +17,13 @@ Two mount modes:
         ├── Notes/   *.md          # data/abstraction/note
         ├── Todos/   *.md          # data/abstraction/todo
         ├── Links/   *.url         # data/abstraction/link
-        ├── Files/   real files    # data/abstraction/file — blob content, lazy-fetched
+        ├── Files/   real files    # data/abstraction/file - blob content, lazy-fetched
         ├── Emails/  *.json
         └── Other/   *.json        # any unmapped schema
 ```
 
 Folder contents are a function of the context's current URL. When the URL is
-switched — by a browser bound to the context, the CLI, an agent, anything —
+switched - by a browser bound to the context, the CLI, an agent, anything -
 the view updates in place within ~1s: the daemon subscribes to the
 canvas-server socket.io bridge (`context.url.set`, `document.*`) and pushes
 kernel invalidations via FUSE reverse notification. A periodic full resync
@@ -47,7 +47,7 @@ folder hierarchy at the top level.
 
 Documents appear as flat files named by their `data.filename` (round-trips
 safely through create/rename). Live updates arrive via the `workspace:<id>`
-socket.io channel — any tree or document change (path insert/remove, document
+socket.io channel - any tree or document change (path insert/remove, document
 insert/update/remove) triggers a full tree reconcile within ~1s. Supports
 markdown write path: create files, edit content, rename and delete files, mkdir,
 rmdir (non-recursive, matching POSIX semantics). Designed for bulk wiki/folder
@@ -58,7 +58,7 @@ imports.
 Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
 `v*`). Linux: `x86_64`/`aarch64` glibc, plus a fully static `x86_64` musl build
 that runs on any distro (only the `fusermount3` helper is needed at mount time).
-Linux only — `fuser`'s pure-Rust backend (no libfuse) is not supported on macOS
+Linux only - `fuser`'s pure-Rust backend (no libfuse) is not supported on macOS
 or Windows. Build from source with `cargo build --release` (no `libfuse` dev
 package needed).
 
@@ -80,7 +80,7 @@ canvas-fuse contexts [--json]              # list accessible contexts
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-c/--context <id>` | (all) | Only mount specific context ids (repeatable). Single `-c` roots the mount at that context (schema dirs at top level, no `Contexts/` wrapper). Mutually exclusive with `-w`. |
-| `-w/--workspace <name>` | — | Mount a whole workspace's trees read/write. Mounts at `<mountpoint>/<name>/`. Mutually exclusive with `-c`. |
+| `-w/--workspace <name>` | - | Mount a whole workspace's trees read/write. Mounts at `<mountpoint>/<name>/`. Mutually exclusive with `-c`. |
 | `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only mode). |
 | `--resync <secs>` | 30 | Full resync interval in seconds. |
@@ -105,7 +105,7 @@ CANVAS_SERVER=https://canvas.example CANVAS_API_TOKEN=canvas-... \
 ```
 
 Requires `fusermount3` (present on any desktop distro; `fuse3` package in
-containers). No libfuse linkage — `fuser` is built with
+containers). No libfuse linkage - `fuser` is built with
 `default-features = false` and speaks the kernel protocol directly, so the
 binary is self-contained.
 
@@ -115,10 +115,10 @@ binary is self-contained.
   location URL basename (real extension preserved, so players/editors open it),
   size from `metadata.size`. When the doc carries no size, the file is still
   shown as-is and the size is resolved lazily from the blob on first `stat`
-  (cached thereafter) — never a `.json` stub. Bytes are fetched lazily through
+  (cached thereafter) - never a `.json` stub. Bytes are fetched lazily through
   `GET /workspaces/:id/documents/:docId/content` (the server resolves
   `stored://` / `file://{WORKSPACE_ROOT}` locations) on first read, via a fetch
-  pool — the FUSE session loop never blocks on the network, concurrent kernel
+  pool - the FUSE session loop never blocks on the network, concurrent kernel
   readahead of the same blob is deduplicated into one download, and blobs are
   cached in memory by checksum (LRU, `--blob-cache-mb`, default 256).
   `Files/` is read-only.
@@ -131,7 +131,7 @@ binary is self-contained.
   redb keyed by `(context, schemaDir, docId)`. Title collisions get a docId
   suffix (`Meeting.2.md`) and never silently swap back to the clean name, so
   external references (Obsidian links) stay valid. Assignment is deterministic
-  (docId order); the map is per-device — lifting it to server-side
+  (docId order); the map is per-device - lifting it to server-side
   document-in-context metadata is the planned path to cross-device identical
   names.
 - **Inode stability.** A document keeps its inode across context URL switches
@@ -144,20 +144,20 @@ binary is self-contained.
   hook for FUSE reverse invalidation was lost in the ~5.3 refactor). Practical
   effect: `ls`/`cat`/agents always see fresh data with no manual refresh;
   editors watching files notice removals; file managers showing a directory
-  listing may need a nudge — a desktop app can deliver one from the same ws
+  listing may need a nudge - a desktop app can deliver one from the same ws
   events. Entries *entering* a view are never push-notified (no FUSE create
   notification exists); they appear on the next readdir.
 - **Daemon lifecycle.** `mount -d` daemonizes after pre-flight (so config and
   connectivity errors still reach the terminal), writes a state file under
   `~/.local/state/canvas-fuse/mounts/`, and exits hard on SIGTERM after
-  unmounting — rust_socketio's reconnect thread otherwise outlives
+  unmounting - rust_socketio's reconnect thread otherwise outlives
   `disconnect()` and would pin the process. `unmount`/`status` operate on the
   state files; stale entries from crashes are cleaned up automatically and
   stale kernel mounts are recovered with `fusermount3 -uz` on the next mount.
 
 ## Embedding
 
-`canvas_fuse::mount(MountOptions) -> MountHandle` — dropping the handle (or
+`canvas_fuse::mount(MountOptions) -> MountHandle` - dropping the handle (or
 calling `unmount()`) tears down ws client, threads, and the kernel mount.
 `MountOptions.contexts` filters which contexts are materialized.
 
