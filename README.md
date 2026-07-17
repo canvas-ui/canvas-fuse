@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/canvas-ai/.github/main/banners/canvas-banner_1200x480.jpg" alt="Canvas" width="100%" />
+</p>
+
 # canvas-fuse
 
 FUSE-based Canvas mount - materializes context views and workspace trees as live
