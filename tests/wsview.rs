@@ -14,7 +14,7 @@ fn ti(id: &str, name: &str, tree_type: &str) -> TreeInfo {
 fn note(id: u64, title: &str, content: &str) -> Document {
     Document {
         id,
-        schema: "data/abstraction/note".to_string(),
+        schema: "data/schema/note".to_string(),
         data: json!({ "title": title, "content": content }),
         updated_at: SystemTime::UNIX_EPOCH,
         locations: Vec::new(),

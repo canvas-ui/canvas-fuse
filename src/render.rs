@@ -53,12 +53,12 @@ pub fn flat(doc: &Document) -> (String, Content) {
 
 pub fn render(doc: &Document) -> Rendered {
     match doc.schema.as_str() {
-        "data/abstraction/tab" => render_link(doc, "Tabs"),
-        "data/abstraction/link" => render_link(doc, "Links"),
-        "data/abstraction/note" => render_note(doc),
-        "data/abstraction/todo" => render_todo(doc),
-        "data/abstraction/file" => render_file(doc),
-        "data/abstraction/email" => render_json(doc, "Emails"),
+        "data/schema/tab" => render_link(doc, "Tabs"),
+        "data/schema/link" => render_link(doc, "Links"),
+        "data/schema/note" => render_note(doc),
+        "data/schema/task" => render_todo(doc),
+        "data/schema/file" => render_file(doc),
+        "data/schema/message/email" => render_json(doc, "Emails"),
         _ => render_json(doc, "Other"),
     }
 }

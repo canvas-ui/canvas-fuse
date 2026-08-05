@@ -933,7 +933,7 @@ impl WriteStore {
         let schema = existing
             .get("schema")
             .and_then(Value::as_str)
-            .unwrap_or("data/abstraction/note")
+            .unwrap_or("data/schema/note")
             .to_string();
         let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
         data["filename"] = json!(filename);
@@ -966,10 +966,12 @@ impl WriteStore {
         let schema = existing
             .get("schema")
             .and_then(Value::as_str)
-            .unwrap_or("data/abstraction/note")
+            .unwrap_or("data/schema/note")
             .to_string();
         let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
-        let dir = if schema.ends_with("todo") {
+        // Exact id match, not a suffix test: with hierarchical ids a suffix match
+        // would silently misroute any id that merely ends in the same segment.
+        let dir = if schema == "data/schema/task" {
             "Todos"
         } else {
             "Notes"
@@ -1046,7 +1048,7 @@ impl WriteStore {
         let schema = existing
             .get("schema")
             .and_then(Value::as_str)
-            .unwrap_or("data/abstraction/note")
+            .unwrap_or("data/schema/note")
             .to_string();
         let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
         apply_buffer_to_data(dir, &mut data, buffer);
@@ -1148,13 +1150,13 @@ fn build_new_document(dir: &str, name: &str, buffer: &[u8]) -> Value {
             if let Some(d) = description {
                 data["description"] = json!(d);
             }
-            json!({ "schema": "data/abstraction/todo", "data": data })
+            json!({ "schema": "data/schema/task", "data": data })
         }
         _ => {
             // A markdown H1 wins; else fall back to the filename stem.
             let title = first_markdown_h1(&text).unwrap_or_else(|| stem.to_string());
             json!({
-                "schema": "data/abstraction/note",
+                "schema": "data/schema/note",
                 "data": { "title": title, "content": text }
             })
         }
@@ -1183,11 +1185,11 @@ fn parent_of(path: &str) -> String {
 fn ws_doc_schema(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     if lower.ends_with(".todo.json") {
-        Some("data/abstraction/todo")
+        Some("data/schema/task")
     } else if lower.ends_with(".md") {
-        Some("data/abstraction/note")
+        Some("data/schema/note")
     } else if lower.ends_with(".url") {
-        Some("data/abstraction/tab")
+        Some("data/schema/tab")
     } else {
         None
     }
@@ -1199,7 +1201,7 @@ fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
     let schema = ws_doc_schema(name)?;
     let text = String::from_utf8_lossy(buffer);
     match schema {
-        "data/abstraction/todo" => {
+        "data/schema/task" => {
             let stem = name.strip_suffix(".todo.json").unwrap_or(name);
             let (mut title, done, description) = parse_todo_markdown(&text);
             if title.is_empty() {
@@ -1211,7 +1213,7 @@ fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
             }
             Some(json!({ "schema": schema, "data": data }))
         }
-        "data/abstraction/tab" => {
+        "data/schema/tab" => {
             let stem = name.strip_suffix(".url").unwrap_or(name);
             let url = extract_url(&text)?;
             Some(json!({

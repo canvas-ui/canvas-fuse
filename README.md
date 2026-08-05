@@ -17,11 +17,11 @@ Two mount modes:
 └── Contexts/
     └── <context-id>/
         ├── .context.json          # context metadata incl. current url
-        ├── Tabs/    *.url         # data/abstraction/tab
-        ├── Notes/   *.md          # data/abstraction/note
-        ├── Todos/   *.md          # data/abstraction/todo
-        ├── Links/   *.url         # data/abstraction/link
-        ├── Files/   real files    # data/abstraction/file - blob content, lazy-fetched
+        ├── Tabs/    *.url         # data/schema/tab
+        ├── Notes/   *.md          # data/schema/note
+        ├── Todos/   *.md          # data/schema/task
+        ├── Links/   *.url         # data/schema/link
+        ├── Files/   real files    # data/schema/file - blob content, lazy-fetched
         ├── Emails/  *.json
         └── Other/   *.json        # any unmapped schema
 ```

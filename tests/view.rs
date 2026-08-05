@@ -28,7 +28,7 @@ fn doc(id: u64, schema: &str, data: serde_json::Value) -> Document {
 fn note(id: u64, title: &str, content: &str) -> Document {
     doc(
         id,
-        "data/abstraction/note",
+        "data/schema/note",
         json!({ "title": title, "content": content }),
     )
 }
@@ -36,13 +36,13 @@ fn note(id: u64, title: &str, content: &str) -> Document {
 fn tab(id: u64, title: &str, url: &str) -> Document {
     doc(
         id,
-        "data/abstraction/tab",
+        "data/schema/tab",
         json!({ "title": title, "url": url }),
     )
 }
 
 fn file(id: u64, location: &str, size: Option<u64>, checksum: &str) -> Document {
-    let mut d = doc(id, "data/abstraction/file", json!({}));
+    let mut d = doc(id, "data/schema/file", json!({}));
     d.locations = vec![location.to_string()];
     d.size = size;
     d.checksum = Some(checksum.to_string());
