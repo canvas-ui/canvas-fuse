@@ -1,7 +1,10 @@
 [package]
 name = "canvas-fuse"
-version = "0.5.0"
-description = "Canvas context FUSE mount — materializes context views as folders"
+version = "0.5.1"
+description = "Canvas context FUSE mount that materializes context views as folders"
+authors = ["Jozef Melich <me@idnc.sk>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/canvas-ui/canvas-fuse"
 edition = "2021"
 
 [lib]

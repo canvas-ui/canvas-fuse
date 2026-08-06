@@ -245,3 +245,15 @@ Common to both modes:
 - Editing file blobs (`Files/` is read-only)
 - Global `Workspaces/` umbrella in the all-contexts mount (only rooted single `-w` is supported)
 - Eager per-path document refresh (workspace mode issues one request per tree path; fine for wiki scale, optimize later)
+
+## Licence
+
+Copyright (C) 2026 Jozef Melich.
+
+Canvas FUSE is licensed under the **[AGPL-3.0-or-later](LICENSE)** and under no
+other terms. No commercial exemption is offered for this component, to anyone.
+The Canvas clients stay free software in all cases.
+
+Contributing needs no CLA here, only a DCO sign-off (`git commit -s`). See
+[CONTRIBUTING.md](CONTRIBUTING.md). The dual-licensed Canvas components are
+listed in [NOTICE](NOTICE).
