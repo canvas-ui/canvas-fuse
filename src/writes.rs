@@ -38,6 +38,10 @@ enum FlushTarget {
         path: String,
         doc_id: u64,
     },
+    /// Write a real file on the home drive. Whole-file PUT on flush — the home
+    /// API replaces files rather than patching them, which is the same shape
+    /// this overlay already uses for documents.
+    HomeFile { path: String, dir_ino: u64, name: String },
     /// Create a new document in a workspace tree path on first flush
     WsCreate {
         tree_name: String,
@@ -91,6 +95,8 @@ pub enum WriteError {
     NotPermitted,
     NotFound,
     Exists,
+    /// rmdir on a directory that still has children (POSIX: ENOTEMPTY).
+    NotEmpty,
     CrossDir,
     Io(String),
 }
@@ -101,6 +107,7 @@ impl WriteError {
             WriteError::NotPermitted => libc::EACCES,
             WriteError::NotFound => libc::ENOENT,
             WriteError::Exists => libc::EEXIST,
+            WriteError::NotEmpty => libc::ENOTEMPTY,
             WriteError::CrossDir => libc::EXDEV,
             WriteError::Io(_) => libc::EIO,
         }
@@ -204,7 +211,47 @@ impl WriteStore {
     // ── open / create / write / truncate ────────────────────────────────────
 
     /// Prepare a write state for an existing tree file (open with write access).
+    /// The flush target for a home file that already exists in the view.
+    fn home_target(&self, ino: u64) -> Option<FlushTarget> {
+        let tree = self.tree.read();
+        let (path, _size) = tree.home_file(ino)?;
+        let node = tree.get(ino)?;
+        Some(FlushTarget::HomeFile {
+            path,
+            dir_ino: node.parent,
+            name: node.name.clone(),
+        })
+    }
+
     pub fn open_existing(&self, ino: u64, truncate: bool) -> WResult<()> {
+        // Home files are edited whole: read the current bytes into the buffer so
+        // a partial write (every editor does one) does not truncate the rest of
+        // the file when the PUT replaces it.
+        if let Some(target) = self.home_target(ino) {
+            let (path, size) = self.tree.read().home_file(ino).ok_or(WriteError::NotFound)?;
+            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+            let content = if truncate || size == 0 {
+                Vec::new()
+            } else {
+                self.api
+                    .read_home_range(&ws, &path, 0, size.saturating_sub(1))
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?
+            };
+            let mut inner = self.inner.lock();
+            let state = inner.states.entry(ino).or_insert_with(|| OpenWrite {
+                buffer: content,
+                dirty: truncate,
+                refs: 0,
+                target,
+            });
+            state.refs += 1;
+            if truncate {
+                state.buffer.clear();
+                state.dirty = true;
+            }
+            return Ok(());
+        }
+
         let content = {
             let tree = self.tree.read();
             let node = tree.get(ino).ok_or(WriteError::NotFound)?;
@@ -268,7 +315,15 @@ impl WriteStore {
     }
 
     pub fn create(&self, dir_ino: u64, name: &str) -> WResult<OverlayEntry> {
-        let target = if self.tree.read().is_workspace() {
+        // Home is a real drive: any name is a file, no schema inference.
+        let home_dir = self.tree.read().home_path(dir_ino);
+        let target = if let Some((dir_path, _)) = home_dir {
+            FlushTarget::HomeFile {
+                path: crate::state::join_home_path(&dir_path, name),
+                dir_ino,
+                name: name.to_string(),
+            }
+        } else if self.tree.read().is_workspace() {
             let (tree_name, tree_id, tree_type, path) = self
                 .tree
                 .read()
@@ -379,12 +434,19 @@ impl WriteStore {
 
     fn flush_inner(&self, ino: u64, final_flush: bool) -> WResult<()> {
         let _sync = self.sync.lock();
-        let (buffer, target) = {
+        let (buffer, target, dirty) = {
             let mut inner = self.inner.lock();
             let state = match inner.states.get_mut(&ino) {
                 Some(s) if s.dirty => s,
+                // A home file whose bytes already went out on an earlier flush
+                // still has to be PUBLISHED into the view when the handle
+                // closes: the write landed, but until the overlay is retired
+                // for a real node, the next lookup(2) misses and the file looks
+                // like it was never created.
+                Some(s) if final_flush && matches!(s.target, FlushTarget::HomeFile { .. }) => s,
                 _ => return Ok(()),
             };
+            let dirty = state.dirty;
             // Shells flush right after open(O_CREAT), before any write lands.
             // Creating an empty doc just to supersede it on close is churn —
             // defer empty creates to the final flush (where `touch` needs them).
@@ -392,16 +454,50 @@ impl WriteStore {
                 && state.buffer.is_empty()
                 && matches!(
                     state.target,
-                    FlushTarget::Create { .. } | FlushTarget::WsCreate { .. }
+                    FlushTarget::Create { .. }
+                        | FlushTarget::WsCreate { .. }
+                        | FlushTarget::HomeFile { .. }
                 )
             {
                 return Ok(());
             }
             state.dirty = false;
-            (state.buffer.clone(), state.target.clone())
+            (state.buffer.clone(), state.target.clone(), dirty)
         };
 
         let result = match &target {
+            FlushTarget::HomeFile { path, dir_ino, name } => {
+                if dirty {
+                    let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+                    self.api
+                        .write_home(&ws, path, buffer.clone())
+                        .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                }
+                // Publish into the view so the next lookup/readdir sees the
+                // file at its real size. ONLY on the final flush: retiring the
+                // overlay mid-edit would leave the next write(2) with nowhere
+                // to land. The overlay's ino is adopted rather than a fresh one
+                // allocated — the kernel already handed that ino to the process
+                // from create(), and a new one leaves its cached dentry
+                // pointing at nothing (the file reads back ENOENT until the
+                // directory is listed again).
+                if final_flush {
+                    let mut inner = self.inner.lock();
+                    let overlay_ino = inner.overlay_names.remove(&(*dir_ino, name.clone()));
+                    if let Some(overlay_ino) = overlay_ino {
+                        inner.overlay.remove(&overlay_ino);
+                    }
+                    drop(inner);
+                    self.tree.write().upsert_home_file(
+                        *dir_ino,
+                        name,
+                        path,
+                        buffer.len() as u64,
+                        overlay_ino,
+                    );
+                }
+                Ok(())
+            }
             FlushTarget::Existing { ctx, dir, doc_id } => {
                 self.flush_update(ctx, dir, *doc_id, &buffer)
             }
@@ -508,6 +604,24 @@ impl WriteStore {
                 inner.states.remove(&ino);
                 return Ok(());
             }
+        }
+
+        // Home is a real drive: `rm` deletes the file. No trash, no detach —
+        // the file manager's own warning is the safety net, and the workspace
+        // trash is for documents, not for the drive.
+        let home_child = self
+            .tree
+            .read()
+            .lookup(dir_ino, name)
+            .and_then(|n| self.tree.read().home_file(n.ino).map(|(p, _)| (n.ino, p)));
+        if let Some((ino, path)) = home_child {
+            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+            self.api
+                .remove_home(&ws, &path)
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            self.tree.write().remove_node(ino);
+            self.inner.lock().states.remove(&ino);
+            return Ok(());
         }
 
         if self.tree.read().is_workspace() {
@@ -677,6 +791,24 @@ impl WriteStore {
     /// Create a directory node (mkdir) — inserts a tree path on the server.
     pub fn mkdir(&self, parent_ino: u64, name: &str) -> WResult<u64> {
         let _sync = self.sync.lock();
+
+        // A folder on the home drive is a real directory.
+        // Bind the path BEFORE the body: an `if let` holds the read guard for the
+        // whole block, and the tree.write() below would deadlock against it
+        // (parking_lot is not reentrant).
+        let home_parent = self.tree.read().home_path(parent_ino);
+        if let Some((parent_path, _)) = home_parent {
+            if self.tree.read().lookup(parent_ino, name).is_some() {
+                return Err(WriteError::Exists);
+            }
+            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+            let child = crate::state::join_home_path(&parent_path, name);
+            self.api
+                .mkdir_home(&ws, &child)
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            return Ok(self.tree.write().insert_home_dir(parent_ino, name, &child));
+        }
+
         let (tree_name, tree_id, _tt, parent_path) = self
             .tree
             .read()
@@ -700,6 +832,26 @@ impl WriteStore {
     /// Remove a directory node (rmdir) — removes the tree path on the server.
     pub fn rmdir(&self, parent_ino: u64, name: &str) -> WResult<()> {
         let _sync = self.sync.lock();
+
+        let home_child = self
+            .tree
+            .read()
+            .lookup(parent_ino, name)
+            .and_then(|n| self.tree.read().home_path(n.ino).map(|(p, _)| (n.ino, p)));
+        if let Some((ino, path)) = home_child {
+            // POSIX rmdir is non-recursive; refuse a folder we know has
+            // children rather than deleting a subtree behind the user's back.
+            if self.tree.read().list(ino).is_some_and(|c| !c.is_empty()) {
+                return Err(WriteError::NotEmpty);
+            }
+            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+            self.api
+                .remove_home(&ws, &path)
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            self.tree.write().remove_node(ino);
+            return Ok(());
+        }
+
         let (_tn, tree_id, _tt, _pp) = self
             .tree
             .read()
@@ -741,10 +893,24 @@ impl WriteStore {
             .read()
             .tree_file(ino)
             .ok_or(WriteError::NotPermitted)?;
-        // `rm` detaches the document from this tree path (safe default), never
-        // destroys — it survives in the DB and any other path it's linked into.
+        // Inside the trash, `rm` is the permanent one — same as a file manager's
+        // "delete from trash". Detaching instead would be a silent no-op: the
+        // document is already orphaned, so the server would file it right back.
+        if path == crate::state::TRASH_PATH {
+            self.api
+                .empty_trash(&ws, &[doc_id])
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            self.tree.write().remove_tree_file(ino);
+            self.inner.lock().states.remove(&ino);
+            return Ok(());
+        }
+
+        // Everywhere else `rm` detaches from this tree path, never destroys —
+        // the document survives in the DB and in any other path it's linked
+        // into. If this WAS its last path the server files it into the trash,
+        // so nothing a mount does can make a document unreachable.
         self.api
-            .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[doc_id])
+            .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[doc_id], true)
             .map_err(|e| WriteError::Io(format!("{e:#}")))?;
         self.tree.write().remove_tree_file(ino);
         self.inner.lock().states.remove(&ino);
@@ -834,11 +1000,10 @@ impl WriteStore {
             .unwrap_or(false);
 
         if src_is_dir {
-            // Folder rename. Cross-parent moves fall back to copy+unlink (EXDEV);
-            // same-parent rename maps to a tree path move.
-            if src_dir != dst_dir {
-                return Err(WriteError::CrossDir);
-            }
+            // A folder move is a TREE operation: the node moves and every
+            // document filed under it comes along untouched. Works across
+            // parents as well as in place — but only within one tree, since
+            // nodes of different trees have nothing in common.
             if self.tree.read().lookup(dst_dir, dst_name).is_some() {
                 return Err(WriteError::Exists);
             }
@@ -847,14 +1012,25 @@ impl WriteStore {
                 .read()
                 .locate_tree_dir(src_ino)
                 .ok_or(WriteError::NotPermitted)?;
-            let parent = parent_of(&src_path);
-            let dst_path = join_path(&parent, dst_name);
+            let dst_path = if src_dir == dst_dir {
+                join_path(&parent_of(&src_path), dst_name)
+            } else {
+                let (dst_tree_name, dst_tree_id, _dtt, dst_parent_path) = self
+                    .tree
+                    .read()
+                    .locate_tree_dir(dst_dir)
+                    .ok_or(WriteError::NotPermitted)?;
+                if dst_tree_id != tree_id || dst_tree_name != tree_name {
+                    return Err(WriteError::CrossDir);
+                }
+                join_path(&dst_parent_path, dst_name)
+            };
             self.api
                 .move_tree_path(&ws, &tree_id, &src_path, &dst_path)
                 .map_err(|e| WriteError::Io(format!("{e:#}")))?;
             self.tree
                 .write()
-                .rename_tree_path(src_ino, dst_name, &tree_name);
+                .move_tree_path_node(src_ino, dst_dir, dst_name, &tree_name);
             return Ok(());
         }
 
@@ -865,7 +1041,37 @@ impl WriteStore {
             .tree_file(src_ino)
             .ok_or(WriteError::NotPermitted)?;
         if src_dir != dst_dir {
-            return Err(WriteError::CrossDir); // mv falls back to copy+unlink
+            // Cross-directory move = re-tag: file the document at the
+            // destination, unfile it at the source. Two small requests, no
+            // bytes through the mount — the same document, shown elsewhere.
+            // Works across trees too, since both halves are path-scoped.
+            let (dst_tree_name, dst_tree_id, dst_tree_type, dst_path) = self
+                .tree
+                .read()
+                .locate_tree_dir(dst_dir)
+                .ok_or(WriteError::NotPermitted)?;
+            if self.tree.read().lookup(dst_dir, dst_name).is_some() {
+                return Err(WriteError::Exists);
+            }
+
+            // Link first: a failure between the two halves leaves the document
+            // findable in both places rather than in neither.
+            self.api
+                .link_tree_document(&ws, &dst_tree_id, &dst_tree_type, &dst_path, &[src_doc])
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            if dst_name != src_name {
+                self.ws_set_filename(&ws, &dst_tree_id, &dst_tree_type, &dst_path, src_doc, dst_name)?;
+            }
+            // The source unlink never trashes: the document is already filed at
+            // the destination, so it is not orphaned.
+            self.api
+                .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[src_doc], false)
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+
+            self.tree
+                .write()
+                .move_tree_file(src_ino, dst_dir, dst_name, &tree_name, &dst_tree_name);
+            return Ok(());
         }
         let dst_ino = self.tree.read().lookup(dst_dir, dst_name).map(|n| n.ino);
 
@@ -891,8 +1097,11 @@ impl WriteStore {
                 };
                 self.flush_ws_update(&tree_name, &tree_id, &tree_type, &path, dst_doc, &content)?;
                 self.ws_set_filename(&ws, &tree_id, &tree_type, &path, dst_doc, dst_name)?;
+                // Not a user-initiated delete: the source document was just
+                // superseded by the atomic-save copy, so it must not land in
+                // the trash as if someone had removed it.
                 self.api
-                    .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[src_doc])
+                    .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[src_doc], false)
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?;
                 {
                     let mut tree = self.tree.write();

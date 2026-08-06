@@ -1,3 +1,4 @@
+use crate::api::ApiClient;
 use crate::blobs::{reply_slice, BlobStore};
 use crate::state::{NodeContent, Tree};
 use crate::writes::WriteStore;
@@ -18,15 +19,25 @@ pub struct CanvasFs {
     tree: Arc<RwLock<Tree>>,
     blobs: Arc<BlobStore>,
     writes: Arc<WriteStore>,
+    /// Home is a passthrough drive: its listings and bytes are fetched on
+    /// demand rather than reconciled into the tree by the worker, so the
+    /// filesystem itself needs the client.
+    api: Arc<ApiClient>,
     uid: u32,
     gid: u32,
 }
 
 impl CanvasFs {
-    pub fn new(tree: Arc<RwLock<Tree>>, blobs: Arc<BlobStore>, writes: Arc<WriteStore>) -> Self {
+    pub fn new(
+        tree: Arc<RwLock<Tree>>,
+        blobs: Arc<BlobStore>,
+        writes: Arc<WriteStore>,
+        api: Arc<ApiClient>,
+    ) -> Self {
         Self {
             tree,
             blobs,
+            api,
             writes,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -91,6 +102,32 @@ impl CanvasFs {
     }
 }
 
+impl CanvasFs {
+    /// Fetch a home directory's listing the first time something looks into it.
+    ///
+    /// Home is a real drive that can be enormous, so it is materialized folder
+    /// by folder on demand rather than walked at mount. This blocks the FUSE
+    /// loop for one REST call — the same trade the write path already makes on
+    /// close-time flush.
+    fn ensure_home_loaded(&self, ino: u64) {
+        let Some((path, loaded)) = self.tree.read().home_path(ino) else {
+            return;
+        };
+        if loaded {
+            return;
+        }
+        let Some(ws) = self.tree.read().ws_id() else {
+            return;
+        };
+        match self.api.list_home(&ws, &path) {
+            Ok(entries) => {
+                self.tree.write().apply_home_entries(ino, &entries);
+            }
+            Err(e) => log::warn!("home listing {path}: {e:#}"),
+        }
+    }
+}
+
 fn wants_write(flags: i32) -> bool {
     (flags & libc::O_ACCMODE) != libc::O_RDONLY
 }
@@ -101,6 +138,12 @@ impl Filesystem for CanvasFs {
             reply.error(libc::ENOENT);
             return;
         };
+        if let Some(node) = self.tree.read().lookup(parent, name) {
+            reply.entry(&TTL, &self.attr(node), 0);
+            return;
+        }
+        // A miss inside Home may just mean the folder has not been listed yet.
+        self.ensure_home_loaded(parent);
         if let Some(node) = self.tree.read().lookup(parent, name) {
             reply.entry(&TTL, &self.attr(node), 0);
             return;
@@ -363,8 +406,33 @@ impl Filesystem for CanvasFs {
             }
         };
         match content {
-            NodeContent::Dir => reply.error(libc::EISDIR),
+            NodeContent::Dir | NodeContent::HomeDir { .. } => reply.error(libc::EISDIR),
             NodeContent::Inline(bytes) => reply_slice(reply, &bytes, offset, size),
+            // Home is a passthrough: read the window straight from the drive.
+            // No blob cache — these bytes are not content-addressed and can
+            // change under us at any moment.
+            NodeContent::HomeFile { path, size: file_size } => {
+                if offset as u64 >= file_size {
+                    reply.data(&[]);
+                    return;
+                }
+                let start = offset as u64;
+                let end = (start + size as u64 - 1).min(file_size.saturating_sub(1));
+                let ws = match self.tree.read().ws_id() {
+                    Some(id) => id,
+                    None => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+                match self.api.read_home_range(&ws, &path, start, end) {
+                    Ok(bytes) => reply.data(bytes.as_slice()),
+                    Err(e) => {
+                        log::warn!("home read {path} [{start}-{end}]: {e:#}");
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
             NodeContent::Remote {
                 workspace_id,
                 doc_id,
@@ -388,6 +456,8 @@ impl Filesystem for CanvasFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        self.ensure_home_loaded(ino);
+
         let mut entries: Vec<(u64, FileType, String)> = Vec::new();
         {
             let tree = self.tree.read();

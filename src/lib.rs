@@ -34,6 +34,9 @@ pub struct MountOptions {
     /// When set, mount a workspace's trees (context + directory) read/write,
     /// mirroring each tree's path hierarchy. Mutually exclusive with contexts.
     pub workspace: Option<String>,
+    /// The workspace a CONTEXT mount is scoped to. A mount is always one
+    /// workspace; contexts belonging to any other are not materialized.
+    pub context_workspace: Option<String>,
     /// In-memory blob cache budget for file content, in bytes
     pub blob_cache_bytes: usize,
 }
@@ -108,6 +111,20 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     } else {
         opts.contexts.as_ref().map(|c| c.iter().cloned().collect())
     };
+    // A context mount is still one workspace: resolve its id once so the worker
+    // can drop contexts that belong elsewhere. A lookup failure is not fatal —
+    // the mount then shows every context it can see, which is what it did
+    // before this scoping existed.
+    let context_workspace_id: Option<String> = match (&opts.context_workspace, workspace_mode) {
+        (Some(name), false) => match api.get_workspace(name) {
+            Ok(ws) => Some(ws.id),
+            Err(e) => {
+                log::warn!("workspace {name}: lookup failed, mounting contexts unscoped: {e:#}");
+                None
+            }
+        },
+        _ => None,
+    };
 
     // Populate before mounting so the first readdir is already correct.
     // Server being down is not fatal: the resync loop recovers.
@@ -118,6 +135,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         notifier: None,
         ensure_subscribed: None,
         context_filter: context_filter.clone(),
+        context_workspace_id: context_workspace_id.clone(),
         refresh_lock: None,
     };
     bootstrap.refresh_all();
@@ -128,7 +146,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         tree.clone(),
         names.clone(),
     ));
-    let fs = fsimpl::CanvasFs::new(tree.clone(), blobs, write_store.clone());
+    let fs = fsimpl::CanvasFs::new(tree.clone(), blobs, write_store.clone(), api.clone());
     let session = fuser::spawn_mount2(
         fs,
         &opts.mountpoint,
@@ -165,6 +183,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         notifier: Some(session.notifier()),
         ensure_subscribed,
         context_filter,
+        context_workspace_id,
         refresh_lock: Some(write_store.sync_handle()),
     };
     std::thread::Builder::new()

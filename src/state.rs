@@ -1,4 +1,4 @@
-use crate::api::{ContextInfo, Document, TreeInfo};
+use crate::api::{ContextInfo, Document, HomeEntry, TreeInfo};
 use crate::names::NameStore;
 use crate::render::{self, SCHEMA_DIRS};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7,6 +7,16 @@ use std::time::SystemTime;
 
 pub const ROOT_INO: u64 = 1;
 pub const CONTEXTS_INO: u64 = 2;
+/// Workspace mounts group the trees under `Trees/` and expose the workspace
+/// trash as its own root, so one mount has the same shape as the WebDAV view
+/// (see docs/data-representation.md).
+pub const TREES_INO: u64 = 3;
+pub const TRASH_INO: u64 = 4;
+pub const HOME_INO: u64 = 5;
+/// The trash is physically a path in the default directory tree; a file node
+/// under `Trash/` records that origin so the write path can address it.
+pub const TRASH_TREE_NAME: &str = "directory";
+pub const TRASH_PATH: &str = "/.trash";
 const FIRST_DYNAMIC_INO: u64 = 16;
 
 pub const CONTEXT_META_FILE: &str = ".context.json";
@@ -17,6 +27,12 @@ pub const CONTEXT_META_FILE: &str = ".context.json";
 pub enum NodeContent {
     Dir,
     Inline(Arc<Vec<u8>>),
+    /// A folder of the home drive. `loaded` flips once its listing has been
+    /// fetched: home is a real filesystem and can be huge, so directories are
+    /// materialized on first look rather than walked at mount.
+    HomeDir { path: String, loaded: bool },
+    /// A real file on the home drive, read by byte window on demand.
+    HomeFile { path: String, size: u64 },
     Remote {
         workspace_id: String,
         doc_id: u64,
@@ -37,7 +53,10 @@ pub struct Node {
 
 impl Node {
     pub fn is_dir(&self) -> bool {
-        matches!(self.content, NodeContent::Dir)
+        matches!(
+            self.content,
+            NodeContent::Dir | NodeContent::HomeDir { .. }
+        )
     }
 
     pub fn size(&self) -> u64 {
@@ -47,6 +66,8 @@ impl Node {
             // None (unresolved) reports 0 here; fsimpl resolves it lazily via
             // the blob store before answering getattr.
             NodeContent::Remote { size, .. } => size.unwrap_or(0),
+            NodeContent::HomeDir { .. } => 0,
+            NodeContent::HomeFile { size, .. } => *size,
         }
     }
 }
@@ -149,10 +170,37 @@ impl Tree {
         Self::bare(Some(ctx_id))
     }
 
-    /// Workspace mount: ROOT holds one directory per tree, each mirroring the
-    /// tree's path hierarchy with documents materialized as files.
+    /// Workspace mount. ROOT holds the same roots the WebDAV view exposes:
+    /// `Trees/` (one directory per tree, mirroring its path hierarchy with
+    /// documents as files) and `Trash/` (flat; what a delete parked there).
+    /// `Home/` is not served here yet — see the README.
     pub fn workspace_rooted(ws_id: String, ws_name: String) -> Self {
         let mut t = Self::bare(None);
+        let now = SystemTime::now();
+        t.insert_node(Node {
+            ino: TREES_INO,
+            parent: ROOT_INO,
+            name: "Trees".to_string(),
+            mtime: now,
+            content: NodeContent::Dir,
+        });
+        t.insert_node(Node {
+            ino: TRASH_INO,
+            parent: ROOT_INO,
+            name: "Trash".to_string(),
+            mtime: now,
+            content: NodeContent::Dir,
+        });
+        t.insert_node(Node {
+            ino: HOME_INO,
+            parent: ROOT_INO,
+            name: "Home".to_string(),
+            mtime: now,
+            content: NodeContent::HomeDir {
+                path: "/".to_string(),
+                loaded: false,
+            },
+        });
         t.ws = Some(WsState {
             ws_id,
             ws_name,
@@ -215,7 +263,7 @@ impl Tree {
         self.nodes.insert(node.ino, node);
     }
 
-    fn remove_node(&mut self, ino: u64) -> Option<Node> {
+    pub fn remove_node(&mut self, ino: u64) -> Option<Node> {
         let node = self.nodes.remove(&ino)?;
         if let Some(siblings) = self.children.get_mut(&node.parent) {
             siblings.remove(&node.name);
@@ -691,7 +739,7 @@ impl Tree {
                 inv.removed.push((node.parent, root_ino, node.name));
             }
             self.ws_mut().trees.remove(&name);
-            inv.dirty_dirs.push(ROOT_INO);
+            inv.dirty_dirs.push(TREES_INO);
         }
 
         for t in trees {
@@ -711,7 +759,7 @@ impl Tree {
                     let ino = self.alloc_ino();
                     self.insert_node(Node {
                         ino,
-                        parent: ROOT_INO,
+                        parent: TREES_INO,
                         name: t.name.clone(),
                         mtime: now,
                         content: NodeContent::Dir,
@@ -807,6 +855,224 @@ impl Tree {
     }
 
     /// Reconcile the document files in one tree path's directory.
+    /// Insert a home directory node (mkdir). Marked loaded: it was just created
+    /// and is empty, so there is nothing to fetch.
+    pub fn insert_home_dir(&mut self, parent_ino: u64, name: &str, path: &str) -> u64 {
+        let ino = self.alloc_ino();
+        self.insert_node(Node {
+            ino,
+            parent: parent_ino,
+            name: name.to_string(),
+            mtime: SystemTime::now(),
+            content: NodeContent::HomeDir {
+                path: path.to_string(),
+                loaded: true,
+            },
+        });
+        ino
+    }
+
+    /// Publish a home file into the view after a write, creating the node if
+    /// this was a fresh file.
+    /// Publish a home file into the view after a write.
+    ///
+    /// `adopt_ino` is the overlay's ino, and taking it over matters: the kernel
+    /// already handed that ino to the process through create(), so allocating a
+    /// fresh one here would leave the cached dentry pointing at a node that no
+    /// longer exists — the file reads back as ENOENT until the directory is
+    /// re-listed. Same reason adopt_tree_file() adopts.
+    pub fn upsert_home_file(
+        &mut self,
+        dir_ino: u64,
+        name: &str,
+        path: &str,
+        size: u64,
+        adopt_ino: Option<u64>,
+    ) -> u64 {
+        let content = NodeContent::HomeFile {
+            path: path.to_string(),
+            size,
+        };
+        if let Some(existing) = self.lookup(dir_ino, name).map(|n| n.ino) {
+            if let Some(node) = self.nodes.get_mut(&existing) {
+                node.content = content;
+                node.mtime = SystemTime::now();
+            }
+            return existing;
+        }
+        let ino = adopt_ino.unwrap_or_else(|| self.alloc_ino());
+        self.insert_node(Node {
+            ino,
+            parent: dir_ino,
+            name: name.to_string(),
+            mtime: SystemTime::now(),
+            content,
+        });
+        ino
+    }
+
+    /// The home-drive path a node addresses, if it is one.
+    pub fn home_path(&self, ino: u64) -> Option<(String, bool)> {
+        match &self.nodes.get(&ino)?.content {
+            NodeContent::HomeDir { path, loaded } => Some((path.clone(), *loaded)),
+            NodeContent::HomeFile { path, .. } => Some((path.clone(), true)),
+            _ => None,
+        }
+    }
+
+    pub fn home_file(&self, ino: u64) -> Option<(String, u64)> {
+        match &self.nodes.get(&ino)?.content {
+            NodeContent::HomeFile { path, size } => Some((path.clone(), *size)),
+            _ => None,
+        }
+    }
+
+    /// Replace a home directory's children with a freshly fetched listing, and
+    /// mark it loaded so the next readdir does not refetch.
+    pub fn apply_home_entries(&mut self, dir_ino: u64, entries: &[HomeEntry]) -> Invalidation {
+        let mut inv = Invalidation::default();
+        let Some((dir_path, _)) = self.home_path(dir_ino) else {
+            return inv;
+        };
+
+        let wanted: HashMap<&str, &HomeEntry> =
+            entries.iter().map(|e| (e.name.as_str(), e)).collect();
+
+        let have: Vec<(String, u64)> = self
+            .children
+            .get(&dir_ino)
+            .map(|c| c.iter().map(|(n, i)| (n.clone(), *i)).collect())
+            .unwrap_or_default();
+        for (name, ino) in have {
+            if !wanted.contains_key(name.as_str()) {
+                self.remove_subtree(ino, &mut inv);
+                self.remove_node(ino);
+                inv.removed.push((dir_ino, ino, name));
+            }
+        }
+
+        for entry in entries {
+            let child_path = join_home_path(&dir_path, &entry.name);
+            let content = if entry.is_dir {
+                NodeContent::HomeDir { path: child_path, loaded: false }
+            } else {
+                NodeContent::HomeFile { path: child_path, size: entry.size }
+            };
+            match self.lookup(dir_ino, &entry.name).map(|n| n.ino) {
+                Some(ino) => {
+                    if let Some(node) = self.nodes.get_mut(&ino) {
+                        // Keep a loaded directory loaded; only its identity is
+                        // being confirmed here.
+                        let keep_loaded = matches!(
+                            (&node.content, &content),
+                            (NodeContent::HomeDir { loaded: true, .. }, NodeContent::HomeDir { .. })
+                        );
+                        if !keep_loaded && node.content != content {
+                            node.content = content;
+                            inv.changed.push(ino);
+                        }
+                    }
+                }
+                None => {
+                    let ino = self.alloc_ino();
+                    self.insert_node(Node {
+                        ino,
+                        parent: dir_ino,
+                        name: entry.name.clone(),
+                        mtime: SystemTime::now(),
+                        content,
+                    });
+                }
+            }
+        }
+
+        if let Some(NodeContent::HomeDir { loaded, .. }) =
+            self.nodes.get_mut(&dir_ino).map(|n| &mut n.content)
+        {
+            *loaded = true;
+        }
+        inv.dirty_dirs.push(dir_ino);
+        inv
+    }
+
+    /// Materialize the workspace trash as a flat folder. Deliberately flat: it
+    /// is a holding area, not a hierarchy — where each document CAME from is
+    /// recorded server-side and surfaced by restore, not by nesting here.
+    pub fn apply_trash_documents(&mut self, docs: &[Document]) -> Invalidation {
+        let mut inv = Invalidation::default();
+        if self.ws.is_none() {
+            return inv;
+        }
+        let ws_id = self.ws().ws_id.clone();
+
+        let mut sorted: Vec<&Document> = docs.iter().collect();
+        sorted.sort_by_key(|d| d.id);
+
+        let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
+        let mut taken: HashSet<String> = HashSet::new();
+        for doc in sorted {
+            let (base, content) = render::flat(doc);
+            let content = match content {
+                render::Content::Inline(bytes) => NodeContent::Inline(Arc::new(bytes)),
+                render::Content::Remote { size } => NodeContent::Remote {
+                    workspace_id: ws_id.clone(),
+                    doc_id: doc.id,
+                    size,
+                    checksum: doc.checksum.clone(),
+                },
+            };
+            let name = if taken.contains(&base) {
+                render::with_id_suffix(&base, doc.id)
+            } else {
+                base
+            };
+            taken.insert(name.clone());
+            desired.insert(name, (doc.id, content, doc.updated_at));
+        }
+
+        let have: Vec<(String, u64)> = self
+            .children
+            .get(&TRASH_INO)
+            .map(|c| c.iter().map(|(n, i)| (n.clone(), *i)).collect())
+            .unwrap_or_default();
+
+        let mut dirty = false;
+        for (name, ino) in have {
+            if !desired.contains_key(&name) {
+                self.remove_node(ino);
+                self.ws_mut().file_docs.remove(&ino);
+                inv.removed.push((TRASH_INO, ino, name));
+                dirty = true;
+            }
+        }
+        for (name, (doc_id, content, mtime)) in desired {
+            if self.lookup(TRASH_INO, &name).is_some() {
+                continue;
+            }
+            let ino = self.alloc_ino();
+            self.insert_node(Node {
+                ino,
+                parent: TRASH_INO,
+                name,
+                mtime,
+                content,
+            });
+            self.ws_mut().file_docs.insert(
+                ino,
+                WsFile {
+                    tree_name: TRASH_TREE_NAME.to_string(),
+                    path: TRASH_PATH.to_string(),
+                    doc_id,
+                },
+            );
+            dirty = true;
+        }
+        if dirty {
+            inv.dirty_dirs.push(TRASH_INO);
+        }
+        inv
+    }
+
     pub fn apply_tree_documents(
         &mut self,
         tree_name: &str,
@@ -1014,6 +1280,55 @@ impl Tree {
         }
     }
 
+    /// Move an entry into another directory, renaming it on the way.
+    fn move_entry(&mut self, ino: u64, new_parent: u64, new_name: &str) {
+        let Some(node) = self.nodes.get_mut(&ino) else {
+            return;
+        };
+        let old_parent = node.parent;
+        let old_name = std::mem::replace(&mut node.name, new_name.to_string());
+        node.parent = new_parent;
+        if let Some(siblings) = self.children.get_mut(&old_parent) {
+            siblings.remove(&old_name);
+        }
+        self.children
+            .entry(new_parent)
+            .or_default()
+            .insert(new_name.to_string(), ino);
+    }
+
+    /// Move a document file node into another directory (cross-directory
+    /// rename). The document itself is unchanged — only where it is shown, and
+    /// under which name. Both trees are reindexed: a move ACROSS trees leaves
+    /// the source tree's path index stale otherwise.
+    pub fn move_tree_file(
+        &mut self,
+        ino: u64,
+        new_parent: u64,
+        new_name: &str,
+        src_tree_name: &str,
+        dst_tree_name: &str,
+    ) {
+        self.move_entry(ino, new_parent, new_name);
+        if let Some(w) = self.ws.as_mut() {
+            if let Some(f) = w.file_docs.get_mut(&ino) {
+                f.tree_name = dst_tree_name.to_string();
+            }
+        }
+        // reindex recomputes every path from the tree walk, so the node's new
+        // path falls out of it rather than being spelled out here.
+        self.reindex_tree_paths(dst_tree_name);
+        if src_tree_name != dst_tree_name {
+            self.reindex_tree_paths(src_tree_name);
+        }
+    }
+
+    /// Move a FOLDER node into another directory (cross-parent folder move).
+    pub fn move_tree_path_node(&mut self, ino: u64, new_parent: u64, new_name: &str, tree_name: &str) {
+        self.move_entry(ino, new_parent, new_name);
+        self.reindex_tree_paths(tree_name);
+    }
+
     /// Point a file node at a different document id (overwrite-rename).
     pub fn rebind_tree_file(&mut self, ino: u64, doc_id: u64) {
         if let Some(w) = self.ws.as_mut() {
@@ -1137,4 +1452,13 @@ fn parent_path(p: &str) -> String {
 /// Final segment of a path ("/foo/bar" -> "bar").
 fn leaf_name(p: &str) -> String {
     p.rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// Join a home-drive path with a child name, keeping a single leading slash.
+pub fn join_home_path(dir: &str, name: &str) -> String {
+    if dir == "/" || dir.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", dir.trim_end_matches('/'))
+    }
 }

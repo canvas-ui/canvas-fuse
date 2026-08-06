@@ -46,22 +46,43 @@ impl ConnectArgs {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Mount context views at a directory
+    /// Mount a workspace (or one of its context views) at a directory
     Mount {
+        /// With two arguments, what to mount: <workspace>,
+        /// <workspace>/Contexts, or <workspace>/Contexts/<id>. With one, this
+        /// IS the mountpoint and the target comes from -w / -c / --root.
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
+
         /// Mountpoint directory (created if missing)
-        mountpoint: PathBuf,
+        #[arg(value_name = "MOUNTPOINT")]
+        mountpoint: Option<PathBuf>,
 
         #[command(flatten)]
         connect: ConnectArgs,
 
-        /// Only mount specific context ids (repeatable)
+        #[arg(
+            long = "root",
+            value_name = "SELECTOR",
+            conflicts_with_all = ["contexts", "workspace"],
+            help = "What the mount is rooted at (default: Contexts)",
+            long_help = "What the mount is rooted at. A mount always scopes to ONE\n\
+                workspace.\n\n\
+                <workspace>                  Trees/ and Trash/ at the top,\n\
+                \x20                            mounted at <mountpoint>/<workspace>/\n\
+                <workspace>/Contexts         that workspace's context views\n\
+                <workspace>/Contexts/<id>    one context, its schema dirs at the top"
+        )]
+        root: Option<String>,
+
+        /// Mount a context view, as <workspace>/<context> (or a bare context id
+        /// alongside -w). Repeatable; a single -c roots the mount at it.
         #[arg(short = 'c', long = "context")]
         contexts: Vec<String>,
 
-        /// Mount a whole workspace's trees (read/write) instead of contexts.
-        /// Mirrors each tree's folder hierarchy; supports markdown + folder
-        /// create/rename/remove. Mutually exclusive with --context.
-        #[arg(short = 'w', long = "workspace", conflicts_with = "contexts")]
+        /// Mount a workspace — Trees/ and Trash/ at the top, at
+        /// <mountpoint>/<workspace>/. Equivalent to `--root <workspace>`.
+        #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
 
         /// Run in the background (logs to the state dir)
@@ -124,6 +145,29 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Mount {
+            selector,
+            mountpoint,
+            connect,
+            root,
+            contexts,
+            workspace,
+            detach,
+            no_ws,
+            resync,
+            data_dir,
+            blob_cache_mb,
+        } => {
+            // `mount <selector> <mountpoint>` vs `mount <mountpoint>`: clap
+            // cannot express "optional first positional", so the pair is
+            // resolved here by how many were given.
+            let (selector, mountpoint) = match (selector, mountpoint) {
+                (Some(sel), Some(path)) => (Some(sel), path),
+                (Some(only), None) => (None, PathBuf::from(only)),
+                (None, Some(path)) => (None, path),
+                (None, None) => anyhow::bail!("a mountpoint is required"),
+            };
+            let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
+            cmd_mount(
             mountpoint,
             connect,
             contexts,
@@ -133,17 +177,8 @@ fn main() -> Result<()> {
             resync,
             data_dir,
             blob_cache_mb,
-        } => cmd_mount(
-            mountpoint,
-            connect,
-            contexts,
-            workspace,
-            detach,
-            no_ws,
-            resync,
-            data_dir,
-            blob_cache_mb,
-        ),
+            )
+        }
         Command::Unmount { mountpoint } => cmd_unmount(mountpoint),
         Command::Status { json } => cmd_status(json),
         Command::Ping { connect, json } => cmd_ping(connect, json),
@@ -157,6 +192,66 @@ fn init_logger() {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolve what to mount into the (workspace, contexts) pair the mount speaks.
+///
+/// A mount always scopes to ONE workspace — contexts are addressed inside it,
+/// never across workspaces. The selector may arrive as a positional argument,
+/// as `--root`, or as the `-w` / `-c` flags:
+///
+///   myws                      the workspace: Trees/ and Trash/
+///   myws/Contexts             that workspace's context views
+///   myws/Contexts/foo         one context, rooted
+///   -w myws                   same as `myws`
+///   -c myws/foo               same as `myws/Contexts/foo`
+///   -c foo -w myws            a bare context id alongside its workspace
+fn resolve_root(
+    selector: Option<String>,
+    workspace: Option<String>,
+    contexts: Vec<String>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if let Some(selector) = selector {
+        let trimmed = selector.trim_matches('/');
+        let mut parts = trimmed.split('/').filter(|p| !p.is_empty());
+        let Some(ws) = parts.next() else {
+            anyhow::bail!("empty mount selector");
+        };
+        let rest: Vec<&str> = parts.collect();
+
+        return match rest.as_slice() {
+            // The whole workspace.
+            [] => Ok((Some(ws.to_string()), Vec::new())),
+            // Its context views, optionally rooted at one of them.
+            [section] if section.eq_ignore_ascii_case("contexts") => {
+                Ok((Some(ws.to_string()), Vec::new()))
+            }
+            [section, id] if section.eq_ignore_ascii_case("contexts") => {
+                Ok((Some(ws.to_string()), vec![(*id).to_string()]))
+            }
+            _ => anyhow::bail!(
+                "cannot mount `{selector}`: expected <workspace>, \
+                 <workspace>/Contexts or <workspace>/Contexts/<id>"
+            ),
+        };
+    }
+
+    // Flag form. `-c <workspace>/<id>` carries its workspace the same way.
+    let mut ws = workspace;
+    let mut ids = Vec::new();
+    for entry in contexts {
+        match entry.trim_matches('/').split_once('/') {
+            Some((entry_ws, id)) => {
+                if ws.as_deref().is_some_and(|w| w != entry_ws) {
+                    anyhow::bail!("one mount is one workspace: got both `{}` and `{entry_ws}`", ws.unwrap());
+                }
+                ws = Some(entry_ws.to_string());
+                ids.push(id.to_string());
+            }
+            None => ids.push(entry),
+        }
+    }
+    Ok((ws, ids))
+}
+
 fn cmd_mount(
     mountpoint: PathBuf,
     connect: ConnectArgs,
@@ -170,15 +265,16 @@ fn cmd_mount(
 ) -> Result<()> {
     let endpoint = connect.endpoint()?;
 
-    // -w <ws> roots the mount at a workspace: we mount at <path>/<ws> with the
-    // workspace's trees at the top level. Otherwise a single -c <ctx> roots at
-    // that context; multiple/no -c stays a global mount at the given path.
-    let context_root = if workspace.is_none() && contexts.len() == 1 {
+    // A mount is one workspace. Naming a context inside it (`myws/Contexts/foo`)
+    // mounts the CONTEXT view, not the workspace tree view — so the workspace
+    // only selects the mount shape when no context was asked for.
+    let workspace_mount = contexts.is_empty().then(|| workspace.clone()).flatten();
+    let context_root = if contexts.len() == 1 {
         Some(contexts[0].clone())
     } else {
         None
     };
-    let mountpoint = match (&workspace, &context_root) {
+    let mountpoint = match (&workspace_mount, &context_root) {
         (Some(ws), _) => mountpoint.join(ws),
         (None, Some(ctx)) => mountpoint.join(ctx),
         (None, None) => mountpoint,
@@ -204,7 +300,7 @@ fn cmd_mount(
                 .unwrap_or("server")
                 .to_string()
         });
-        match &workspace {
+        match &workspace_mount {
             Some(ws) => runtime::workspace_data_dir(&remote_label, ws),
             None => runtime::mount_data_dir(&remote_label, &contexts, &mountpoint),
         }
@@ -264,7 +360,8 @@ fn cmd_mount(
             Some(contexts.clone())
         },
         context_root: context_root.clone(),
-        workspace: workspace.clone(),
+        workspace: workspace_mount.clone(),
+        context_workspace: workspace.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
     })?;
 
@@ -471,4 +568,68 @@ fn cmd_contexts(connect: ConnectArgs, as_json: bool) -> Result<()> {
         println!("{}\t{}", ctx.id, ctx.url);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod root_selector_tests {
+    use super::resolve_root;
+
+    fn resolved(
+        selector: Option<&str>,
+        workspace: Option<&str>,
+        contexts: &[&str],
+    ) -> (Option<String>, Vec<String>) {
+        resolve_root(
+            selector.map(str::to_string),
+            workspace.map(str::to_string),
+            contexts.iter().map(|c| c.to_string()).collect(),
+        )
+        .expect("selector should resolve")
+    }
+
+    #[test]
+    fn a_bare_name_mounts_that_workspace() {
+        assert_eq!(resolved(Some("myws"), None, &[]), (Some("myws".into()), vec![]));
+        assert_eq!(
+            resolved(Some("myws/Contexts"), None, &[]),
+            (Some("myws".into()), vec![])
+        );
+    }
+
+    #[test]
+    fn a_context_selector_roots_at_one_context_of_that_workspace() {
+        assert_eq!(
+            resolved(Some("myws/Contexts/foo"), None, &[]),
+            (Some("myws".into()), vec!["foo".to_string()])
+        );
+        // Typing noise carries no meaning.
+        assert_eq!(
+            resolved(Some("/myws/contexts/foo/"), None, &[]),
+            (Some("myws".into()), vec!["foo".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_flag_forms_agree_with_the_selector() {
+        assert_eq!(resolved(None, Some("myws"), &[]), (Some("myws".into()), vec![]));
+        // -c takes the workspace-qualified form...
+        assert_eq!(
+            resolved(None, None, &["myws/foo"]),
+            (Some("myws".into()), vec!["foo".to_string()])
+        );
+        // ...or a bare id next to -w.
+        assert_eq!(
+            resolved(None, Some("myws"), &["foo"]),
+            (Some("myws".into()), vec!["foo".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_mount_is_one_workspace() {
+        // Two workspaces in one mount has no meaning — say so rather than
+        // silently mounting one of them.
+        assert!(resolve_root(None, Some("a".into()), vec!["b/foo".into()]).is_err());
+        assert!(resolve_root(Some("myws/Trees/directory".into()), None, vec![]).is_err());
+        assert!(resolve_root(Some("myws/Nonsense/x".into()), None, vec![]).is_err());
+    }
 }

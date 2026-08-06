@@ -12,6 +12,16 @@ pub struct ContextInfo {
     pub raw: Value,
 }
 
+/// One entry of the workspace home drive — a real file or folder, not a
+/// document. Home is a passthrough: the file IS the file.
+#[derive(Debug, Clone)]
+pub struct HomeEntry {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub mtime: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceInfo {
     pub id: String,
@@ -363,6 +373,142 @@ impl ApiClient {
         Ok(docs)
     }
 
+    // ── Home drive ───────────────────────────────────────────────────────────
+    // Real files, addressed by path. Reads take a byte window (the server
+    // honours Range), writes replace whole files — the same shape the write
+    // overlay already uses for documents.
+
+    pub fn list_home(&self, ws: &str, path: &str) -> Result<Vec<HomeEntry>> {
+        let body = self.get_json(&format!(
+            "/rest/v2/workspaces/{}/home/{}",
+            encode_segment(ws),
+            encode_path(path)
+        ))?;
+        let entries = body
+            .get("payload")
+            .and_then(|p| p.get("entries"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(entries
+            .iter()
+            .filter_map(|e| {
+                Some(HomeEntry {
+                    name: e.get("name").and_then(Value::as_str)?.to_string(),
+                    size: e.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    is_dir: e.get("isDirectory").and_then(Value::as_bool).unwrap_or(false),
+                    mtime: e.get("mtime").and_then(Value::as_str).map(str::to_string),
+                })
+            })
+            .collect())
+    }
+
+    /// A byte window of a home file. `end` is inclusive, as in the HTTP header.
+    pub fn read_home_range(&self, ws: &str, path: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/rest/v2/workspaces/{}/home/{}?download",
+            self.base,
+            encode_segment(ws),
+            encode_path(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("GET {url}: HTTP {status}");
+        }
+        let body = resp.bytes()?.to_vec();
+        // A server that ignored the Range answered with the whole file; trim so
+        // the caller always gets the window it asked for.
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            Ok(body)
+        } else {
+            let from = (start as usize).min(body.len());
+            let to = ((end as usize).saturating_add(1)).min(body.len());
+            Ok(body[from..to].to_vec())
+        }
+    }
+
+    pub fn write_home(&self, ws: &str, path: &str, bytes: Vec<u8>) -> Result<()> {
+        let url = format!(
+            "{}/rest/v2/workspaces/{}/home/{}",
+            self.base,
+            encode_segment(ws),
+            encode_path(path)
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes)
+            .send()
+            .with_context(|| format!("PUT {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("PUT {url}: HTTP {status}");
+        }
+        Ok(())
+    }
+
+    pub fn mkdir_home(&self, ws: &str, path: &str) -> Result<()> {
+        self.send_json(
+            reqwest::Method::POST,
+            &format!("/rest/v2/workspaces/{}/home/mkdir", encode_segment(ws)),
+            // Relative to the drive root: the server reads a leading slash as
+            // an attempt to escape it. Every other home call goes through
+            // encode_path(), which trims for the same reason.
+            &serde_json::json!({ "path": path.trim_start_matches('/') }),
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_home(&self, ws: &str, path: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/v2/workspaces/{}/home/{}",
+            self.base,
+            encode_segment(ws),
+            encode_path(path)
+        );
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .with_context(|| format!("DELETE {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("DELETE {url}: HTTP {status}");
+        }
+        Ok(())
+    }
+
+    /// Permanently delete documents that are in the trash. The one call that
+    /// destroys — same as "delete from trash" in a file manager.
+    pub fn empty_trash(&self, ws: &str, ids: &[u64]) -> Result<()> {
+        self.send_json(
+            reqwest::Method::DELETE,
+            &format!("/rest/v2/workspaces/{}/trash", encode_segment(ws)),
+            &serde_json::json!({ "documentIds": ids }),
+        )?;
+        Ok(())
+    }
+
+    /// Documents sitting in the workspace trash — what a filesystem delete
+    /// parked there when it removed a document's last placement.
+    pub fn list_trash(&self, ws: &str) -> Result<Vec<Document>> {
+        let body = self.get_json(&format!("/rest/v2/workspaces/{}/trash", encode_segment(ws)))?;
+        Ok(extract_documents(&body)
+            .iter()
+            .filter_map(parse_document)
+            .collect())
+    }
+
     /// Create a directory/context path node (mkdir).
     pub fn insert_tree_path(&self, ws: &str, tree: &str, path: &str) -> Result<()> {
         self.send_json(
@@ -436,6 +582,32 @@ impl ApiClient {
         Ok(extract_result_ids(&body))
     }
 
+    /// File an EXISTING document at a tree path.
+    ///
+    /// The link half of a move: `POST /documents` with `documentIds` adds a
+    /// placement without touching content, so a cross-directory move costs two
+    /// small requests instead of streaming the bytes through the mount.
+    pub fn link_tree_document(
+        &self,
+        ws: &str,
+        tree: &str,
+        tree_type: &str,
+        path: &str,
+        ids: &[u64],
+    ) -> Result<()> {
+        self.send_json(
+            reqwest::Method::POST,
+            &format!("/rest/v2/workspaces/{}/documents", encode_segment(ws)),
+            &serde_json::json!({
+                "documentIds": ids,
+                "treeNameOrTreeId": tree,
+                "treeType": tree_type,
+                "context": path,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Update existing documents at the workspace level (objects carry id).
     pub fn update_workspace_documents(
         &self,
@@ -468,6 +640,13 @@ impl ApiClient {
     }
 
     /// Unlink documents from a tree path (organizational removal, like `rm`).
+    /// Detach documents from a tree path.
+    ///
+    /// `trash_if_orphaned` applies the filesystem rule the server owns: when
+    /// this removes a document's LAST placement it is filed into the workspace
+    /// trash instead of becoming reachable only through the flat
+    /// workspace-wide list. `rm` on a mount means "take it out of this folder",
+    /// and nothing a mount does should make a document unreachable.
     pub fn remove_tree_document(
         &self,
         ws: &str,
@@ -475,20 +654,33 @@ impl ApiClient {
         tree_type: &str,
         path: &str,
         ids: &[u64],
+        trash_if_orphaned: bool,
     ) -> Result<()> {
+        let trash = if trash_if_orphaned { "&trashIfOrphaned=true" } else { "" };
         self.send_json(
             reqwest::Method::DELETE,
             &format!(
-                "/rest/v2/workspaces/{}/documents/remove?treeNameOrTreeId={}&treeType={}&context={}",
+                "/rest/v2/workspaces/{}/documents/remove?treeNameOrTreeId={}&treeType={}&context={}{}",
                 encode_segment(ws),
                 encode_segment(tree),
                 encode_segment(tree_type),
-                encode_component(path)
+                encode_component(path),
+                trash
             ),
             &serde_json::json!(ids),
         )?;
         Ok(())
     }
+}
+
+/// Percent-encode a multi-segment path, keeping the separators.
+fn encode_path(path: &str) -> String {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Percent-encode one URL path segment (no '/' allowed through).

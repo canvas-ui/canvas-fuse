@@ -29,6 +29,10 @@ pub struct Worker {
     /// When set, only these context ids are materialized (agent containers
     /// typically mount a single context).
     pub context_filter: Option<HashSet<String>>,
+    /// Workspace id a context mount is scoped to. A mount is one workspace, so
+    /// contexts belonging to another are not materialized even though the
+    /// contexts API is user-wide.
+    pub context_workspace_id: Option<String>,
     /// Held across fetch+apply so refreshes serialize with write-path tree
     /// mutations (WriteStore::sync_handle).
     pub refresh_lock: Option<Arc<parking_lot::Mutex<()>>>,
@@ -72,6 +76,9 @@ impl Worker {
         if let Some(filter) = &self.context_filter {
             contexts.retain(|c| filter.contains(&c.id));
         }
+        if let Some(ws_id) = &self.context_workspace_id {
+            contexts.retain(|c| c.workspace_id.as_deref() == Some(ws_id.as_str()));
+        }
         let (inv, added) = {
             let mut tree = self.tree.write();
             tree.apply_contexts(&contexts)
@@ -112,6 +119,15 @@ impl Worker {
                 }
                 Err(e) => log::warn!("workspace {ws} tree {}: paths fetch failed: {e:#}", t.name),
             }
+        }
+
+        // The trash is a root of its own, not a tree path.
+        match self.api.list_trash(&ws) {
+            Ok(docs) => {
+                let inv = self.tree.write().apply_trash_documents(&docs);
+                self.notify(inv);
+            }
+            Err(e) => log::warn!("workspace {ws}: trash fetch failed: {e:#}"),
         }
 
         // Populate documents at every known path. Snapshot the path list into an

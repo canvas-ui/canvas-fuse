@@ -8,9 +8,30 @@ FUSE-based Canvas mount - materializes context views and workspace trees as live
 folders. A universal helper: usable by users from a shell, by agent containers,
 and as a sidecar/library by other apps (canvas desktop UI).
 
-Two mount modes:
+One mount is one workspace — contexts are addressed inside it, never across
+workspaces. Point it with a selector before the mountpoint (or with `-w`/`-c`).
 
-**Context mode** (default): materializes one or more context views.
+**A workspace** (`canvas-fuse mount <workspace> <mountpoint>`) — the same shape
+the WebDAV view serves (see `docs/data-representation.md` in canvas-server):
+
+```
+<mountpoint>/<workspace-name>/
+├── Home/                       # the workspace drive, 1:1, listed on demand
+│   └── <your files>
+├── Trees/
+│   └── <tree-name>/
+│       ├── <folder>/
+│       │   ├── <subfolder>/
+│       │   │   └── document.md
+│       │   └── document.md
+│       └── document.md
+└── Trash/                      # flat; what a delete parked here
+    └── document.md
+```
+
+**Contexts** (`<workspace>/Contexts`) — materializes that workspace's context
+views; `<workspace>/Contexts/<id>` roots the mount at one of them, with its
+schema dirs at the top:
 
 ```
 <mountpoint>/
@@ -26,36 +47,42 @@ Two mount modes:
         └── Other/   *.json        # any unmapped schema
 ```
 
-Folder contents are a function of the context's current URL. When the URL is
-switched - by a browser bound to the context, the CLI, an agent, anything -
-the view updates in place within ~1s: the daemon subscribes to the
+Context folder contents are a function of the context's current URL. When the
+URL is switched - by a browser bound to the context, the CLI, an agent,
+anything - the view updates in place within ~1s: the daemon subscribes to the
 canvas-server socket.io bridge (`context.url.set`, `document.*`) and pushes
 kernel invalidations via FUSE reverse notification. A periodic full resync
-(default 30 s) covers missed events and discovers new contexts.
+(default 30 s) covers missed events and discovers new contexts. Workspace
+mounts reconcile the same way over the `workspace:<id>` channel.
 
-**Workspace mode** (`-w <name>`): mounts all trees of a workspace (both
-`tree:Context` and `tree:Directory` types) read/write, recreating each tree's
-folder hierarchy at the top level.
+`Home/` is the workspace's file drive, passed straight through: real files, no
+document layer. Directories are listed the first time something looks into them
+(a home drive can be enormous, so it is never walked at mount), reads take a
+byte window, and writes replace the whole file on close — the same shape the
+document write path already uses.
 
-```
-<mountpoint>/<workspace-name>/
-├── <tree-name>/
-│   ├── <folder>/
-│   │   ├── <subfolder>/
-│   │   │   └── document.md
-│   │   └── document.md
-│   └── document.md
-└── <another-tree>/
-    └── ...
-```
+### What the filesystem verbs mean
 
-Documents appear as flat files named by their `data.filename` (round-trips
-safely through create/rename). Live updates arrive via the `workspace:<id>`
-socket.io channel - any tree or document change (path insert/remove, document
-insert/update/remove) triggers a full tree reconcile within ~1s. Supports
-markdown write path: create files, edit content, rename and delete files, mkdir,
-rmdir (non-recursive, matching POSIX semantics). Designed for bulk wiki/folder
-imports.
+The rules live server-side, so this mount and WebDAV agree by construction:
+
+- **`rm` detaches** the document from that folder — it survives in the store and
+  in every other path it is filed into. If that was its LAST placement, the
+  server files it into `Trash/` rather than letting it become reachable only
+  through the flat workspace-wide list. Nothing a mount does deletes.
+- **`mv` re-tags.** Moving a file between folders (or trees) links it at the
+  destination and unlinks it at the source — two small requests, no bytes
+  through the mount, so a 4GB blob moves as fast as a note. Moving a folder is a
+  tree operation: the documents filed under it come along.
+- **Deleting from a context** only detaches it from that view; a context is a
+  view, not a place.
+- **Writing a file** stores its bytes: `.todo.json` and `.url` keep their canvas
+  meaning, everything else — markdown included — is a file. Saving over a
+  document that already exists updates it in its own schema, so editing a note
+  edits the note.
+- **Under `Home/` the rules are the filesystem's own**: `rm` deletes the file,
+  `mkdir`/`rmdir` create and remove real directories. No trash, no detach — the
+  workspace trash is for documents, and your file manager's own warning is the
+  safety net.
 
 ## Install
 
@@ -69,22 +96,26 @@ package needed).
 ## CLI
 
 ```sh
-canvas-fuse mount ~/Canvas                 # foreground; ctrl-c unmounts
-canvas-fuse mount -d ~/Canvas              # detached daemon, logs to state dir
-canvas-fuse mount -d -c work ~/ctx/work    # only specific context(s); single -c roots at that context
-canvas-fuse mount -w universe ~/mnt        # workspace mount at ~/mnt/universe/
-canvas-fuse unmount ~/Canvas               # SIGTERM daemon, escalates if needed
-canvas-fuse status [--json]                # known mounts + health (ok/orphaned/...)
-canvas-fuse ping [--json]                  # server reachability, version, auth check
-canvas-fuse contexts [--json]              # list accessible contexts
+canvas-fuse mount universe ~/MyWorkspace                    # the workspace: Trees/ + Trash/
+canvas-fuse mount universe/Contexts ~/ctx                  # that workspace's context views
+canvas-fuse mount universe/Contexts/foo ~/MyFooContext     # one context, rooted
+canvas-fuse mount -d universe ~/MyWorkspace                # detached; logs to the state dir
+canvas-fuse mount -w universe ~/wrk                        # flag form of the first
+canvas-fuse mount -c universe/foo ~/ctx/foo                # flag form of the third
+canvas-fuse unmount ~/MyWorkspace                           # SIGTERM daemon, escalates if needed
+canvas-fuse status [--json]                                # known mounts + health (ok/orphaned/...)
+canvas-fuse ping [--json]                                   # server reachability, version, auth check
+canvas-fuse contexts [--json]                               # list accessible contexts
 ```
 
 ### mount flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-c/--context <id>` | (all) | Only mount specific context ids (repeatable). Single `-c` roots the mount at that context (schema dirs at top level, no `Contexts/` wrapper). Mutually exclusive with `-w`. |
-| `-w/--workspace <name>` | - | Mount a whole workspace's trees read/write. Mounts at `<mountpoint>/<name>/`. Mutually exclusive with `-c`. |
+| `<selector>` | - | Positional, before the mountpoint: `<workspace>`, `<workspace>/Contexts`, or `<workspace>/Contexts/<id>`. |
+| `-c/--context <id>` | - | A context view as `<workspace>/<id>` (or a bare id alongside `-w`). Repeatable; a single one roots the mount at it. |
+| `-w/--workspace <name>` | - | The workspace to mount, at `<mountpoint>/<name>/`. With `-c` it scopes the context mount instead. |
+| `--root <selector>` | - | The selector as a flag, for when it comes from config or a script. |
 | `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only mode). |
 | `--resync <secs>` | 30 | Full resync interval in seconds. |
@@ -101,11 +132,11 @@ machine where canvas-cli is logged in:
 3. `--remote <name>` from `~/.canvas/config/remotes.json`
 4. `boundRemote` from `~/.canvas/config/cli-session.json`
 
-Agent containers typically use env vars + `-c <context>`:
+Agent containers typically use env vars + one context:
 
 ```sh
 CANVAS_SERVER=https://canvas.example CANVAS_API_TOKEN=canvas-... \
-  canvas-fuse mount -d -c mbag /workspace/context
+  canvas-fuse mount -d universe/Contexts/mbag /workspace/context
 ```
 
 Requires `fusermount3` (present on any desktop distro; `fuse3` package in
