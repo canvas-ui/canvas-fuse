@@ -18,6 +18,7 @@ fn note(id: u64, title: &str, content: &str) -> Document {
         data: json!({ "title": title, "content": content }),
         updated_at: SystemTime::UNIX_EPOCH,
         locations: Vec::new(),
+        display_name: None,
         size: None,
         checksum: None,
     }

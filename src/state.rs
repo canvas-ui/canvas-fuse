@@ -1,6 +1,13 @@
 use crate::api::{ContextInfo, Document, HomeEntry, TreeInfo};
 use crate::names::NameStore;
-use crate::render::{self, SCHEMA_DIRS};
+use crate::render;
+
+/// The derived, read-only grouping inside a context folder.
+pub const BY_SCHEMA_DIR: &str = ".by-schema";
+
+/// Sticky-name key for the flat context view (there are no schema dirs to key
+/// by anymore; the store's shape is unchanged).
+pub const FLAT_NAME_KEY: &str = "";
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -301,24 +308,20 @@ impl Tree {
 
     /// If ino is a schema dir (e.g. Notes under a context), return
     /// (context id, dir label). Used by the write path to classify targets.
-    pub fn locate_schema_dir(&self, ino: u64) -> Option<(String, String)> {
+    /// If `ino` IS a context folder, the context it holds. A context is flat, so
+    /// this is the one place documents are written; `.by-schema/` is derived and
+    /// never a write target.
+    pub fn locate_context_dir(&self, ino: u64) -> Option<String> {
         let node = self.get(ino)?;
-        if !node.is_dir() || !SCHEMA_DIRS.contains(&node.name.as_str()) {
+        if !node.is_dir() {
             return None;
         }
-        // Context-rooted: schema dirs hang off ROOT, which is the context.
+        // Context-rooted: ROOT is the context.
         if let Some(root_ctx) = &self.context_root {
-            if node.parent == ROOT_INO {
-                return Some((root_ctx.clone(), node.name.clone()));
-            }
-            return None;
+            return (ino == ROOT_INO).then(|| root_ctx.clone());
         }
-        // Global: schema dir -> context dir -> Contexts.
-        let ctx_node = self.get(node.parent)?;
-        if ctx_node.parent != CONTEXTS_INO {
-            return None;
-        }
-        Some((ctx_node.name.clone(), node.name.clone()))
+        // Global: context dir -> Contexts.
+        (node.parent == CONTEXTS_INO).then(|| node.name.clone())
     }
 
     pub fn ino_for_doc(&self, ctx: &str, doc_id: u64) -> Option<u64> {
@@ -472,16 +475,18 @@ impl Tree {
                     if let Some(ws) = &ctx.workspace_id {
                         self.ctx_workspaces.insert(ctx.id.clone(), ws.clone());
                     }
-                    for dir in SCHEMA_DIRS {
-                        let ino = self.alloc_ino();
-                        self.insert_node(Node {
-                            ino,
-                            parent: ctx_ino,
-                            name: dir.to_string(),
-                            mtime: now,
-                            content: NodeContent::Dir,
-                        });
-                    }
+                    // Grouping is a DERIVED view, dotted and read-only. The
+                    // documents themselves are the context's files (flat), so a
+                    // gesture means the same thing here as anywhere else on the
+                    // mount — see docs/data-representation.md.
+                    let by_schema = self.alloc_ino();
+                    self.insert_node(Node {
+                        ino: by_schema,
+                        parent: ctx_ino,
+                        name: BY_SCHEMA_DIR.to_string(),
+                        mtime: now,
+                        content: NodeContent::Dir,
+                    });
                     let meta_ino = self.alloc_ino();
                     self.insert_node(Node {
                         ino: meta_ino,
@@ -524,6 +529,10 @@ impl Tree {
     }
 
     /// Replace the document view of one context with a freshly fetched list.
+    ///
+    /// FLAT: the documents are the context's files. `.by-schema/` is rebuilt
+    /// from the same render pass — it is derived, so it carries no sticky names
+    /// and no document bindings; the flat entries own those.
     pub fn apply_documents(
         &mut self,
         ctx_id: &str,
@@ -535,30 +544,19 @@ impl Tree {
             return inv;
         };
 
-        // Resolve schema-dir inos for this context
-        let mut dir_inos: HashMap<&str, u64> = HashMap::new();
-        for dir in SCHEMA_DIRS {
-            if let Some(node) = self.lookup(ctx_ino, dir) {
-                dir_inos.insert(*dir, node.ino);
-            }
-        }
-
-        // Render all docs and assign sticky filenames, deterministically (id order)
+        // Render every doc once, deterministically (id order), and assign the
+        // sticky filename the flat view shows.
         let mut sorted: Vec<&Document> = docs.iter().collect();
         sorted.sort_by_key(|d| d.id);
-
         let workspace_id = self.ctx_workspaces.get(ctx_id).cloned();
 
-        // (dir ino) -> name -> (doc id, content, mtime)
-        let mut desired: HashMap<u64, BTreeMap<String, (u64, NodeContent, SystemTime)>> =
-            HashMap::new();
-        let mut taken: HashMap<u64, HashSet<String>> = HashMap::new();
+        let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
+        let mut grouped: BTreeMap<&'static str, Vec<(String, NodeContent, SystemTime)>> =
+            BTreeMap::new();
+        let mut taken: HashSet<String> = HashSet::new();
 
         for doc in sorted {
             let rendered = render::render(doc);
-            let Some(&dir_ino) = dir_inos.get(rendered.dir) else {
-                continue;
-            };
             let content = match rendered.content {
                 render::Content::Inline(bytes) => NodeContent::Inline(Arc::new(bytes)),
                 render::Content::Remote { size } => match &workspace_id {
@@ -568,15 +566,17 @@ impl Tree {
                         size,
                         checksum: doc.checksum.clone(),
                     },
-                    // No workspace to address the content route — degrade to
-                    // the document JSON rather than an unreadable entry
+                    // No workspace to address the content route — degrade to the
+                    // document JSON rather than an unreadable entry.
                     None => NodeContent::Inline(Arc::new(
                         serde_json::to_vec_pretty(&doc.data).unwrap_or_default(),
                     )),
                 },
             };
-            let taken = taken.entry(dir_ino).or_default();
-            let persisted = names.get(ctx_id, rendered.dir, doc.id);
+
+            // Sticky names are keyed per context now that there are no schema
+            // dirs to key by; FLAT_NAME_KEY keeps the store's shape.
+            let persisted = names.get(ctx_id, FLAT_NAME_KEY, doc.id);
             let name = match persisted {
                 Some(n) if !taken.contains(&n) => n,
                 _ => {
@@ -585,97 +585,132 @@ impl Tree {
                     } else {
                         rendered.base_name.clone()
                     };
-                    if let Err(e) = names.put(ctx_id, rendered.dir, doc.id, &candidate) {
+                    if let Err(e) = names.put(ctx_id, FLAT_NAME_KEY, doc.id, &candidate) {
                         log::warn!("name store write failed: {e}");
                     }
                     candidate
                 }
             };
             taken.insert(name.clone());
-            desired
-                .entry(dir_ino)
+            grouped
+                .entry(rendered.dir)
                 .or_default()
-                .insert(name, (doc.id, content, doc.updated_at));
+                .push((name.clone(), content.clone(), doc.updated_at));
+            desired.insert(name, (doc.id, content, doc.updated_at));
         }
 
-        // Diff each schema dir: remove gone entries, update changed, add new
-        for &dir_ino in dir_inos.values() {
-            let want = desired.remove(&dir_ino).unwrap_or_default();
-            let have: Vec<(String, u64)> = self
-                .children
-                .get(&dir_ino)
-                .map(|c| c.iter().map(|(n, i)| (n.clone(), *i)).collect())
-                .unwrap_or_default();
-
-            let mut dirty = false;
-            for (name, ino) in have {
-                match want.get(&name) {
-                    Some((doc_id, content, mtime)) => {
-                        let node = self.nodes.get_mut(&ino).unwrap();
-                        let same_doc =
-                            self.doc_inos.get(&(ctx_id.to_string(), *doc_id)) == Some(&ino);
-                        if same_doc {
-                            if node.content != *content {
-                                node.content = content.clone();
-                                node.mtime = *mtime;
-                                inv.changed.push(ino);
-                            }
-                        } else {
-                            // Same filename now belongs to a different document
-                            self.remove_node(ino);
-                            self.doc_inos
-                                .retain(|(c, _), i| !(c == ctx_id && *i == ino));
-                            inv.removed.push((dir_ino, ino, name.clone()));
-                            dirty = true;
-                        }
-                    }
-                    None => {
-                        self.remove_node(ino);
-                        self.doc_inos
-                            .retain(|(c, _), i| !(c == ctx_id && *i == ino));
-                        inv.removed.push((dir_ino, ino, name));
-                        dirty = true;
-                    }
-                }
-            }
-
-            for (name, (doc_id, content, mtime)) in want {
-                if self.lookup(dir_ino, &name).is_some() {
-                    continue; // already present and up to date / refreshed above
-                }
-                let key = (ctx_id.to_string(), doc_id);
-                let ino = match self.doc_inos.get(&key) {
-                    Some(&ino) if self.nodes.contains_key(&ino) => {
-                        // Doc moved (renamed file or schema dir); re-home it
-                        let old = self.remove_node(ino).unwrap();
-                        inv.removed.push((old.parent, ino, old.name));
-                        ino
-                    }
-                    _ => self.alloc_ino(),
-                };
-                self.doc_inos.insert(key, ino);
-                self.insert_node(Node {
-                    ino,
-                    parent: dir_ino,
-                    name,
-                    mtime,
-                    content,
-                });
-                dirty = true;
-            }
-
-            if dirty {
-                inv.dirty_dirs.push(dir_ino);
-                if let Some(node) = self.nodes.get_mut(&dir_ino) {
-                    node.mtime = SystemTime::now();
-                }
-            }
+        let changed = self.reconcile_doc_dir(ctx_ino, ctx_id, &desired, &mut inv);
+        if changed {
+            self.rebuild_by_schema(ctx_ino, &grouped, &mut inv);
         }
-
         inv
     }
 
-    // ── Workspace tree view ───────────────────────────────────────────────
+    /// Bring one directory's document files in line with `desired`. Returns
+    /// whether anything changed.
+    fn reconcile_doc_dir(
+        &mut self,
+        dir_ino: u64,
+        ctx_id: &str,
+        desired: &BTreeMap<String, (u64, NodeContent, SystemTime)>,
+        inv: &mut Invalidation,
+    ) -> bool {
+        // Only document files are ours to reconcile: `.context.json` and
+        // `.by-schema/` live here too and are managed elsewhere.
+        let have: Vec<(String, u64)> = self
+            .children
+            .get(&dir_ino)
+            .map(|c| {
+                c.iter()
+                    .filter(|(name, _)| {
+                        name.as_str() != CONTEXT_META_FILE && name.as_str() != BY_SCHEMA_DIR
+                    })
+                    .map(|(n, i)| (n.clone(), *i))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut dirty = false;
+        for (name, ino) in have {
+            match desired.get(&name) {
+                Some((doc_id, content, mtime)) if self.doc_for_ino(ino).map(|(_, d)| d) == Some(*doc_id) => {
+                    let node = self.nodes.get_mut(&ino).unwrap();
+                    if node.content != *content {
+                        node.content = content.clone();
+                        node.mtime = *mtime;
+                        inv.changed.push(ino);
+                    }
+                }
+                _ => {
+                    self.remove_node(ino);
+                    self.doc_inos.retain(|_, &mut i| i != ino);
+                    inv.removed.push((dir_ino, ino, name));
+                    dirty = true;
+                }
+            }
+        }
+
+        for (name, (doc_id, content, mtime)) in desired {
+            if self.lookup(dir_ino, name).is_some() {
+                continue;
+            }
+            let ino = self.alloc_ino();
+            self.insert_node(Node {
+                ino,
+                parent: dir_ino,
+                name: name.clone(),
+                mtime: *mtime,
+                content: content.clone(),
+            });
+            self.doc_inos.insert((ctx_id.to_string(), *doc_id), ino);
+            dirty = true;
+        }
+
+        if dirty {
+            inv.dirty_dirs.push(dir_ino);
+        }
+        dirty
+    }
+
+    /// Rebuild `.by-schema/` from scratch. It is derived and read-only, so
+    /// throwing it away and re-materializing is simpler — and safer — than
+    /// diffing a second copy of every document.
+    fn rebuild_by_schema(
+        &mut self,
+        ctx_ino: u64,
+        grouped: &BTreeMap<&'static str, Vec<(String, NodeContent, SystemTime)>>,
+        inv: &mut Invalidation,
+    ) {
+        let Some(root) = self.lookup(ctx_ino, BY_SCHEMA_DIR).map(|n| n.ino) else {
+            return;
+        };
+        self.remove_subtree(root, inv);
+
+        for (dir, entries) in grouped {
+            if entries.is_empty() {
+                continue;
+            }
+            let dir_ino = self.alloc_ino();
+            self.insert_node(Node {
+                ino: dir_ino,
+                parent: root,
+                name: (*dir).to_string(),
+                mtime: SystemTime::now(),
+                content: NodeContent::Dir,
+            });
+            for (name, content, mtime) in entries {
+                let ino = self.alloc_ino();
+                self.insert_node(Node {
+                    ino,
+                    parent: dir_ino,
+                    name: name.clone(),
+                    mtime: *mtime,
+                    content: content.clone(),
+                });
+            }
+        }
+        inv.dirty_dirs.push(root);
+    }
 
     fn ws(&self) -> &WsState {
         self.ws.as_ref().expect("workspace mode")

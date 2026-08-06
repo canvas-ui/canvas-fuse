@@ -20,6 +20,7 @@ fn doc(id: u64, schema: &str, data: serde_json::Value) -> Document {
         data,
         updated_at: SystemTime::UNIX_EPOCH,
         locations: Vec::new(),
+        display_name: None,
         size: None,
         checksum: None,
     }
@@ -70,26 +71,68 @@ fn names_in(tree: &Tree, ino: u64) -> Vec<String> {
         .collect()
 }
 
-fn schema_dir_ino(tree: &Tree, ctx_id: &str, dir: &str) -> u64 {
-    let ctx_ino = tree.context_ino(ctx_id).unwrap();
-    tree.lookup(ctx_ino, dir).unwrap().ino
+/// Where a context's documents live: the context folder itself, flat.
+fn docs_ino(tree: &Tree, ctx_id: &str) -> u64 {
+    tree.context_ino(ctx_id).unwrap()
 }
 
+/// The derived, read-only grouping.
+fn by_schema_ino(tree: &Tree, ctx_id: &str, dir: &str) -> Option<u64> {
+    let by = tree.lookup(tree.context_ino(ctx_id).unwrap(), ".by-schema")?.ino;
+    tree.lookup(by, dir).map(|n| n.ino)
+}
+
+/// Document files only — `.context.json` and `.by-schema` are furniture.
+fn doc_names(tree: &Tree, ctx_id: &str) -> Vec<String> {
+    let mut v: Vec<String> = names_in(tree, docs_ino(tree, ctx_id))
+        .into_iter()
+        .filter(|n| n != ".context.json" && n != ".by-schema")
+        .collect();
+    v.sort();
+    v
+}
+
+/// A context is FLAT: its documents are its files. The only furniture is the
+/// meta file and the derived `.by-schema/` grouping — no schema skeleton, so
+/// nothing infers meaning from which folder you are standing in.
 #[test]
-fn skeleton_dirs_always_present() {
+fn context_folder_is_flat() {
     let (_tmp, names) = store();
     let mut tree = Tree::new();
     tree.apply_contexts(&[ctx("work", "/work")]);
     tree.apply_documents("work", &[], &names);
 
-    let ctx_ino = tree.context_ino("work").unwrap();
-    let entries = names_in(&tree, ctx_ino);
-    for dir in [
-        "Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other",
-    ] {
-        assert!(entries.contains(&dir.to_string()), "missing {dir}");
-    }
+    let entries = names_in(&tree, tree.context_ino("work").unwrap());
     assert!(entries.contains(&".context.json".to_string()));
+    assert!(entries.contains(&".by-schema".to_string()));
+    for gone in ["Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other"] {
+        assert!(!entries.contains(&gone.to_string()), "{gone} should not be a folder");
+    }
+}
+
+/// The same documents, grouped — derived and read-only.
+#[test]
+fn by_schema_groups_the_same_documents() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("work", "/work")]);
+    tree.apply_documents(
+        "work",
+        &[note(1, "Idea", "body"), tab(2, "Rust", "https://rust-lang.org")],
+        &names,
+    );
+
+    assert_eq!(doc_names(&tree, "work"), vec!["Idea.md", "Rust.url"]);
+    assert_eq!(
+        names_in(&tree, by_schema_ino(&tree, "work", "Notes").expect("Notes group")),
+        vec!["Idea.md"]
+    );
+    assert_eq!(
+        names_in(&tree, by_schema_ino(&tree, "work", "Tabs").expect("Tabs group")),
+        vec!["Rust.url"]
+    );
+    // Empty groups are not materialized — there is nothing to look at.
+    assert!(by_schema_ino(&tree, "work", "Emails").is_none());
 }
 
 #[test]
@@ -101,15 +144,11 @@ fn title_collisions_get_id_suffix_and_stick() {
     let docs = vec![note(1, "Meeting", "a"), note(2, "Meeting", "b")];
     tree.apply_documents("work", &docs, &names);
 
-    let notes_ino = schema_dir_ino(&tree, "work", "Notes");
-    assert_eq!(
-        names_in(&tree, notes_ino),
-        vec!["Meeting.2.md", "Meeting.md"]
-    );
+    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.2.md", "Meeting.md"]);
 
     // Doc 1 leaves; doc 2 must NOT inherit the clean name (sticky map)
     tree.apply_documents("work", &[note(2, "Meeting", "b")], &names);
-    assert_eq!(names_in(&tree, notes_ino), vec!["Meeting.2.md"]);
+    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.2.md"]);
 }
 
 #[test]
@@ -128,7 +167,7 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
         ],
         &names,
     );
-    let tabs_ino = schema_dir_ino(&tree, "work", "Tabs");
+    let tabs_ino = docs_ino(&tree, "work");
     let shared_tab_ino = tree.lookup(tabs_ino, "Docs.url").unwrap().ino;
 
     // switch to jira-3333: Docs tab survives, ticket tab replaced, note gone
@@ -141,10 +180,7 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
         &names,
     );
 
-    assert_eq!(
-        names_in(&tree, tabs_ino),
-        vec!["Docs.url", "Other-ticket.url"]
-    );
+    assert_eq!(doc_names(&tree, "work"), vec!["Docs.url", "Other-ticket.url"]);
     // surviving doc keeps its inode → open handles stay valid
     assert_eq!(
         tree.lookup(tabs_ino, "Docs.url").unwrap().ino,
@@ -163,7 +199,7 @@ fn content_change_reports_inode_invalidation() {
     tree.apply_contexts(&[ctx("work", "/w")]);
     tree.apply_documents("work", &[note(1, "Plan", "v1")], &names);
 
-    let notes_ino = schema_dir_ino(&tree, "work", "Notes");
+    let notes_ino = docs_ino(&tree, "work");
     let ino = tree.lookup(notes_ino, "Plan.md").unwrap().ino;
 
     let inv = tree.apply_documents("work", &[note(1, "Plan", "v2 updated")], &names);
@@ -216,7 +252,7 @@ fn file_docs_use_location_basename_and_remote_content() {
     );
     tree.apply_documents("work", &[f], &names);
 
-    let files_ino = schema_dir_ino(&tree, "work", "Files");
+    let files_ino = docs_ino(&tree, "work");
     let node = tree.lookup(files_ino, "Q2 Report.pdf").expect("file entry");
     assert_eq!(node.size(), 123456);
     match &node.content {
@@ -246,7 +282,7 @@ fn file_doc_without_size_shown_as_is_size_unresolved() {
 
     // Shown as the real file (not a .json stub) with size unresolved (None) —
     // fsimpl resolves it from the blob on first stat.
-    let files_ino = schema_dir_ino(&tree, "work", "Files");
+    let files_ino = docs_ino(&tree, "work");
     let node = tree.lookup(files_ino, "notes.txt").expect("file entry");
     assert!(matches!(
         node.content,
@@ -255,30 +291,28 @@ fn file_doc_without_size_shown_as_is_size_unresolved() {
 }
 
 #[test]
-fn context_rooted_mount_puts_schema_dirs_at_root() {
+fn context_rooted_mount_puts_the_documents_at_root() {
     let (_tmp, names) = store();
     let mut tree = Tree::context_rooted("mbag".to_string());
     tree.apply_contexts(&[ctx("mbag", "/work")]);
     tree.apply_documents("mbag", &[note(1, "Hello", "hi")], &names);
 
-    // The context's schema dirs hang directly off ROOT — no "Contexts" wrapper.
+    // Rooted at one context: its files hang directly off ROOT — no "Contexts"
+    // wrapper, and no schema skeleton.
     let root_entries = names_in(&tree, ROOT_INO);
-    assert!(root_entries.contains(&"Notes".to_string()));
-    assert!(root_entries.contains(&"Tabs".to_string()));
+    assert!(root_entries.contains(&"Hello.md".to_string()));
     assert!(root_entries.contains(&".context.json".to_string()));
+    assert!(root_entries.contains(&".by-schema".to_string()));
     assert!(!root_entries.contains(&"Contexts".to_string()));
+    assert!(!root_entries.contains(&"Notes".to_string()));
 
     // The context dir IS root.
     assert_eq!(tree.context_ino("mbag"), Some(ROOT_INO));
 
-    // The note materializes under the root-level Notes dir, and the write path
-    // still classifies it as belonging to the rooted context.
-    let notes_ino = tree.lookup(ROOT_INO, "Notes").unwrap().ino;
-    assert_eq!(names_in(&tree, notes_ino), vec!["Hello.md"]);
-    assert_eq!(
-        tree.locate_schema_dir(notes_ino),
-        Some(("mbag".to_string(), "Notes".to_string()))
-    );
+    // The write path still classifies a file here as belonging to the context.
+    let file_ino = tree.lookup(ROOT_INO, "Hello.md").unwrap().ino;
+    assert_eq!(tree.doc_for_ino(file_ino), Some(("mbag".to_string(), 1)));
+    assert_eq!(tree.locate_context_dir(ROOT_INO), Some("mbag".to_string()));
 }
 
 #[test]

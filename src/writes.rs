@@ -7,9 +7,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Schema dirs that accept writes. Notes and Todos map to mutable JSON docs
+/// Legacy: schema dirs that accepted writes when contexts were grouped by
+/// schema. Contexts are flat now; kept only for the renderer's dir labels.
 /// (identity = doc id), so edits are plain updates — no versioning needed.
 pub const WRITABLE_DIRS: &[&str] = &["Notes", "Todos"];
+
+/// Sticky-name key for a flat context view — mirrors state::FLAT_NAME_KEY.
+const FLAT_DIR: &str = "";
 
 /// Overlay inodes live far above anything Tree allocates.
 const FIRST_OVERLAY_INO: u64 = 1 << 48;
@@ -137,9 +141,11 @@ impl WriteStore {
         self.sync.clone()
     }
 
-    fn writable_dir(&self, dir_ino: u64) -> Option<(String, String)> {
-        let (ctx, dir) = self.tree.read().locate_schema_dir(dir_ino)?;
-        WRITABLE_DIRS.contains(&dir.as_str()).then_some((ctx, dir))
+    /// The context a write into `dir_ino` targets. A context folder is flat, so
+    /// the folder itself is the only writable place — `.by-schema/` is a
+    /// derived view and refuses writes by not resolving here.
+    fn writable_context(&self, dir_ino: u64) -> Option<String> {
+        self.tree.read().locate_context_dir(dir_ino)
     }
 
     // ── overlay view (pending creates), consumed by lookup/readdir/getattr ──
@@ -278,13 +284,13 @@ impl WriteStore {
             }
         } else {
             let parent = self.tree.read().get(ino).map(|n| n.parent).unwrap_or(0);
-            let (ctx, dir) = self.writable_dir(parent).ok_or(WriteError::NotPermitted)?;
+            let ctx = self.writable_context(parent).ok_or(WriteError::NotPermitted)?;
             let (_, doc_id) = self
                 .tree
                 .read()
                 .doc_for_ino(ino)
                 .ok_or(WriteError::NotPermitted)?; // .context.json etc. have no doc
-            FlushTarget::Existing { ctx, dir, doc_id }
+            FlushTarget::Existing { ctx, dir: FLAT_DIR.to_string(), doc_id }
         };
 
         let mut inner = self.inner.lock();
@@ -329,9 +335,6 @@ impl WriteStore {
                 .read()
                 .locate_tree_dir(dir_ino)
                 .ok_or(WriteError::NotPermitted)?;
-            if ws_doc_schema(name).is_none() {
-                return Err(WriteError::NotPermitted); // only .md / .todo.json / .url
-            }
             FlushTarget::WsCreate {
                 tree_name,
                 tree_id,
@@ -341,10 +344,10 @@ impl WriteStore {
                 name: name.to_string(),
             }
         } else {
-            let (ctx, dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
+            let ctx = self.writable_context(dir_ino).ok_or(WriteError::NotPermitted)?;
             FlushTarget::Create {
                 ctx,
-                dir,
+                dir: FLAT_DIR.to_string(),
                 dir_ino,
                 name: name.to_string(),
             }
@@ -627,7 +630,7 @@ impl WriteStore {
         if self.tree.read().is_workspace() {
             return self.unlink_ws(dir_ino, name);
         }
-        let (ctx, _dir) = self.writable_dir(dir_ino).ok_or(WriteError::NotPermitted)?;
+        let ctx = self.writable_context(dir_ino).ok_or(WriteError::NotPermitted)?;
 
         let ino = {
             let tree = self.tree.read();
@@ -671,7 +674,8 @@ impl WriteStore {
             return Err(WriteError::CrossDir);
         }
         let _sync = self.sync.lock();
-        let (ctx, dir) = self.writable_dir(src_dir).ok_or(WriteError::NotPermitted)?;
+        let ctx = self.writable_context(src_dir).ok_or(WriteError::NotPermitted)?;
+        let dir = FLAT_DIR.to_string();
 
         let src_overlay = {
             let inner = self.inner.lock();
@@ -1177,24 +1181,44 @@ impl WriteStore {
             .and_then(Value::as_str)
             .unwrap_or("data/schema/note")
             .to_string();
-        let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
-        // Exact id match, not a suffix test: with hierarchical ids a suffix match
-        // would silently misroute any id that merely ends in the same segment.
-        let dir = if schema == "data/schema/task" {
-            "Todos"
+        // Editing never changes what a document IS: a note stays a note, and a
+        // FILE's bytes go to the blob store rather than into `data`.
+        if schema == "data/schema/file" {
+            let blob = self
+                .api
+                .upload_blob(&ws, buffer.to_vec())
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            let name = existing
+                .get("locations")
+                .and_then(Value::as_array)
+                .and_then(|l| l.first())
+                .and_then(|loc| loc.get("metadata"))
+                .and_then(|m| m.get("filename"))
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .to_string();
+            let mut doc = build_file_document(&name, &blob);
+            doc["id"] = json!(doc_id);
+            self.api
+                .update_workspace_documents(&ws, tree_id, tree_type, path, vec![doc])
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
         } else {
-            "Notes"
-        };
-        apply_buffer_to_data(dir, &mut data, buffer);
-        self.api
-            .update_workspace_documents(
-                &ws,
-                tree_id,
-                tree_type,
-                path,
-                vec![json!({ "id": doc_id, "schema": schema, "data": data })],
-            )
-            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
+            // Exact id match, not a suffix test: with hierarchical ids a suffix
+            // match would silently misroute any id that merely ends in the same
+            // segment.
+            let dir = if schema == "data/schema/task" { "Todos" } else { "Notes" };
+            apply_buffer_to_data(dir, &mut data, buffer);
+            self.api
+                .update_workspace_documents(
+                    &ws,
+                    tree_id,
+                    tree_type,
+                    path,
+                    vec![json!({ "id": doc_id, "schema": schema, "data": data })],
+                )
+                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        }
 
         let ino = self.tree.read().ws_ino_for_doc(tree_name, path, doc_id);
         if let Some(ino) = ino {
@@ -1218,7 +1242,18 @@ impl WriteStore {
         ino: u64,
     ) -> WResult<u64> {
         let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
-        let doc = build_ws_document(name, buffer).ok_or(WriteError::NotPermitted)?;
+        // A canvas-native name builds its abstraction; anything else is a file,
+        // so its bytes go to the blob store first.
+        let doc = match build_ws_document(name, buffer) {
+            Some(doc) => doc,
+            None => {
+                let blob = self
+                    .api
+                    .upload_blob(&ws, buffer.to_vec())
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                build_file_document(name, &blob)
+            }
+        };
         let ids = self
             .api
             .put_tree_document(&ws, tree_id, tree_type, path, doc)
@@ -1391,12 +1426,19 @@ fn parent_of(path: &str) -> String {
 
 /// Schema a writable filename maps to in a workspace tree, or None if the
 /// extension isn't one we materialize as an editable document.
+/// Which schema a NEW file implies, or None when it is just a file.
+///
+/// `.todo.json` and `.url` keep a canvas meaning because they are not general
+/// formats — a browser emits `.url` when you drag a link out of the address
+/// bar, and `.todo.json` only ever comes from our own renderer. **`.md` does
+/// not**: markdown is a general document format, so a new `.md` is a FILE.
+/// Rendering markdown as a note is a UI decision, not a storage one. Same rule
+/// as the server's `inferDocFromFile()`; the two wires must not disagree about
+/// what a write means.
 fn ws_doc_schema(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
     if lower.ends_with(".todo.json") {
         Some("data/schema/task")
-    } else if lower.ends_with(".md") {
-        Some("data/schema/note")
     } else if lower.ends_with(".url") {
         Some("data/schema/tab")
     } else {
@@ -1406,6 +1448,24 @@ fn ws_doc_schema(name: &str) -> Option<&'static str> {
 
 /// Build a new workspace document from a filename + body. `data.filename` pins
 /// the on-disk name so re-saves round-trip to the same document.
+/// A File document for already-uploaded bytes. `data` stays empty (the server's
+/// core/File.js reserves it for JSON docs); the name rides on the location.
+fn build_file_document(name: &str, blob: &crate::api::BlobRef) -> Value {
+    let mut doc = json!({
+        "schema": "data/schema/file",
+        "data": {},
+        "locations": [{ "url": blob.url, "metadata": { "filename": name } }],
+        "metadata": { "size": blob.size },
+    });
+    if let Some(checksum) = &blob.checksum {
+        doc["checksumArray"] = json!([format!("sha256/{checksum}")]);
+    }
+    if let Some(mime) = &blob.mime_type {
+        doc["metadata"]["contentType"] = json!(mime);
+    }
+    doc
+}
+
 fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
     let schema = ws_doc_schema(name)?;
     let text = String::from_utf8_lossy(buffer);

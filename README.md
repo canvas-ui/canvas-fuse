@@ -30,22 +30,27 @@ the WebDAV view serves (see `docs/data-representation.md` in canvas-server):
 ```
 
 **Contexts** (`<workspace>/Contexts`) — materializes that workspace's context
-views; `<workspace>/Contexts/<id>` roots the mount at one of them, with its
-schema dirs at the top:
+views; `<workspace>/Contexts/<id>` roots the mount at one of them.
+
+A context is FLAT: its documents are its files. Grouping by schema is a derived,
+read-only `.by-schema/`, so nothing about a file changes depending on which
+folder you drop it in.
 
 ```
 <mountpoint>/
 └── Contexts/
     └── <context-id>/
         ├── .context.json          # context metadata incl. current url
-        ├── Tabs/    *.url         # data/schema/tab
-        ├── Notes/   *.md          # data/schema/note
-        ├── Todos/   *.md          # data/schema/task
-        ├── Links/   *.url         # data/schema/link
-        ├── Files/   real files    # data/schema/file - blob content, lazy-fetched
-        ├── Emails/  *.json
-        └── Other/   *.json        # any unmapped schema
+        ├── reddit.url             # data/schema/tab
+        ├── notes.md               # a file, like anywhere else
+        ├── report.pdf             # blob content, lazy-fetched
+        └── .by-schema/            # derived, read-only
+            ├── Tabs/  Notes/  Files/  Emails/  …
 ```
+
+Because the tabs of a context-bound browser are just files here, a file manager
+can drive it: `rm reddit.url` closes that tab, writing a `.url` opens one, and
+editing one navigates it.
 
 Context folder contents are a function of the context's current URL. When the
 URL is switched - by a browser bound to the context, the CLI, an agent,
@@ -76,7 +81,8 @@ The rules live server-side, so this mount and WebDAV agree by construction:
 - **Deleting from a context** only detaches it from that view; a context is a
   view, not a place.
 - **Writing a file** stores its bytes: `.todo.json` and `.url` keep their canvas
-  meaning, everything else — markdown included — is a file. Saving over a
+  meaning, everything else — markdown included — is a file (its bytes go to the
+  workspace blob store, and the document references them). Saving over a
   document that already exists updates it in its own schema, so editing a note
   edits the note.
 - **Under `Home/` the rules are the filesystem's own**: `rm` deletes the file,

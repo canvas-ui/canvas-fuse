@@ -12,6 +12,15 @@ pub struct ContextInfo {
     pub raw: Value,
 }
 
+/// A blob stored in the workspace, as a File document references it.
+#[derive(Debug, Clone)]
+pub struct BlobRef {
+    pub url: String,
+    pub checksum: Option<String>,
+    pub size: u64,
+    pub mime_type: Option<String>,
+}
+
 /// One entry of the workspace home drive — a real file or folder, not a
 /// document. Home is a passthrough: the file IS the file.
 #[derive(Debug, Clone)]
@@ -42,8 +51,12 @@ pub struct Document {
     pub schema: String,
     pub data: Value,
     pub updated_at: SystemTime,
-    /// locations[].url — for file docs the basename is the display name
+    /// locations[].url — where the bytes are, NOT where the name comes from.
     pub locations: Vec<String>,
+    /// The document's display name, resolved server-style at parse time (see
+    /// `resolve_display_name`). None when nothing names it and the renderer
+    /// must derive one.
+    pub display_name: Option<String>,
     /// metadata.size — getattr size for blob-backed docs
     pub size: Option<u64>,
     /// checksumArray[0] — blob cache key (content-addressed dedupe)
@@ -371,6 +384,41 @@ impl ApiClient {
             }
         }
         Ok(docs)
+    }
+
+    /// Store bytes in the workspace blob store and get back the location a File
+    /// document references. The byte half of writing a plain file.
+    pub fn upload_blob(&self, ws: &str, bytes: Vec<u8>) -> Result<BlobRef> {
+        let url = format!("{}/rest/v2/workspaces/{}/blobs", self.base, encode_segment(ws));
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes)
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .with_context(|| format!("POST {url}: invalid JSON (HTTP {status})"))?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "POST {url}: HTTP {status}: {}",
+                body.get("message").and_then(Value::as_str).unwrap_or("?")
+            );
+        }
+        let payload = body.get("payload").unwrap_or(&body);
+        Ok(BlobRef {
+            url: payload
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("blob upload returned no url"))?
+                .to_string(),
+            checksum: payload.get("checksum").and_then(Value::as_str).map(str::to_string),
+            size: payload.get("size").and_then(Value::as_u64).unwrap_or(0),
+            mime_type: payload.get("mimeType").and_then(Value::as_str).map(str::to_string),
+        })
     }
 
     // ── Home drive ───────────────────────────────────────────────────────────
@@ -757,6 +805,53 @@ fn extract_documents(body: &Value) -> Vec<Value> {
     Vec::new()
 }
 
+/// The name a document should be shown under, in the server's order (see
+/// `displayFilename()` in transports/webdav/vfs-shared.js — the two must agree
+/// or the same file is called different things on the two wires):
+///
+///   1. `metadata.filename` — the document's own name, set by a rename;
+///   2. `data.filename` — the same for JSON abstractions;
+///   3. the name on the canvas-owned copy (`stored://workspace:*`);
+///   4. any location name, by a STABLE sort of the url — never array order,
+///      which is rebuilt per backend scan;
+///
+/// A `stored://` key is a content HASH and is never a name; the renderer falls
+/// back to deriving one.
+fn resolve_display_name(doc: &Value) -> Option<String> {
+    let trimmed = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+
+    if let Some(name) = trimmed(doc.get("metadata").and_then(|m| m.get("filename"))) {
+        return Some(name);
+    }
+    if let Some(name) = trimmed(doc.get("data").and_then(|d| d.get("filename"))) {
+        return Some(name);
+    }
+
+    let locations = doc.get("locations").and_then(Value::as_array)?;
+    let named = |loc: &Value| trimmed(loc.get("metadata").and_then(|m| m.get("filename")));
+
+    if let Some(name) = locations
+        .iter()
+        .find(|loc| {
+            loc.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.starts_with("stored://workspace:"))
+        })
+        .and_then(named)
+    {
+        return Some(name);
+    }
+
+    let mut sorted: Vec<&Value> = locations.iter().collect();
+    sorted.sort_by_key(|loc| loc.get("url").and_then(Value::as_str).unwrap_or("").to_string());
+    sorted.iter().find_map(|loc| named(loc))
+}
+
 fn parse_document(doc: &Value) -> Option<Document> {
     let id = doc.get("id").and_then(Value::as_u64)?;
     let schema = doc.get("schema").and_then(Value::as_str)?.to_string();
@@ -788,8 +883,10 @@ fn parse_document(doc: &Value) -> Option<Document> {
         .and_then(|a| a.first())
         .and_then(Value::as_str)
         .map(str::to_string);
+    let display_name = resolve_display_name(doc);
     Some(Document {
         id,
+        display_name,
         schema,
         data,
         updated_at,

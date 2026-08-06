@@ -72,9 +72,16 @@ fn render_file(doc: &Document) -> Rendered {
     // media players / spreadsheets / etc. open it directly. Size comes from
     // metadata.size when present; otherwise None → resolved lazily on stat/read.
     let name = doc
-        .locations
-        .iter()
-        .find_map(|url| location_basename(url))
+        .display_name
+        .clone()
+        // Only schemes whose path IS a name: a stored:// key is a content hash,
+        // and showing it would rename the file to its checksum.
+        .or_else(|| {
+            doc.locations
+                .iter()
+                .filter(|url| !url.starts_with("stored://"))
+                .find_map(|url| location_basename(url))
+        })
         .unwrap_or_else(|| format!("file-{}", doc.id));
     Rendered {
         dir: "Files",
