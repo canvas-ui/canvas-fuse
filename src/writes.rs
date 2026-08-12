@@ -45,7 +45,11 @@ enum FlushTarget {
     /// Write a real file on the home drive. Whole-file PUT on flush — the home
     /// API replaces files rather than patching them, which is the same shape
     /// this overlay already uses for documents.
-    HomeFile { path: String, dir_ino: u64, name: String },
+    HomeFile {
+        path: String,
+        dir_ino: u64,
+        name: String,
+    },
     /// Create a new document in a workspace tree path on first flush
     WsCreate {
         tree_name: String,
@@ -234,7 +238,11 @@ impl WriteStore {
         // a partial write (every editor does one) does not truncate the rest of
         // the file when the PUT replaces it.
         if let Some(target) = self.home_target(ino) {
-            let (path, size) = self.tree.read().home_file(ino).ok_or(WriteError::NotFound)?;
+            let (path, size) = self
+                .tree
+                .read()
+                .home_file(ino)
+                .ok_or(WriteError::NotFound)?;
             let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
             let content = if truncate || size == 0 {
                 Vec::new()
@@ -284,13 +292,19 @@ impl WriteStore {
             }
         } else {
             let parent = self.tree.read().get(ino).map(|n| n.parent).unwrap_or(0);
-            let ctx = self.writable_context(parent).ok_or(WriteError::NotPermitted)?;
+            let ctx = self
+                .writable_context(parent)
+                .ok_or(WriteError::NotPermitted)?;
             let (_, doc_id) = self
                 .tree
                 .read()
                 .doc_for_ino(ino)
                 .ok_or(WriteError::NotPermitted)?; // .context.json etc. have no doc
-            FlushTarget::Existing { ctx, dir: FLAT_DIR.to_string(), doc_id }
+            FlushTarget::Existing {
+                ctx,
+                dir: FLAT_DIR.to_string(),
+                doc_id,
+            }
         };
 
         let mut inner = self.inner.lock();
@@ -344,7 +358,9 @@ impl WriteStore {
                 name: name.to_string(),
             }
         } else {
-            let ctx = self.writable_context(dir_ino).ok_or(WriteError::NotPermitted)?;
+            let ctx = self
+                .writable_context(dir_ino)
+                .ok_or(WriteError::NotPermitted)?;
             FlushTarget::Create {
                 ctx,
                 dir: FLAT_DIR.to_string(),
@@ -469,7 +485,11 @@ impl WriteStore {
         };
 
         let result = match &target {
-            FlushTarget::HomeFile { path, dir_ino, name } => {
+            FlushTarget::HomeFile {
+                path,
+                dir_ino,
+                name,
+            } => {
                 if dirty {
                     let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
                     self.api
@@ -630,7 +650,9 @@ impl WriteStore {
         if self.tree.read().is_workspace() {
             return self.unlink_ws(dir_ino, name);
         }
-        let ctx = self.writable_context(dir_ino).ok_or(WriteError::NotPermitted)?;
+        let ctx = self
+            .writable_context(dir_ino)
+            .ok_or(WriteError::NotPermitted)?;
 
         let ino = {
             let tree = self.tree.read();
@@ -674,7 +696,9 @@ impl WriteStore {
             return Err(WriteError::CrossDir);
         }
         let _sync = self.sync.lock();
-        let ctx = self.writable_context(src_dir).ok_or(WriteError::NotPermitted)?;
+        let ctx = self
+            .writable_context(src_dir)
+            .ok_or(WriteError::NotPermitted)?;
         let dir = FLAT_DIR.to_string();
 
         let src_overlay = {
@@ -1064,7 +1088,14 @@ impl WriteStore {
                 .link_tree_document(&ws, &dst_tree_id, &dst_tree_type, &dst_path, &[src_doc])
                 .map_err(|e| WriteError::Io(format!("{e:#}")))?;
             if dst_name != src_name {
-                self.ws_set_filename(&ws, &dst_tree_id, &dst_tree_type, &dst_path, src_doc, dst_name)?;
+                self.ws_set_filename(
+                    &ws,
+                    &dst_tree_id,
+                    &dst_tree_type,
+                    &dst_path,
+                    src_doc,
+                    dst_name,
+                )?;
             }
             // The source unlink never trashes: the document is already filed at
             // the destination, so it is not orphaned.
@@ -1072,9 +1103,13 @@ impl WriteStore {
                 .remove_tree_document(&ws, &tree_id, &tree_type, &path, &[src_doc], false)
                 .map_err(|e| WriteError::Io(format!("{e:#}")))?;
 
-            self.tree
-                .write()
-                .move_tree_file(src_ino, dst_dir, dst_name, &tree_name, &dst_tree_name);
+            self.tree.write().move_tree_file(
+                src_ino,
+                dst_dir,
+                dst_name,
+                &tree_name,
+                &dst_tree_name,
+            );
             return Ok(());
         }
         let dst_ino = self.tree.read().lookup(dst_dir, dst_name).map(|n| n.ino);
@@ -1207,7 +1242,11 @@ impl WriteStore {
             // Exact id match, not a suffix test: with hierarchical ids a suffix
             // match would silently misroute any id that merely ends in the same
             // segment.
-            let dir = if schema == "data/schema/task" { "Todos" } else { "Notes" };
+            let dir = if schema == "data/schema/task" {
+                "Todos"
+            } else {
+                "Notes"
+            };
             apply_buffer_to_data(dir, &mut data, buffer);
             self.api
                 .update_workspace_documents(

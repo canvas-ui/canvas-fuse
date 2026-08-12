@@ -35,11 +35,7 @@ fn note(id: u64, title: &str, content: &str) -> Document {
 }
 
 fn tab(id: u64, title: &str, url: &str) -> Document {
-    doc(
-        id,
-        "data/schema/tab",
-        json!({ "title": title, "url": url }),
-    )
+    doc(id, "data/schema/tab", json!({ "title": title, "url": url }))
 }
 
 fn file(id: u64, location: &str, size: Option<u64>, checksum: &str) -> Document {
@@ -78,7 +74,9 @@ fn docs_ino(tree: &Tree, ctx_id: &str) -> u64 {
 
 /// The derived, read-only grouping.
 fn by_schema_ino(tree: &Tree, ctx_id: &str, dir: &str) -> Option<u64> {
-    let by = tree.lookup(tree.context_ino(ctx_id).unwrap(), ".by-schema")?.ino;
+    let by = tree
+        .lookup(tree.context_ino(ctx_id).unwrap(), ".by-schema")?
+        .ino;
     tree.lookup(by, dir).map(|n| n.ino)
 }
 
@@ -105,8 +103,13 @@ fn context_folder_is_flat() {
     let entries = names_in(&tree, tree.context_ino("work").unwrap());
     assert!(entries.contains(&".context.json".to_string()));
     assert!(entries.contains(&".by-schema".to_string()));
-    for gone in ["Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other"] {
-        assert!(!entries.contains(&gone.to_string()), "{gone} should not be a folder");
+    for gone in [
+        "Tabs", "Notes", "Todos", "Files", "Emails", "Links", "Other",
+    ] {
+        assert!(
+            !entries.contains(&gone.to_string()),
+            "{gone} should not be a folder"
+        );
     }
 }
 
@@ -118,17 +121,26 @@ fn by_schema_groups_the_same_documents() {
     tree.apply_contexts(&[ctx("work", "/work")]);
     tree.apply_documents(
         "work",
-        &[note(1, "Idea", "body"), tab(2, "Rust", "https://rust-lang.org")],
+        &[
+            note(1, "Idea", "body"),
+            tab(2, "Rust", "https://rust-lang.org"),
+        ],
         &names,
     );
 
     assert_eq!(doc_names(&tree, "work"), vec!["Idea.md", "Rust.url"]);
     assert_eq!(
-        names_in(&tree, by_schema_ino(&tree, "work", "Notes").expect("Notes group")),
+        names_in(
+            &tree,
+            by_schema_ino(&tree, "work", "Notes").expect("Notes group")
+        ),
         vec!["Idea.md"]
     );
     assert_eq!(
-        names_in(&tree, by_schema_ino(&tree, "work", "Tabs").expect("Tabs group")),
+        names_in(
+            &tree,
+            by_schema_ino(&tree, "work", "Tabs").expect("Tabs group")
+        ),
         vec!["Rust.url"]
     );
     // Empty groups are not materialized — there is nothing to look at.
@@ -180,7 +192,10 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
         &names,
     );
 
-    assert_eq!(doc_names(&tree, "work"), vec!["Docs.url", "Other-ticket.url"]);
+    assert_eq!(
+        doc_names(&tree, "work"),
+        vec!["Docs.url", "Other-ticket.url"]
+    );
     // surviving doc keeps its inode → open handles stay valid
     assert_eq!(
         tree.lookup(tabs_ino, "Docs.url").unwrap().ino,

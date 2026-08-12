@@ -168,15 +168,15 @@ fn main() -> Result<()> {
             };
             let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
             cmd_mount(
-            mountpoint,
-            connect,
-            contexts,
-            workspace,
-            detach,
-            no_ws,
-            resync,
-            data_dir,
-            blob_cache_mb,
+                mountpoint,
+                connect,
+                contexts,
+                workspace,
+                detach,
+                no_ws,
+                resync,
+                data_dir,
+                blob_cache_mb,
             )
         }
         Command::Unmount { mountpoint } => cmd_unmount(mountpoint),
@@ -241,7 +241,10 @@ fn resolve_root(
         match entry.trim_matches('/').split_once('/') {
             Some((entry_ws, id)) => {
                 if ws.as_deref().is_some_and(|w| w != entry_ws) {
-                    anyhow::bail!("one mount is one workspace: got both `{}` and `{entry_ws}`", ws.unwrap());
+                    anyhow::bail!(
+                        "one mount is one workspace: got both `{}` and `{entry_ws}`",
+                        ws.unwrap()
+                    );
                 }
                 ws = Some(entry_ws.to_string());
                 ids.push(id.to_string());
@@ -252,6 +255,8 @@ fn resolve_root(
     Ok((ws, ids))
 }
 
+// Flat CLI plumbing: one parameter per mount flag, folded into MountOptions below.
+#[allow(clippy::too_many_arguments)]
 fn cmd_mount(
     mountpoint: PathBuf,
     connect: ConnectArgs,
@@ -589,7 +594,10 @@ mod root_selector_tests {
 
     #[test]
     fn a_bare_name_mounts_that_workspace() {
-        assert_eq!(resolved(Some("myws"), None, &[]), (Some("myws".into()), vec![]));
+        assert_eq!(
+            resolved(Some("myws"), None, &[]),
+            (Some("myws".into()), vec![])
+        );
         assert_eq!(
             resolved(Some("myws/Contexts"), None, &[]),
             (Some("myws".into()), vec![])
@@ -611,7 +619,10 @@ mod root_selector_tests {
 
     #[test]
     fn the_flag_forms_agree_with_the_selector() {
-        assert_eq!(resolved(None, Some("myws"), &[]), (Some("myws".into()), vec![]));
+        assert_eq!(
+            resolved(None, Some("myws"), &[]),
+            (Some("myws".into()), vec![])
+        );
         // -c takes the workspace-qualified form...
         assert_eq!(
             resolved(None, None, &["myws/foo"]),

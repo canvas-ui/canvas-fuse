@@ -411,7 +411,10 @@ impl Filesystem for CanvasFs {
             // Home is a passthrough: read the window straight from the drive.
             // No blob cache — these bytes are not content-addressed and can
             // change under us at any moment.
-            NodeContent::HomeFile { path, size: file_size } => {
+            NodeContent::HomeFile {
+                path,
+                size: file_size,
+            } => {
                 if offset as u64 >= file_size {
                     reply.data(&[]);
                     return;

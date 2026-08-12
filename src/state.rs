@@ -37,9 +37,15 @@ pub enum NodeContent {
     /// A folder of the home drive. `loaded` flips once its listing has been
     /// fetched: home is a real filesystem and can be huge, so directories are
     /// materialized on first look rather than walked at mount.
-    HomeDir { path: String, loaded: bool },
+    HomeDir {
+        path: String,
+        loaded: bool,
+    },
     /// A real file on the home drive, read by byte window on demand.
-    HomeFile { path: String, size: u64 },
+    HomeFile {
+        path: String,
+        size: u64,
+    },
     Remote {
         workspace_id: String,
         doc_id: u64,
@@ -60,10 +66,7 @@ pub struct Node {
 
 impl Node {
     pub fn is_dir(&self) -> bool {
-        matches!(
-            self.content,
-            NodeContent::Dir | NodeContent::HomeDir { .. }
-        )
+        matches!(self.content, NodeContent::Dir | NodeContent::HomeDir { .. })
     }
 
     pub fn size(&self) -> u64 {
@@ -592,10 +595,11 @@ impl Tree {
                 }
             };
             taken.insert(name.clone());
-            grouped
-                .entry(rendered.dir)
-                .or_default()
-                .push((name.clone(), content.clone(), doc.updated_at));
+            grouped.entry(rendered.dir).or_default().push((
+                name.clone(),
+                content.clone(),
+                doc.updated_at,
+            ));
             desired.insert(name, (doc.id, content, doc.updated_at));
         }
 
@@ -633,7 +637,9 @@ impl Tree {
         let mut dirty = false;
         for (name, ino) in have {
             match desired.get(&name) {
-                Some((doc_id, content, mtime)) if self.doc_for_ino(ino).map(|(_, d)| d) == Some(*doc_id) => {
+                Some((doc_id, content, mtime))
+                    if self.doc_for_ino(ino).map(|(_, d)| d) == Some(*doc_id) =>
+                {
                     let node = self.nodes.get_mut(&ino).unwrap();
                     if node.content != *content {
                         node.content = content.clone();
@@ -989,9 +995,15 @@ impl Tree {
         for entry in entries {
             let child_path = join_home_path(&dir_path, &entry.name);
             let content = if entry.is_dir {
-                NodeContent::HomeDir { path: child_path, loaded: false }
+                NodeContent::HomeDir {
+                    path: child_path,
+                    loaded: false,
+                }
             } else {
-                NodeContent::HomeFile { path: child_path, size: entry.size }
+                NodeContent::HomeFile {
+                    path: child_path,
+                    size: entry.size,
+                }
             };
             match self.lookup(dir_ino, &entry.name).map(|n| n.ino) {
                 Some(ino) => {
@@ -1000,7 +1012,10 @@ impl Tree {
                         // being confirmed here.
                         let keep_loaded = matches!(
                             (&node.content, &content),
-                            (NodeContent::HomeDir { loaded: true, .. }, NodeContent::HomeDir { .. })
+                            (
+                                NodeContent::HomeDir { loaded: true, .. },
+                                NodeContent::HomeDir { .. }
+                            )
                         );
                         if !keep_loaded && node.content != content {
                             node.content = content;
@@ -1359,7 +1374,13 @@ impl Tree {
     }
 
     /// Move a FOLDER node into another directory (cross-parent folder move).
-    pub fn move_tree_path_node(&mut self, ino: u64, new_parent: u64, new_name: &str, tree_name: &str) {
+    pub fn move_tree_path_node(
+        &mut self,
+        ino: u64,
+        new_parent: u64,
+        new_name: &str,
+        tree_name: &str,
+    ) {
         self.move_entry(ino, new_parent, new_name);
         self.reindex_tree_paths(tree_name);
     }

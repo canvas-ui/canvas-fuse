@@ -389,7 +389,11 @@ impl ApiClient {
     /// Store bytes in the workspace blob store and get back the location a File
     /// document references. The byte half of writing a plain file.
     pub fn upload_blob(&self, ws: &str, bytes: Vec<u8>) -> Result<BlobRef> {
-        let url = format!("{}/rest/v2/workspaces/{}/blobs", self.base, encode_segment(ws));
+        let url = format!(
+            "{}/rest/v2/workspaces/{}/blobs",
+            self.base,
+            encode_segment(ws)
+        );
         let resp = self
             .http
             .post(&url)
@@ -415,9 +419,15 @@ impl ApiClient {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("blob upload returned no url"))?
                 .to_string(),
-            checksum: payload.get("checksum").and_then(Value::as_str).map(str::to_string),
+            checksum: payload
+                .get("checksum")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             size: payload.get("size").and_then(Value::as_u64).unwrap_or(0),
-            mime_type: payload.get("mimeType").and_then(Value::as_str).map(str::to_string),
+            mime_type: payload
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
@@ -444,7 +454,10 @@ impl ApiClient {
                 Some(HomeEntry {
                     name: e.get("name").and_then(Value::as_str)?.to_string(),
                     size: e.get("size").and_then(Value::as_u64).unwrap_or(0),
-                    is_dir: e.get("isDirectory").and_then(Value::as_bool).unwrap_or(false),
+                    is_dir: e
+                        .get("isDirectory")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     mtime: e.get("mtime").and_then(Value::as_str).map(str::to_string),
                 })
             })
@@ -704,7 +717,11 @@ impl ApiClient {
         ids: &[u64],
         trash_if_orphaned: bool,
     ) -> Result<()> {
-        let trash = if trash_if_orphaned { "&trashIfOrphaned=true" } else { "" };
+        let trash = if trash_if_orphaned {
+            "&trashIfOrphaned=true"
+        } else {
+            ""
+        };
         self.send_json(
             reqwest::Method::DELETE,
             &format!(
@@ -848,7 +865,12 @@ fn resolve_display_name(doc: &Value) -> Option<String> {
     }
 
     let mut sorted: Vec<&Value> = locations.iter().collect();
-    sorted.sort_by_key(|loc| loc.get("url").and_then(Value::as_str).unwrap_or("").to_string());
+    sorted.sort_by_key(|loc| {
+        loc.get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
     sorted.iter().find_map(|loc| named(loc))
 }
 

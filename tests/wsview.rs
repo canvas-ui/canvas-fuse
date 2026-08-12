@@ -90,7 +90,10 @@ fn paths_materialize_nested_dirs_and_prune() {
 
     // Drop /baz and /foo/bar — they disappear, /foo stays.
     tree.apply_tree_paths("directory", &["/".to_string(), "/foo".to_string()]);
-    assert_eq!(names_in(&tree, ino_at(&tree, &["Trees", "directory"])), vec!["foo"]);
+    assert_eq!(
+        names_in(&tree, ino_at(&tree, &["Trees", "directory"])),
+        vec!["foo"]
+    );
     assert!(names_in(&tree, ino_at(&tree, &["Trees", "directory", "foo"])).is_empty());
 }
 
@@ -272,7 +275,10 @@ fn home_directories_load_lazily() {
     // The root is loaded now; the subfolder is not, and knows its own path.
     assert_eq!(tree.home_path(HOME_INO), Some(("/".to_string(), true)));
     let projects = ino_at(&tree, &["Home", "projects"]);
-    assert_eq!(tree.home_path(projects), Some(("/projects".to_string(), false)));
+    assert_eq!(
+        tree.home_path(projects),
+        Some(("/projects".to_string(), false))
+    );
 
     // Files carry the path a range read addresses, and their size.
     let file = ino_at(&tree, &["Home", "notes.txt"]);
@@ -288,5 +294,8 @@ fn home_directories_load_lazily() {
     tree.apply_home_entries(HOME_INO, &[entry("projects", true, 0)]);
     assert_eq!(names_in(&tree, HOME_INO), vec!["projects"]);
     // ...and the subfolder that survived keeps what it had loaded.
-    assert_eq!(names_in(&tree, ino_at(&tree, &["Home", "projects"])), vec!["alpha.md"]);
+    assert_eq!(
+        names_in(&tree, ino_at(&tree, &["Home", "projects"])),
+        vec!["alpha.md"]
+    );
 }
