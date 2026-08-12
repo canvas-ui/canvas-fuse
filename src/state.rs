@@ -291,6 +291,24 @@ impl Tree {
         self.nodes.get(ino)
     }
 
+    /// Path of an ino relative to the mount root (empty path for the root
+    /// itself). Walks `parent` links; None for unknown inos or on a cycle
+    /// that isn't the root's self-parent.
+    pub fn path_of(&self, ino: u64) -> Option<std::path::PathBuf> {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut cur = ino;
+        for _ in 0..256 {
+            if cur == ROOT_INO {
+                parts.reverse();
+                return Some(parts.iter().collect());
+            }
+            let node = self.nodes.get(&cur)?;
+            parts.push(&node.name);
+            cur = node.parent;
+        }
+        None
+    }
+
     pub fn list(&self, ino: u64) -> Option<Vec<&Node>> {
         let children = self.children.get(&ino)?;
         Some(

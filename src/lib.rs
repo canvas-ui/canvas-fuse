@@ -4,6 +4,7 @@ pub mod config;
 pub mod events;
 pub mod fsimpl;
 pub mod names;
+pub mod nudge;
 pub mod render;
 pub mod runtime;
 pub mod state;
@@ -39,6 +40,9 @@ pub struct MountOptions {
     pub context_workspace: Option<String>,
     /// In-memory blob cache budget for file content, in bytes
     pub blob_cache_bytes: usize,
+    /// Emit inotify nudges (create+unlink of the virtual `.canvas-tmp`) so
+    /// directory watchers see remote-driven view changes. See nudge.rs.
+    pub enable_nudge: bool,
 }
 
 /// A live mount. Dropping it (or calling unmount) tears everything down:
@@ -137,6 +141,9 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         context_filter: context_filter.clone(),
         context_workspace_id: context_workspace_id.clone(),
         refresh_lock: None,
+        // No nudging before the mount exists (the syscalls would hit the
+        // underlying directory).
+        nudger: None,
     };
     bootstrap.refresh_all();
 
@@ -160,6 +167,14 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
 
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
     let stop = Arc::new(AtomicBool::new(false));
+
+    // inotify nudge thread: the mount is up, so syscalls on it now reach the
+    // session loop. Sender lives in the worker; worker exit closes the channel.
+    let nudger = if opts.enable_nudge {
+        Some(nudge::Nudger::spawn(opts.mountpoint.clone(), stop.clone())?)
+    } else {
+        None
+    };
 
     // Subscriber is created up front and shared: the worker (re)subscribes a
     // context through it after each successful refresh, and the ws supervisor
@@ -185,6 +200,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         context_filter,
         context_workspace_id,
         refresh_lock: Some(write_store.sync_handle()),
+        nudger,
     };
     std::thread::Builder::new()
         .name("canvas-fuse-worker".into())

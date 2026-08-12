@@ -93,8 +93,20 @@ The rules live server-side, so this mount and WebDAV agree by construction:
 ## Install
 
 Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
-`v*`). Linux: `x86_64`/`aarch64` glibc, plus a fully static `x86_64` musl build
-that runs on any distro (only the `fusermount3` helper is needed at mount time).
+`v*`) — grab the [latest](../../releases/latest):
+
+| Target | Notes |
+| --- | --- |
+| [`x86_64-unknown-linux-musl`](../../releases/latest/download/canvas-fuse-x86_64-unknown-linux-musl.tar.gz) | fully static — download-and-run on any distro |
+| [`x86_64-unknown-linux-gnu`](../../releases/latest/download/canvas-fuse-x86_64-unknown-linux-gnu.tar.gz) | dynamic glibc |
+| [`aarch64-unknown-linux-gnu`](../../releases/latest/download/canvas-fuse-aarch64-unknown-linux-gnu.tar.gz) | dynamic glibc, arm64 |
+
+```sh
+curl -L https://github.com/canvas-ui/canvas-fuse/releases/latest/download/canvas-fuse-x86_64-unknown-linux-musl.tar.gz \
+  | tar xz --strip-components=1 -C ~/.local/bin canvas-fuse-x86_64-unknown-linux-musl/canvas-fuse
+```
+
+Only the `fusermount3` helper is needed at mount time (`fuse3` package).
 Linux only - `fuser`'s pure-Rust backend (no libfuse) is not supported on macOS
 or Windows. Build from source with `cargo build --release` (no `libfuse` dev
 package needed).
@@ -124,6 +136,7 @@ canvas-fuse contexts [--json]                               # list accessible co
 | `--root <selector>` | - | The selector as a flag, for when it comes from config or a script. |
 | `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only mode). |
+| `--no-nudge` | false | Disable the inotify nudge for directory watchers (see below). Also `CANVAS_FUSE_NO_NUDGE`. |
 | `--resync <secs>` | 30 | Full resync interval in seconds. |
 | `--data-dir <path>` | `~/.canvas/<remote>/fuse/…` | Override the per-mount state directory (sticky filename map). Also `CANVAS_FUSE_DATA_DIR`. |
 | `--blob-cache-mb <n>` | 256 | In-memory cache budget for file content. |
@@ -183,11 +196,18 @@ binary is self-contained.
   invalidates the dentry and emits `IN_DELETE_SELF` to watchers of the *file*,
   but no `IN_DELETE` reaches watchers of the *parent directory* (the fsnotify
   hook for FUSE reverse invalidation was lost in the ~5.3 refactor). Practical
-  effect: `ls`/`cat`/agents always see fresh data with no manual refresh;
-  editors watching files notice removals; file managers showing a directory
-  listing may need a nudge - a desktop app can deliver one from the same ws
-  events. Entries *entering* a view are never push-notified (no FUSE create
-  notification exists); they appear on the next readdir.
+  effect: `ls`/`cat`/agents always see fresh data with no manual refresh, but
+  inotify-based directory watchers (Obsidian, file managers) would see nothing.
+  The daemon therefore delivers the missing events itself: after applying a
+  remote-driven change it creates and unlinks a virtual `.canvas-tmp` marker
+  in each affected directory with real syscalls (`--no-nudge` disables). The
+  kernel emits `IN_CREATE`/`IN_DELETE` to the directory's watchers, and
+  rescanning watchers (chokidar/Obsidian, Dolphin) pick up the whole delta.
+  `.canvas-tmp` is a reserved name: virtual in every directory, invisible to
+  `readdir`, never a server document — and a sensible pattern for indexers on
+  the client or server to auto-exclude, like other dotfiles. Entries
+  *entering* a view are never push-notified by FUSE itself; between nudges
+  they appear on the next readdir.
 - **Daemon lifecycle.** `mount -d` daemonizes after pre-flight (so config and
   connectivity errors still reach the terminal), writes a state file under
   `~/.local/state/canvas-fuse/mounts/`, and exits hard on SIGTERM after

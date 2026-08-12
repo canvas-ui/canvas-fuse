@@ -299,3 +299,23 @@ fn home_directories_load_lazily() {
         vec!["alpha.md"]
     );
 }
+
+#[test]
+fn path_of_resolves_mount_relative_paths() {
+    let mut tree = Tree::workspace_rooted("ws-1".to_string(), "myws".to_string());
+    tree.apply_trees(&[ti("t-dir", "directory", "directory")]);
+    tree.apply_tree_paths(
+        "directory",
+        &["/".to_string(), "/foo".to_string(), "/foo/bar".to_string()],
+    );
+
+    // Root is the empty relative path; nested dirs walk parent links back up.
+    assert_eq!(tree.path_of(ROOT_INO), Some(std::path::PathBuf::from("")));
+    let bar = ino_at(&tree, &["Trees", "directory", "foo", "bar"]);
+    assert_eq!(
+        tree.path_of(bar),
+        Some(std::path::PathBuf::from("Trees/directory/foo/bar"))
+    );
+    // Unknown inos resolve to nothing (the nudge queue then drops them).
+    assert_eq!(tree.path_of(999_999), None);
+}

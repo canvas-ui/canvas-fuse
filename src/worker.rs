@@ -36,6 +36,10 @@ pub struct Worker {
     /// Held across fetch+apply so refreshes serialize with write-path tree
     /// mutations (WriteStore::sync_handle).
     pub refresh_lock: Option<Arc<parking_lot::Mutex<()>>>,
+    /// Emits inotify events for directory watchers after a remote-driven view
+    /// change (see nudge.rs). None on the pre-mount bootstrap worker and under
+    /// --no-nudge.
+    pub nudger: Option<crate::nudge::Nudger>,
 }
 
 impl Worker {
@@ -223,5 +227,28 @@ impl Worker {
             inv.changed.len(),
             inv.dirty_dirs.len()
         );
+
+        // Reverse invalidation generates no fsnotify events, so directory
+        // watchers (Obsidian, file managers) still see nothing — queue an
+        // inotify nudge for every affected directory. Queueing never blocks;
+        // the syscalls happen on the nudge thread (this thread may hold
+        // refresh_lock here, which the session loop can be waiting on).
+        if let Some(nudger) = &self.nudger {
+            let mut dirs: HashSet<u64> = inv.dirty_dirs.iter().copied().collect();
+            dirs.extend(inv.removed.iter().map(|(parent, _, _)| *parent));
+            let tree = self.tree.read();
+            // A changed file's watchers get IN_MODIFY-ish signal via its
+            // parent: rescanning watchers re-stat and pick up the new content.
+            for ino in &inv.changed {
+                if let Some(node) = tree.get(*ino) {
+                    dirs.insert(node.parent);
+                }
+            }
+            for ino in dirs {
+                if let Some(rel) = tree.path_of(ino) {
+                    nudger.nudge(rel);
+                }
+            }
+        }
     }
 }

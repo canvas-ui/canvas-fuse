@@ -93,6 +93,11 @@ enum Command {
         #[arg(long)]
         no_ws: bool,
 
+        /// Disable the inotify nudge (create+unlink of a virtual `.canvas-tmp`
+        /// in changed directories, so file managers/Obsidian see live updates)
+        #[arg(long, env = "CANVAS_FUSE_NO_NUDGE")]
+        no_nudge: bool,
+
         /// Full resync interval in seconds
         #[arg(long, default_value_t = 30)]
         resync: u64,
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
             workspace,
             detach,
             no_ws,
+            no_nudge,
             resync,
             data_dir,
             blob_cache_mb,
@@ -174,6 +180,7 @@ fn main() -> Result<()> {
                 workspace,
                 detach,
                 no_ws,
+                no_nudge,
                 resync,
                 data_dir,
                 blob_cache_mb,
@@ -264,6 +271,7 @@ fn cmd_mount(
     workspace: Option<String>,
     detach: bool,
     no_ws: bool,
+    no_nudge: bool,
     resync: u64,
     data_dir: Option<PathBuf>,
     blob_cache_mb: usize,
@@ -358,6 +366,7 @@ fn cmd_mount(
         mountpoint: mountpoint.clone(),
         data_dir,
         enable_ws: !no_ws,
+        enable_nudge: !no_nudge,
         resync_secs: resync,
         contexts: if contexts.is_empty() {
             None

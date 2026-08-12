@@ -1,5 +1,6 @@
 use crate::api::ApiClient;
 use crate::blobs::{reply_slice, BlobStore};
+use crate::nudge::{NUDGE_FILE, NUDGE_INO};
 use crate::state::{NodeContent, Tree};
 use crate::writes::WriteStore;
 use fuser::{
@@ -92,6 +93,14 @@ impl CanvasFs {
         self.file_attr(node.ino, size, node.mtime, node.is_dir())
     }
 
+    /// Attr of the virtual `.canvas-tmp` nudge marker (see nudge.rs). Every op
+    /// on the name/ino short-circuits BEFORE the tree and the write path: the
+    /// marker must never take a lock (the nudge thread's syscalls may race a
+    /// worker holding them) and never become a server document.
+    fn nudge_attr(&self) -> FileAttr {
+        self.file_attr(NUDGE_INO, 0, SystemTime::now(), false)
+    }
+
     /// Attr for an ino that may be a tree node or a pending overlay file.
     fn attr_for_ino(&self, ino: u64) -> Option<FileAttr> {
         if let Some(node) = self.tree.read().get(ino) {
@@ -138,6 +147,13 @@ impl Filesystem for CanvasFs {
             reply.error(libc::ENOENT);
             return;
         };
+        // The nudge marker "exists" only between its create and unlink, both
+        // served from the dentry the create reply installed; a fresh lookup
+        // always misses, keeping the marker invisible.
+        if name == NUDGE_FILE {
+            reply.error(libc::ENOENT);
+            return;
+        }
         if let Some(node) = self.tree.read().lookup(parent, name) {
             reply.entry(&TTL, &self.attr(node), 0);
             return;
@@ -157,6 +173,10 @@ impl Filesystem for CanvasFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        if ino == NUDGE_INO {
+            reply.attr(&TTL, &self.nudge_attr());
+            return;
+        }
         match self.attr_for_ino(ino) {
             Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(libc::ENOENT),
@@ -181,6 +201,10 @@ impl Filesystem for CanvasFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if ino == NUDGE_INO {
+            reply.attr(&TTL, &self.nudge_attr());
+            return;
+        }
         if let Some(size) = size {
             log::debug!("fs setattr size ino={ino} size={size}");
             if let Err(e) = self.writes.truncate(ino, size) {
@@ -196,6 +220,11 @@ impl Filesystem for CanvasFs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        // fh 0 = read handle; flush/release already no-op on it
+        if ino == NUDGE_INO {
+            reply.opened(0, 0);
+            return;
+        }
         if !wants_write(flags) {
             reply.opened(0, 0);
             return;
@@ -229,6 +258,13 @@ impl Filesystem for CanvasFs {
             return;
         };
         log::debug!("fs create parent={parent} name={name}");
+        // Virtual nudge marker: succeed without touching the write path (a
+        // real create here would mint a server document). fh 0 keeps
+        // flush/release on the no-op path.
+        if name == NUDGE_FILE {
+            reply.created(&TTL, &self.nudge_attr(), 0, 0, 0);
+            return;
+        }
         match self.writes.create(parent, name) {
             Ok(entry) => {
                 let attr = self.file_attr(entry.ino, 0, entry.mtime, false);
@@ -236,6 +272,25 @@ impl Filesystem for CanvasFs {
             }
             Err(e) => reply.error(e.errno()),
         }
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // Only the virtual nudge marker; everything else keeps the historical
+        // ENOSYS (the kernel then falls back to create for regular files).
+        if name.to_str() == Some(NUDGE_FILE) {
+            reply.entry(&TTL, &self.nudge_attr(), 0);
+            return;
+        }
+        reply.error(libc::ENOSYS);
     }
 
     fn mkdir(
@@ -286,6 +341,10 @@ impl Filesystem for CanvasFs {
         reply: ReplyWrite,
     ) {
         log::debug!("fs write ino={ino} offset={offset} len={}", data.len());
+        if ino == NUDGE_INO {
+            reply.written(data.len() as u32);
+            return;
+        }
         match self.writes.write(ino, offset, data) {
             Ok(written) => reply.written(written),
             Err(e) => reply.error(e.errno()),
@@ -350,6 +409,10 @@ impl Filesystem for CanvasFs {
             reply.error(libc::ENOENT);
             return;
         };
+        if name == NUDGE_FILE {
+            reply.ok();
+            return;
+        }
         match self.writes.unlink(parent, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.errno()),
@@ -387,6 +450,10 @@ impl Filesystem for CanvasFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if ino == NUDGE_INO {
+            reply.data(&[]);
+            return;
+        }
         // Active write buffer is the freshest truth (editors read back
         // through the same or another handle mid-edit)
         if let Some(slice) = self.writes.read_buffer(ino, offset, size) {
@@ -476,6 +543,11 @@ impl Filesystem for CanvasFs {
             entries.push((dir.parent, FileType::Directory, "..".to_string()));
             if let Some(children) = tree.list(ino) {
                 for child in children {
+                    // Defensive: a server doc named like the nudge marker must
+                    // not surface (the name is reserved and unlookupable).
+                    if child.name == NUDGE_FILE {
+                        continue;
+                    }
                     let kind = if child.is_dir() {
                         FileType::Directory
                     } else {
@@ -487,7 +559,7 @@ impl Filesystem for CanvasFs {
         }
         // Pending creates appear alongside server-backed entries
         for (overlay_ino, name) in self.writes.overlay_entries(ino) {
-            if !entries.iter().any(|(_, _, n)| n == &name) {
+            if name != NUDGE_FILE && !entries.iter().any(|(_, _, n)| n == &name) {
                 entries.push((overlay_ino, FileType::RegularFile, name));
             }
         }
