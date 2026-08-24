@@ -61,6 +61,10 @@ pub struct Document {
     pub size: Option<u64>,
     /// checksumArray[0] — blob cache key (content-addressed dedupe)
     pub checksum: Option<String>,
+    /// The whole record, kept ONLY for schemas this build has no renderer for —
+    /// those are served as their own JSON, and `data` alone is not the record.
+    /// None for everything else, so the common case carries no second copy.
+    pub raw: Option<Value>,
 }
 
 pub struct ApiClient {
@@ -389,14 +393,35 @@ impl ApiClient {
     /// Store bytes in the workspace blob store and get back the location a File
     /// document references. The byte half of writing a plain file.
     pub fn upload_blob(&self, ws: &str, bytes: Vec<u8>) -> Result<BlobRef> {
-        let url = format!(
-            "{}/rest/v2/workspaces/{}/blobs",
-            self.base,
-            encode_segment(ws)
-        );
+        self.post_blob(
+            &format!(
+                "{}/rest/v2/workspaces/{}/blobs",
+                self.base,
+                encode_segment(ws)
+            ),
+            bytes,
+        )
+    }
+
+    /// The same, addressed by context. The bytes land in the context's backing
+    /// workspace either way — a context is a view, not a place things live —
+    /// but a context mount has a context id and no workspace name, and this
+    /// route answers to the context's own permissions.
+    pub fn upload_context_blob(&self, context_id: &str, bytes: Vec<u8>) -> Result<BlobRef> {
+        self.post_blob(
+            &format!(
+                "{}/rest/v2/contexts/{}/blobs",
+                self.base,
+                encode_segment(context_id)
+            ),
+            bytes,
+        )
+    }
+
+    fn post_blob(&self, url: &str, bytes: Vec<u8>) -> Result<BlobRef> {
         let resp = self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.token)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes)
@@ -895,10 +920,19 @@ fn parse_document(doc: &Value) -> Option<Document> {
                 .collect()
         })
         .unwrap_or_default();
+    // The document's own size first, then any location that measured what it
+    // holds — IMAP records the raw message size on the location, not on the
+    // document. Same order as the server's storedSize().
     let size = doc
         .get("metadata")
         .and_then(|m| m.get("size"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            doc.get("locations")
+                .and_then(Value::as_array)?
+                .iter()
+                .find_map(|loc| loc.get("metadata")?.get("size")?.as_u64())
+        });
     let checksum = doc
         .get("checksumArray")
         .and_then(Value::as_array)
@@ -906,6 +940,11 @@ fn parse_document(doc: &Value) -> Option<Document> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let display_name = resolve_display_name(doc);
+    let raw = if crate::render::has_renderer(&schema) {
+        None
+    } else {
+        Some(doc.clone())
+    };
     Some(Document {
         id,
         display_name,
@@ -915,5 +954,6 @@ fn parse_document(doc: &Value) -> Option<Document> {
         locations,
         size,
         checksum,
+        raw,
     })
 }

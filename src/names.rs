@@ -3,7 +3,16 @@ use redb::{Database, TableDefinition};
 use std::path::Path;
 
 // (contextId \x1f schemaDir \x1f docId) -> assigned filename
-const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames");
+//
+// The table name carries a generation. A sticky name outlives the renderer that
+// produced it — that is the point — so when the renderer changes what a document
+// is CALLED (an email became `<from>-<subject>.eml` instead of a `.json` blob of
+// its fields), every existing assignment would pin the old name forever and the
+// new rendering would only ever be visible on documents nobody had seen yet.
+// Bumping the generation retires those assignments in one step; collision
+// suffixes stay sticky from there on.
+const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames_v2");
+const LEGACY_FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames");
 
 /// Persistent filename assignments. Once a (context, dir, doc) triple gets a
 /// filename it keeps it across restarts, so collision suffixes stay sticky and
@@ -22,9 +31,11 @@ impl NameStore {
             std::fs::create_dir_all(parent)?;
         }
         let db = Database::create(path)?;
-        // Ensure the table exists so later reads don't fail on a fresh DB
+        // Ensure the table exists so later reads don't fail on a fresh DB, and
+        // reclaim any retired generation while we hold the write transaction.
         let tx = db.begin_write()?;
         tx.open_table(FILENAMES)?;
+        let _ = tx.delete_table(LEGACY_FILENAMES);
         tx.commit()?;
         Ok(Self { db })
     }

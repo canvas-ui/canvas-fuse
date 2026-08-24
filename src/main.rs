@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 /// Mount Canvas context views as live folders.
 ///
-/// Contexts/<id>/{Tabs,Notes,Todos,Files,Emails,Links,Other}/ materialize the
-/// documents of each context's current URL. Switching a context URL (from any
-/// client) updates the folder contents in place.
+/// Contexts/<id>/ materializes the documents of each context's current URL as
+/// files — flat, the way the WebDAV mount shows the same view. Switching a
+/// context URL (from any client) updates the folder contents in place.
 #[derive(Parser, Debug)]
 #[command(name = "canvas-fuse", version, propagate_version = true)]
 struct Cli {

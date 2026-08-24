@@ -21,6 +21,7 @@ fn note(id: u64, title: &str, content: &str) -> Document {
         display_name: None,
         size: None,
         checksum: None,
+        raw: None,
     }
 }
 

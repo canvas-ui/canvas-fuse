@@ -7,11 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Legacy: schema dirs that accepted writes when contexts were grouped by
-/// schema. Contexts are flat now; kept only for the renderer's dir labels.
-/// (identity = doc id), so edits are plain updates — no versioning needed.
-pub const WRITABLE_DIRS: &[&str] = &["Notes", "Todos"];
-
 /// Sticky-name key for a flat context view — mirrors state::FLAT_NAME_KEY.
 const FLAT_DIR: &str = "";
 
@@ -22,11 +17,7 @@ const FIRST_OVERLAY_INO: u64 = 1 << 48;
 #[derive(Debug, Clone)]
 enum FlushTarget {
     /// Update an existing document (node lives in the tree)
-    Existing {
-        ctx: String,
-        dir: String,
-        doc_id: u64,
-    },
+    Existing { ctx: String, doc_id: u64 },
     /// Create a new document on first flush
     Create {
         ctx: String,
@@ -300,11 +291,7 @@ impl WriteStore {
                 .read()
                 .doc_for_ino(ino)
                 .ok_or(WriteError::NotPermitted)?; // .context.json etc. have no doc
-            FlushTarget::Existing {
-                ctx,
-                dir: FLAT_DIR.to_string(),
-                doc_id,
-            }
+            FlushTarget::Existing { ctx, doc_id }
         };
 
         let mut inner = self.inner.lock();
@@ -521,9 +508,7 @@ impl WriteStore {
                 }
                 Ok(())
             }
-            FlushTarget::Existing { ctx, dir, doc_id } => {
-                self.flush_update(ctx, dir, *doc_id, &buffer)
-            }
+            FlushTarget::Existing { ctx, doc_id } => self.flush_update(ctx, *doc_id, &buffer),
             FlushTarget::Create {
                 ctx,
                 dir,
@@ -537,7 +522,6 @@ impl WriteStore {
                         if let Some(state) = inner.states.get_mut(&ino) {
                             state.target = FlushTarget::Existing {
                                 ctx: ctx.clone(),
-                                dir: dir.clone(),
                                 doc_id,
                             };
                         }
@@ -722,7 +706,7 @@ impl WriteStore {
                     // dentry — which points at src_ino — keeps resolving until
                     // the handle closes; release() cleans it up.
                     if let Some(state) = inner.states.get_mut(&src_ino) {
-                        state.target = FlushTarget::Existing { ctx, dir, doc_id };
+                        state.target = FlushTarget::Existing { ctx, doc_id };
                         state.dirty = true;
                     }
                     if let Some(entry) = inner.overlay.get_mut(&src_ino) {
@@ -787,7 +771,7 @@ impl WriteStore {
                 };
                 // dst keeps its (stable) id, gains src's content; src is
                 // detached from this context (safe default; survives in DB).
-                self.flush_update(&ctx, &dir, dst_doc, &content)?;
+                self.flush_update(&ctx, dst_doc, &content)?;
                 self.api
                     .remove_documents(&ctx, &[src_doc])
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?;
@@ -805,7 +789,6 @@ impl WriteStore {
                 if let Some(state) = inner.states.get_mut(&src_ino) {
                     state.target = FlushTarget::Existing {
                         ctx: ctx.clone(),
-                        dir: dir.clone(),
                         doc_id: dst_doc,
                     };
                 }
@@ -1239,15 +1222,7 @@ impl WriteStore {
                 .map_err(|e| WriteError::Io(format!("{e:#}")))?;
         } else {
             let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
-            // Exact id match, not a suffix test: with hierarchical ids a suffix
-            // match would silently misroute any id that merely ends in the same
-            // segment.
-            let dir = if schema == "data/schema/task" {
-                "Todos"
-            } else {
-                "Notes"
-            };
-            apply_buffer_to_data(dir, &mut data, buffer);
+            apply_buffer_to_data(&schema, &mut data, buffer);
             self.api
                 .update_workspace_documents(
                     &ws,
@@ -1323,7 +1298,7 @@ impl WriteStore {
     // doc id across content edits (the id is the stable bitmap key), so this is
     // a plain read-merge-write: GET to keep fields the buffer doesn't carry,
     // merge the buffer into data, PUT under the same id.
-    fn flush_update(&self, ctx: &str, dir: &str, doc_id: u64, buffer: &[u8]) -> WResult<()> {
+    fn flush_update(&self, ctx: &str, doc_id: u64, buffer: &[u8]) -> WResult<()> {
         let existing = self
             .api
             .get_document(ctx, doc_id)
@@ -1334,7 +1309,7 @@ impl WriteStore {
             .unwrap_or("data/schema/note")
             .to_string();
         let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
-        apply_buffer_to_data(dir, &mut data, buffer);
+        apply_buffer_to_data(&schema, &mut data, buffer);
 
         self.api
             .update_documents(
@@ -1364,7 +1339,19 @@ impl WriteStore {
         buffer: &[u8],
         ino: u64,
     ) -> WResult<u64> {
-        let doc = build_new_document(dir, name, buffer);
+        // A canvas-native name builds its abstraction; anything else is a file,
+        // so its bytes go to the blob store first. Same rule as a tree write and
+        // as the server's inferDocFromFile — the gesture has to mean one thing.
+        let doc = match build_ws_document(name, buffer) {
+            Some(doc) => doc,
+            None => {
+                let blob = self
+                    .api
+                    .upload_context_blob(ctx, buffer.to_vec())
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                build_file_document(name, &blob)
+            }
+        };
         let ids = self
             .api
             .create_documents(ctx, vec![doc])
@@ -1391,21 +1378,28 @@ impl WriteStore {
     }
 }
 
-/// Map an edited buffer back onto the document's data per schema dir.
-fn apply_buffer_to_data(dir: &str, data: &mut Value, buffer: &[u8]) {
+/// Apply an edited buffer to a document's data, in the document's OWN schema.
+///
+/// Editing through a mount must never change what a document IS: a note that
+/// already exists stays a note when you save over it, and a `.todo.json` is
+/// read back as the JSON it was rendered as. Mirrors `applyBodyToDoc()` in the
+/// server's transports/webdav/vfs-shared.js — the two wires must not disagree
+/// about what a save means.
+fn apply_buffer_to_data(schema: &str, data: &mut Value, buffer: &[u8]) {
     let text = String::from_utf8_lossy(buffer);
-    match dir {
-        "Todos" => {
-            let (title, done, description) = parse_todo_markdown(&text);
-            data["title"] = json!(title);
-            data["completed"] = json!(done);
-            match description {
-                Some(d) => data["description"] = json!(d),
-                None => {
-                    if let Some(obj) = data.as_object_mut() {
-                        obj.remove("description");
-                    }
+    match schema {
+        "data/schema/task" => {
+            // The rendered body IS the document's data as JSON; merge it back
+            // key by key so fields the editor never saw survive the save.
+            if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(&text) {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.extend(parsed);
                 }
+            }
+        }
+        "data/schema/tab" | "data/schema/link" => {
+            if let Some(url) = extract_url(&text) {
+                data["url"] = json!(url);
             }
         }
         _ => {
@@ -1416,32 +1410,6 @@ fn apply_buffer_to_data(dir: &str, data: &mut Value, buffer: &[u8]) {
             if let Some(heading) = first_markdown_h1(&text) {
                 data["title"] = json!(heading);
             }
-        }
-    }
-}
-
-fn build_new_document(dir: &str, name: &str, buffer: &[u8]) -> Value {
-    let text = String::from_utf8_lossy(buffer);
-    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    match dir {
-        "Todos" => {
-            let (mut title, done, description) = parse_todo_markdown(&text);
-            if title.is_empty() {
-                title = stem.to_string();
-            }
-            let mut data = json!({ "title": title, "completed": done });
-            if let Some(d) = description {
-                data["description"] = json!(d);
-            }
-            json!({ "schema": "data/schema/task", "data": data })
-        }
-        _ => {
-            // A markdown H1 wins; else fall back to the filename stem.
-            let title = first_markdown_h1(&text).unwrap_or_else(|| stem.to_string());
-            json!({
-                "schema": "data/schema/note",
-                "data": { "title": title, "content": text }
-            })
         }
     }
 }
@@ -1510,14 +1478,16 @@ fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(buffer);
     match schema {
         "data/schema/task" => {
+            // `.todo.json` only ever comes from our own renderer, and what it
+            // renders is the document's data as JSON — so that is how it reads
+            // back. A body that is not an object contributes nothing but the
+            // title, rather than being guessed at.
             let stem = name.strip_suffix(".todo.json").unwrap_or(name);
-            let (mut title, done, description) = parse_todo_markdown(&text);
-            if title.is_empty() {
-                title = stem.to_string();
-            }
-            let mut data = json!({ "title": title, "completed": done, "filename": name });
-            if let Some(d) = description {
-                data["description"] = json!(d);
+            let mut data = json!({ "title": stem, "completed": false, "filename": name });
+            if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(&text) {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.extend(parsed);
+                }
             }
             Some(json!({ "schema": schema, "data": data }))
         }
@@ -1580,37 +1550,9 @@ fn first_markdown_h1(content: &str) -> Option<String> {
     None
 }
 
-/// Inverse of render_todo: `- [x] title` + optional description body.
-pub fn parse_todo_markdown(text: &str) -> (String, bool, Option<String>) {
-    let mut lines = text.lines();
-    let mut title = String::new();
-    let mut done = false;
-    for line in lines.by_ref() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("- [") {
-            if let Some((mark, t)) = rest.split_once(']') {
-                done = mark.trim().eq_ignore_ascii_case("x");
-                title = t.trim().to_string();
-                break;
-            }
-        }
-        title = trimmed.to_string();
-        break;
-    }
-    let description: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-    (
-        title,
-        done,
-        (!description.is_empty()).then_some(description),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{first_markdown_h1, parse_todo_markdown};
+    use super::{build_ws_document, first_markdown_h1};
 
     #[test]
     fn h1_title_derivation() {
@@ -1634,20 +1576,25 @@ mod tests {
     }
 
     #[test]
-    fn todo_roundtrip() {
-        let (t, d, desc) = parse_todo_markdown("- [x] Ship MVP\n\nBefore end of month\n");
-        assert_eq!(t, "Ship MVP");
-        assert!(d);
-        assert_eq!(desc.as_deref(), Some("Before end of month"));
+    fn canvas_native_names_build_their_abstraction() {
+        let tab = build_ws_document(
+            "reddit.url",
+            b"[InternetShortcut]\nURL=https://reddit.com\n",
+        )
+        .expect("a .url is a tab");
+        assert_eq!(tab["schema"], "data/schema/tab");
+        assert_eq!(tab["data"]["url"], "https://reddit.com");
+        assert_eq!(tab["data"]["filename"], "reddit.url");
 
-        let (t, d, desc) = parse_todo_markdown("- [ ] Open task\n");
-        assert_eq!(t, "Open task");
-        assert!(!d);
-        assert!(desc.is_none());
+        let todo = build_ws_document("ship.todo.json", br#"{"completed": true}"#)
+            .expect("a .todo.json is a task");
+        assert_eq!(todo["schema"], "data/schema/task");
+        assert_eq!(todo["data"]["completed"], true);
+        assert_eq!(todo["data"]["title"], "ship");
 
-        // Plain text without checkbox: first line becomes the title
-        let (t, d, _) = parse_todo_markdown("just a line\n");
-        assert_eq!(t, "just a line");
-        assert!(!d);
+        // Everything else — markdown included — is a file, and the caller
+        // stores its bytes. Markdown is a general format, not a canvas one.
+        assert!(build_ws_document("thoughts.md", b"# Real Title\n\nbody\n").is_none());
+        assert!(build_ws_document("photo.jpg", b"\xff\xd8\xff").is_none());
     }
 }

@@ -35,7 +35,21 @@ itself does not link libfuse.
 A single context (`<workspace>/Contexts/<id>`, or `-c`) roots the mount at that
 view. A context is **flat**: its documents are its files. `.by-schema/` is a
 derived, read-only grouping — dropping a file into a schema folder does not
-change what it is.
+change what it is. Its folders are derived from the schema ids themselves, so a
+schema this build has never heard of still gets its own folder rather than
+falling into a catch-all.
+
+Every document is rendered as the thing it already is, byte for byte the same as
+the WebDAV mount serves it:
+
+| Schema | File |
+| --- | --- |
+| `file` | the bytes themselves, under their own name — lazily fetched |
+| `note` | `<title>.md`, the note's content verbatim |
+| `tab`, `link` | `<title>.url`, a `[InternetShortcut]` body |
+| `task` | `<title>.todo.json` |
+| `message/email` | `<from address>-<subject>.eml`, RFC 822 — a mailbox slot like `INBOX;UID=56909` never names a file |
+| anything else | `<schema>_<id>.json`, the record itself |
 
 ```
 <mountpoint>/<context-id>/
@@ -77,7 +91,9 @@ Rules live server-side, so this mount and WebDAV agree:
 - **Deleting from a context** only detaches it from that view.
 - **Writing a file** stores its bytes. `.todo.json` and `.url` keep their canvas
   meaning; everything else (markdown included) is a file. Saving over an
-  existing document updates it in its own schema.
+  existing document updates it in its own schema. This holds in a context too:
+  its bytes go to the backing workspace's blob store, addressed through the
+  context (`POST /contexts/:id/blobs`).
 - **Under `Home/`**: `rm` deletes the file, `mkdir`/`rmdir` are real
   directories. No trash, no detach.
 
@@ -210,9 +226,11 @@ calling `unmount()`) tears down the ws client, threads, and the kernel mount.
   tree behind a `parking_lot::RwLock`. The network is the refresh worker.
   Kernel TTLs are short (1s); correctness is explicit invalidation.
 - **Sticky filenames.** Constructed names are persisted in redb keyed by
-  `(context, schemaDir, docId)`. Collisions get a docId suffix (`Meeting.2.md`)
-  and never silently swap back, so Obsidian links stay valid. Per-device for
-  now.
+  `(context, docId)`. Collisions get a docId suffix (`Meeting_2.md`) and never
+  silently swap back, so Obsidian links stay valid. Per-device for now. The
+  table name carries a generation: when the renderer changes what a document is
+  CALLED, bumping it retires the old assignments in one step instead of pinning
+  every existing document to its old name forever.
 - **Inode stability.** A document keeps its inode across URL switches inside a
   context, so open handles survive a view swap. Documents that leave the view
   follow unlink semantics.

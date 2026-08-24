@@ -12,6 +12,22 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// What `.by-schema/` would contain, as one comparable value: every folder and
+/// the names in it. A content edit does not move a document between folders, so
+/// it does not belong in the signature — and re-materializing the grouping on
+/// every keystroke would churn inodes nothing else needs churned.
+fn group_signature(grouped: &BTreeMap<String, Vec<(String, NodeContent, SystemTime)>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (dir, entries) in grouped {
+        dir.hash(&mut hasher);
+        for (name, _, _) in entries {
+            name.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 pub const ROOT_INO: u64 = 1;
 pub const CONTEXTS_INO: u64 = 2;
 /// Workspace mounts group the trees under `Trees/` and expose the workspace
@@ -141,6 +157,9 @@ pub struct Tree {
     /// switches so open file handles survive a view swap.
     doc_inos: HashMap<(String, u64), u64>,
     ctx_inos: HashMap<String, u64>,
+    /// context id -> signature of the last `.by-schema/` grouping materialized
+    /// for it (see `group_signature`).
+    by_schema_sigs: HashMap<String, u64>,
     /// context id -> workspaceId, needed to address the content route
     ctx_workspaces: HashMap<String, String>,
     /// When set, the mount is rooted at a single context: that context's schema
@@ -232,6 +251,7 @@ impl Tree {
             next_ino: FIRST_DYNAMIC_INO,
             doc_inos: HashMap::new(),
             ctx_inos: HashMap::new(),
+            by_schema_sigs: HashMap::new(),
             ctx_workspaces: HashMap::new(),
             context_root,
             ws: None,
@@ -572,8 +592,7 @@ impl Tree {
         let workspace_id = self.ctx_workspaces.get(ctx_id).cloned();
 
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
-        let mut grouped: BTreeMap<&'static str, Vec<(String, NodeContent, SystemTime)>> =
-            BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<(String, NodeContent, SystemTime)>> = BTreeMap::new();
         let mut taken: HashSet<String> = HashSet::new();
 
         for doc in sorted {
@@ -613,7 +632,7 @@ impl Tree {
                 }
             };
             taken.insert(name.clone());
-            grouped.entry(rendered.dir).or_default().push((
+            grouped.entry(rendered.dir.clone()).or_default().push((
                 name.clone(),
                 content.clone(),
                 doc.updated_at,
@@ -621,8 +640,15 @@ impl Tree {
             desired.insert(name, (doc.id, content, doc.updated_at));
         }
 
-        let changed = self.reconcile_doc_dir(ctx_ino, ctx_id, &desired, &mut inv);
-        if changed {
+        self.reconcile_doc_dir(ctx_ino, ctx_id, &desired, &mut inv);
+        // Rebuild the grouping when the GROUPING changed, not when the flat
+        // directory happened to gain or lose a node. A document created through
+        // the mount is already in the flat view by the time the server confirms
+        // it (the write path adopts it), so keying off that left it out of
+        // `.by-schema/` until some unrelated change forced a rebuild.
+        let signature = group_signature(&grouped);
+        if self.by_schema_sigs.get(ctx_id) != Some(&signature) {
+            self.by_schema_sigs.insert(ctx_id.to_string(), signature);
             self.rebuild_by_schema(ctx_ino, &grouped, &mut inv);
         }
         inv
@@ -702,7 +728,7 @@ impl Tree {
     fn rebuild_by_schema(
         &mut self,
         ctx_ino: u64,
-        grouped: &BTreeMap<&'static str, Vec<(String, NodeContent, SystemTime)>>,
+        grouped: &BTreeMap<String, Vec<(String, NodeContent, SystemTime)>>,
         inv: &mut Invalidation,
     ) {
         let Some(root) = self.lookup(ctx_ino, BY_SCHEMA_DIR).map(|n| n.ino) else {
@@ -718,7 +744,7 @@ impl Tree {
             self.insert_node(Node {
                 ino: dir_ino,
                 parent: root,
-                name: (*dir).to_string(),
+                name: dir.clone(),
                 mtime: SystemTime::now(),
                 content: NodeContent::Dir,
             });
@@ -1079,7 +1105,7 @@ impl Tree {
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut taken: HashSet<String> = HashSet::new();
         for doc in sorted {
-            let (base, content) = render::flat(doc);
+            let (base, content) = (render::doc_name(doc), render::content(doc));
             let content = match content {
                 render::Content::Inline(bytes) => NodeContent::Inline(Arc::new(bytes)),
                 render::Content::Remote { size } => NodeContent::Remote {
@@ -1164,7 +1190,7 @@ impl Tree {
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut taken: HashSet<String> = HashSet::new();
         for doc in sorted {
-            let (base, content) = render::flat(doc);
+            let (base, content) = (render::doc_name(doc), render::content(doc));
             let content = match content {
                 render::Content::Inline(bytes) => NodeContent::Inline(Arc::new(bytes)),
                 render::Content::Remote { size } => NodeContent::Remote {

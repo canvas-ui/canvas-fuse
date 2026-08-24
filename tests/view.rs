@@ -23,6 +23,7 @@ fn doc(id: u64, schema: &str, data: serde_json::Value) -> Document {
         display_name: None,
         size: None,
         checksum: None,
+        raw: None,
     }
 }
 
@@ -156,11 +157,11 @@ fn title_collisions_get_id_suffix_and_stick() {
     let docs = vec![note(1, "Meeting", "a"), note(2, "Meeting", "b")];
     tree.apply_documents("work", &docs, &names);
 
-    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.2.md", "Meeting.md"]);
+    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.md", "Meeting_2.md"]);
 
     // Doc 1 leaves; doc 2 must NOT inherit the clean name (sticky map)
     tree.apply_documents("work", &[note(2, "Meeting", "b")], &names);
-    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.2.md"]);
+    assert_eq!(doc_names(&tree, "work"), vec!["Meeting_2.md"]);
 }
 
 #[test]
@@ -194,7 +195,7 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
 
     assert_eq!(
         doc_names(&tree, "work"),
-        vec!["Docs.url", "Other-ticket.url"]
+        vec!["Docs.url", "Other ticket.url"]
     );
     // surviving doc keeps its inode → open handles stay valid
     assert_eq!(
@@ -203,7 +204,7 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
     );
     // removals are reported for inotify push
     let removed: Vec<&str> = inv.removed.iter().map(|(_, _, n)| n.as_str()).collect();
-    assert!(removed.contains(&"Jira-ticket.url"));
+    assert!(removed.contains(&"Jira ticket.url"));
     assert!(removed.contains(&"Standup.md"));
 }
 
@@ -220,8 +221,9 @@ fn content_change_reports_inode_invalidation() {
     let inv = tree.apply_documents("work", &[note(1, "Plan", "v2 updated")], &names);
     assert!(inv.changed.contains(&ino));
     let node = tree.lookup(notes_ino, "Plan.md").unwrap();
-    assert_eq!(inline_bytes(&node.content), b"v2 updated\n");
-    assert_eq!(node.size(), 11);
+    // The note IS its content — served verbatim, no trailing newline invented.
+    assert_eq!(inline_bytes(&node.content), b"v2 updated");
+    assert_eq!(node.size(), 10);
 }
 
 #[test]
@@ -342,4 +344,34 @@ fn global_mount_keeps_contexts_wrapper() {
     let mut ctxs = names_in(&tree, CONTEXTS_INO);
     ctxs.sort();
     assert_eq!(ctxs, vec!["a".to_string(), "b".to_string()]);
+}
+
+/// A document created through the mount is in the flat view before the server
+/// confirms it — the write path adopts it there. The grouping has to follow it,
+/// and keying the rebuild off "did the flat directory gain a node" meant it
+/// never did: the node was already present, so nothing looked dirty.
+#[test]
+fn by_schema_follows_a_document_the_flat_view_already_had() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("work", "/work")]);
+    tree.apply_documents("work", &[note(1, "Plan", "a")], &names);
+
+    // A local create: the file exists on the mount before the refresh sees it.
+    let docs_ino = docs_ino(&tree, "work");
+    let new_tab = tab(2, "Reddit", "https://reddit.com");
+    tree.adopt_document(
+        docs_ino,
+        "Reddit.url",
+        "work",
+        2,
+        9_999,
+        std::sync::Arc::new(b"[InternetShortcut]\nURL=https://reddit.com\n".to_vec()),
+    );
+
+    // The refresh now returns it too, and finds the flat view already correct.
+    tree.apply_documents("work", &[note(1, "Plan", "a"), new_tab], &names);
+
+    let tabs = by_schema_ino(&tree, "work", "Tabs").expect("Tabs group");
+    assert!(tree.lookup(tabs, "Reddit.url").is_some());
 }
