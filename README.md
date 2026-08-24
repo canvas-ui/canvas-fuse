@@ -245,6 +245,15 @@ calling `unmount()`) tears down the ws client, threads, and the kernel mount.
   creates and unlinks a virtual `.canvas-tmp` in each affected directory
   (`--no-nudge` disables) so Obsidian/Dolphin/chokidar rescan. `.canvas-tmp`
   is reserved: virtual, hidden from `readdir`, never a server document.
+
+  Two things decide whether a client actually notices. The directory's **mtime**
+  moves whenever its entries change, because a watcher that gets the event still
+  re-stats before re-listing and skips the work when the timestamp is unchanged
+  (KDE's lister does exactly this — it is why remote changes needed an F5). And
+  the marker's **name** is what a watcher judges the event by: the default is
+  hidden, which clients that ignore dotfiles — Obsidian excludes them from a
+  vault outright — discard along with the only notification they were going to
+  get. `--nudge-name canvas-refresh.tmp` gives it a visible one.
 - **Daemon.** `mount -d` daemonizes after pre-flight, writes state under
   `~/.local/state/canvas-fuse/mounts/`, and exits hard on SIGTERM after
   unmounting — rust_socketio's reconnect thread otherwise outlives

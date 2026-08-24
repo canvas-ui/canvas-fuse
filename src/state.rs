@@ -283,14 +283,16 @@ impl Tree {
     }
 
     fn insert_node(&mut self, node: Node) {
+        let parent = node.parent;
         if node.ino != ROOT_INO {
             self.children
-                .entry(node.parent)
+                .entry(parent)
                 .or_default()
                 .insert(node.name.clone(), node.ino);
         }
         self.children.entry(node.ino).or_default();
         self.nodes.insert(node.ino, node);
+        self.touch_dir(parent);
     }
 
     pub fn remove_node(&mut self, ino: u64) -> Option<Node> {
@@ -299,7 +301,25 @@ impl Tree {
             siblings.remove(&node.name);
         }
         self.children.remove(&ino);
+        self.touch_dir(node.parent);
         Some(node)
+    }
+
+    /// A directory's mtime is when its ENTRIES last changed — POSIX updates it
+    /// on every link and unlink, and this view had never done so: a context
+    /// could swap its whole document set and still stat identical, so anything
+    /// that decides "has this folder changed?" by timestamp (file managers,
+    /// backup tools, `find -newer`) concluded it had not, and kept showing the
+    /// previous view until the user pressed F5.
+    ///
+    /// Content edits deliberately do NOT come through here — a file's own mtime
+    /// is the document's updatedAt, and rewriting one changes no entry.
+    fn touch_dir(&mut self, ino: u64) {
+        if let Some(dir) = self.nodes.get_mut(&ino) {
+            if dir.is_dir() {
+                dir.mtime = SystemTime::now();
+            }
+        }
     }
 
     pub fn get(&self, ino: u64) -> Option<&Node> {

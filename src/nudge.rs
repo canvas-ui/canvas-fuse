@@ -4,7 +4,7 @@
 //! fsnotify events (the hook was lost in the ~5.3 refactor), so directory
 //! watchers — Obsidian, file managers, chokidar — never learn that the daemon
 //! changed a view. The workaround: after applying remote-driven changes,
-//! create and unlink a reserved marker file (`.canvas-tmp`) in each affected
+//! create and unlink a reserved marker file (`.canvas-tmp` by default) in each affected
 //! directory with real syscalls through the mount. The kernel then emits
 //! `IN_CREATE`/`IN_DELETE` to the directory's watchers, and rescanning
 //! watchers pick up the whole delta.
@@ -26,11 +26,36 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-/// Reserved marker filename. Virtual in every directory of the mount; also a
+/// Default marker filename. Virtual in every directory of the mount; also a
 /// sensible name for clients/servers to auto-exclude from indexing.
-pub const NUDGE_FILE: &str = ".canvas-tmp";
+///
+/// The name is configurable because it is the part watchers judge. A leading
+/// dot keeps the marker out of the way, but a watcher that filters hidden names
+/// — Obsidian excludes dotfiles from a vault outright — discards the only event
+/// it was going to get, and never learns the view changed. `--nudge-name` makes
+/// that a setting rather than a rebuild.
+pub const DEFAULT_NUDGE_FILE: &str = ".canvas-tmp";
+
+static NUDGE_NAME: OnceLock<String> = OnceLock::new();
+
+/// The marker name this process uses. One mount per process, so a global is
+/// the whole story; unset means the default.
+pub fn nudge_file() -> &'static str {
+    NUDGE_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_NUDGE_FILE)
+}
+
+/// Set the marker name. First call wins; later ones are ignored.
+pub fn set_nudge_file(name: &str) {
+    let trimmed = name.trim();
+    if !trimmed.is_empty() {
+        let _ = NUDGE_NAME.set(trimmed.to_string());
+    }
+}
 
 /// Fixed ino for the virtual marker, from the reserved 6..16 gap below
 /// `FIRST_DYNAMIC_INO` (overlay inos start at 1<<48 — no collision either way).
@@ -65,7 +90,7 @@ impl Nudger {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let marker = mount_root.join(rel).join(NUDGE_FILE);
+                        let marker = mount_root.join(rel).join(nudge_file());
                         // Failures are fine: the dir may have vanished, or the
                         // mount may be going away. The events matter, not the file.
                         let created = std::fs::OpenOptions::new()

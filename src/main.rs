@@ -98,6 +98,13 @@ enum Command {
         #[arg(long, env = "CANVAS_FUSE_NO_NUDGE")]
         no_nudge: bool,
 
+        /// Name of the virtual nudge marker. The default is hidden, which
+        /// watchers that ignore dotfiles (Obsidian excludes them from a vault)
+        /// discard along with the event — give it a visible name if your
+        /// client never notices remote-driven changes.
+        #[arg(long, env = "CANVAS_FUSE_NUDGE_NAME", default_value = canvas_fuse::nudge::DEFAULT_NUDGE_FILE)]
+        nudge_name: String,
+
         /// Full resync interval in seconds
         #[arg(long, default_value_t = 30)]
         resync: u64,
@@ -159,6 +166,7 @@ fn main() -> Result<()> {
             detach,
             no_ws,
             no_nudge,
+            nudge_name,
             resync,
             data_dir,
             blob_cache_mb,
@@ -181,6 +189,7 @@ fn main() -> Result<()> {
                 detach,
                 no_ws,
                 no_nudge,
+                nudge_name,
                 resync,
                 data_dir,
                 blob_cache_mb,
@@ -272,10 +281,12 @@ fn cmd_mount(
     detach: bool,
     no_ws: bool,
     no_nudge: bool,
+    nudge_name: String,
     resync: u64,
     data_dir: Option<PathBuf>,
     blob_cache_mb: usize,
 ) -> Result<()> {
+    canvas_fuse::nudge::set_nudge_file(&nudge_name);
     let endpoint = connect.endpoint()?;
 
     // A mount is one workspace. Naming a context inside it (`myws/Contexts/foo`)

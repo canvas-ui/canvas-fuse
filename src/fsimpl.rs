@@ -1,6 +1,6 @@
 use crate::api::ApiClient;
 use crate::blobs::{reply_slice, BlobStore};
-use crate::nudge::{NUDGE_FILE, NUDGE_INO};
+use crate::nudge::{nudge_file, NUDGE_INO};
 use crate::state::{NodeContent, Tree};
 use crate::writes::WriteStore;
 use fuser::{
@@ -150,7 +150,7 @@ impl Filesystem for CanvasFs {
         // The nudge marker "exists" only between its create and unlink, both
         // served from the dentry the create reply installed; a fresh lookup
         // always misses, keeping the marker invisible.
-        if name == NUDGE_FILE {
+        if name == nudge_file() {
             reply.error(libc::ENOENT);
             return;
         }
@@ -261,7 +261,7 @@ impl Filesystem for CanvasFs {
         // Virtual nudge marker: succeed without touching the write path (a
         // real create here would mint a server document). fh 0 keeps
         // flush/release on the no-op path.
-        if name == NUDGE_FILE {
+        if name == nudge_file() {
             reply.created(&TTL, &self.nudge_attr(), 0, 0, 0);
             return;
         }
@@ -286,7 +286,7 @@ impl Filesystem for CanvasFs {
     ) {
         // Only the virtual nudge marker; everything else keeps the historical
         // ENOSYS (the kernel then falls back to create for regular files).
-        if name.to_str() == Some(NUDGE_FILE) {
+        if name.to_str() == Some(nudge_file()) {
             reply.entry(&TTL, &self.nudge_attr(), 0);
             return;
         }
@@ -409,7 +409,7 @@ impl Filesystem for CanvasFs {
             reply.error(libc::ENOENT);
             return;
         };
-        if name == NUDGE_FILE {
+        if name == nudge_file() {
             reply.ok();
             return;
         }
@@ -545,7 +545,7 @@ impl Filesystem for CanvasFs {
                 for child in children {
                     // Defensive: a server doc named like the nudge marker must
                     // not surface (the name is reserved and unlookupable).
-                    if child.name == NUDGE_FILE {
+                    if child.name == nudge_file() {
                         continue;
                     }
                     let kind = if child.is_dir() {
@@ -559,7 +559,7 @@ impl Filesystem for CanvasFs {
         }
         // Pending creates appear alongside server-backed entries
         for (overlay_ino, name) in self.writes.overlay_entries(ino) {
-            if name != NUDGE_FILE && !entries.iter().any(|(_, _, n)| n == &name) {
+            if name != nudge_file() && !entries.iter().any(|(_, _, n)| n == &name) {
                 entries.push((overlay_ino, FileType::RegularFile, name));
             }
         }

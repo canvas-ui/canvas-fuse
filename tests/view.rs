@@ -378,3 +378,45 @@ fn by_schema_follows_a_document_the_flat_view_already_had() {
     let tabs = by_schema_ino(&tree, "work", "Tabs").expect("Tabs group");
     assert!(tree.lookup(tabs, "Reddit.url").is_some());
 }
+
+/// POSIX updates a directory's mtime on every link and unlink. This view never
+/// did, so a context could swap its entire document set and still stat
+/// identical — and anything that asks "has this folder changed?" by timestamp
+/// (KDE's lister re-stats before re-listing, `find -newer`, backup tools)
+/// concluded it had not. That is the F5 people were pressing.
+#[test]
+fn a_directory_mtime_follows_its_entries() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("work", "/work")]);
+    tree.apply_documents("work", &[note(1, "Plan", "a")], &names);
+
+    let dir = docs_ino(&tree, "work");
+    let before = tree.get(dir).unwrap().mtime;
+
+    // A document arrives: the folder gained an entry.
+    tree.apply_documents(
+        "work",
+        &[note(1, "Plan", "a"), note(2, "Later", "b")],
+        &names,
+    );
+    let after_add = tree.get(dir).unwrap().mtime;
+    assert!(
+        after_add > before,
+        "adding an entry must move the dir mtime"
+    );
+
+    // And leaves again.
+    tree.apply_documents("work", &[note(1, "Plan", "a")], &names);
+    assert!(
+        tree.get(dir).unwrap().mtime > after_add,
+        "removing an entry must move the dir mtime"
+    );
+
+    // A content edit changes no entry, so the directory is untouched — the
+    // file's own mtime carries that, and churning the dir would have every
+    // watcher re-listing on every keystroke.
+    let steady = tree.get(dir).unwrap().mtime;
+    tree.apply_documents("work", &[note(1, "Plan", "edited")], &names);
+    assert_eq!(tree.get(dir).unwrap().mtime, steady);
+}
