@@ -175,6 +175,10 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     } else {
         None
     };
+    // With a nudge thread to make the call, a departed document is held for a
+    // real unlink so the kernel names it in an IN_DELETE — the only signal a
+    // per-file watcher will act on. Without one, nothing would ever collect it.
+    tree.write().set_deferred_removals(nudger.is_some());
 
     // Subscriber is created up front and shared: the worker (re)subscribes a
     // context through it after each successful refresh, and the ws supervisor

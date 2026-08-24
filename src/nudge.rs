@@ -61,18 +61,42 @@ pub fn set_nudge_file(name: &str) {
 /// `FIRST_DYNAMIC_INO` (overlay inos start at 1<<48 — no collision either way).
 pub const NUDGE_INO: u64 = 6;
 
+/// What the nudge thread does to a path.
+enum Poke {
+    /// Create+unlink the marker inside this directory: a signal that SOMETHING
+    /// here changed, for watchers that re-list a directory on any event.
+    Dir(PathBuf),
+    /// Unlink this file for real: the kernel then emits an `IN_DELETE` that
+    /// names it. The daemon dropping an entry emits nothing, and
+    /// `notify_delete` emits no fsnotify event either, so a per-file watcher
+    /// keeps every departed document as a ghost — a context switch from 231
+    /// documents to 16 would leave 215 of them. The file is already gone from
+    /// the view; the tree holds it as a tombstone purely so this call can name
+    /// it (see state::Invalidation::vanished).
+    Unlink(PathBuf),
+    /// Touch this file's timestamps: an event that NAMES a real, still-present
+    /// file, for watchers that handle events per file instead of re-listing.
+    ///
+    /// This is the one that reaches Obsidian. It ignores the marker — an
+    /// unknown path that no longer exists by the time it stats, which is
+    /// exactly what a create-then-unlink leaves behind — so a view could gain
+    /// twenty documents and nothing in the vault would ever mention them. A
+    /// file that is still there when the watcher looks gets added instead.
+    File(PathBuf),
+}
+
 /// Handle to the nudge thread. Dropping the last clone closes the channel and
 /// the thread exits on its own; `stop` covers teardown while syscalls are
 /// queued.
 #[derive(Clone)]
 pub struct Nudger {
-    tx: Sender<PathBuf>,
+    tx: Sender<Poke>,
 }
 
 impl Nudger {
     /// Spawn the nudge thread for a mount rooted at `mount_root`.
     pub fn spawn(mount_root: PathBuf, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
-        let (tx, rx) = channel::<PathBuf>();
+        let (tx, rx) = channel::<Poke>();
         std::thread::Builder::new()
             .name("canvas-fuse-nudge".into())
             .spawn(move || {
@@ -80,12 +104,49 @@ impl Nudger {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    // Debounce a refresh burst into one nudge per directory.
+                    // Debounce a refresh burst into one poke per path.
                     let mut dirs = BTreeSet::new();
-                    dirs.insert(first);
-                    while let Ok(d) = rx.try_recv() {
-                        dirs.insert(d);
+                    let mut files = BTreeSet::new();
+                    let mut gone = BTreeSet::new();
+                    let mut sort = |poke| match poke {
+                        Poke::Dir(p) => {
+                            dirs.insert(p);
+                        }
+                        Poke::File(p) => {
+                            files.insert(p);
+                        }
+                        Poke::Unlink(p) => {
+                            gone.insert(p);
+                        }
+                    };
+                    sort(first);
+                    while let Ok(p) = rx.try_recv() {
+                        sort(p);
                     }
+
+                    // Files first: a watcher that acts per file should learn
+                    // about the documents themselves before the directory
+                    // signal arrives, so a re-list finds nothing new to do.
+                    for rel in files {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let path = mount_root.join(rel);
+                        touch(&path);
+                        log::trace!("touched {}", path.display());
+                    }
+
+                    for rel in gone {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let path = mount_root.join(rel);
+                        // Failure leaves the tombstone in place; the next
+                        // refresh sees the document still absent and pokes again.
+                        let _ = std::fs::remove_file(&path);
+                        log::trace!("collected {}", path.display());
+                    }
+
                     for rel in dirs {
                         if stop.load(Ordering::Relaxed) {
                             return;
@@ -113,6 +174,42 @@ impl Nudger {
     /// Queue a nudge for a directory, given as a path RELATIVE to the mount
     /// root (`Tree::path_of`). Never blocks.
     pub fn nudge(&self, rel_dir: PathBuf) {
-        let _ = self.tx.send(rel_dir);
+        let _ = self.tx.send(Poke::Dir(rel_dir));
     }
+
+    /// Queue a touch for a file that just appeared or changed, RELATIVE to the
+    /// mount root. Never blocks.
+    pub fn touch_file(&self, rel_file: PathBuf) {
+        let _ = self.tx.send(Poke::File(rel_file));
+    }
+
+    /// Queue the real unlink of a tombstoned file, RELATIVE to the mount root.
+    /// Never blocks.
+    pub fn unlink_file(&self, rel_file: PathBuf) {
+        let _ = self.tx.send(Poke::Unlink(rel_file));
+    }
+}
+
+/// Set a file's times to now, so the kernel emits `IN_ATTRIB` naming it.
+///
+/// `utimensat` rather than a write: setattr acknowledges times without touching
+/// the document, so this signals a watcher without the write path ever running.
+/// A failure is fine — the file may already be gone again.
+fn touch(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    // UTIME_NOW in both slots: "set atime and mtime to the current time".
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        },
+    ];
+    unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
 }

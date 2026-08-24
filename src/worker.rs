@@ -200,6 +200,16 @@ impl Worker {
     // Push invalidations into the kernel. Errors are expected noise: ENOENT
     // just means the kernel had nothing cached for that entry.
     fn notify(&self, inv: Invalidation) {
+        // Tombstoned documents are still in the tree so a real unlink can name
+        // them. With no nudge thread to make that call, nothing ever would —
+        // collect them here instead, or the view keeps every departed document
+        // forever.
+        if self.nudger.is_none() && !inv.vanished.is_empty() {
+            let mut tree = self.tree.write();
+            for (_, ino, _) in &inv.vanished {
+                tree.drop_tombstoned(*ino);
+            }
+        }
         let Some(notifier) = &self.notifier else {
             return;
         };
@@ -209,6 +219,16 @@ impl Worker {
         for (parent, child, name) in &inv.removed {
             if let Err(e) = notifier.delete(*parent, *child, &OsString::from(name)) {
                 log::trace!("notify delete {name}: {e}");
+            }
+        }
+        // Without a nudge thread these were just dropped above, so the kernel
+        // still has to be told. With one, the unlink itself does that — telling
+        // the kernel first would drop the dentry and the unlink would 404.
+        if self.nudger.is_none() {
+            for (parent, child, name) in &inv.vanished {
+                if let Err(e) = notifier.delete(*parent, *child, &OsString::from(name)) {
+                    log::trace!("notify delete {name}: {e}");
+                }
             }
         }
         for ino in &inv.changed {
@@ -247,6 +267,23 @@ impl Worker {
             for ino in dirs {
                 if let Some(rel) = tree.path_of(ino) {
                     nudger.nudge(rel);
+                }
+            }
+            // And an event that NAMES each file that appeared or changed. The
+            // marker alone reaches only watchers that re-list a directory on
+            // any signal; one that handles events per file (Obsidian) discards
+            // it — an unknown path, already gone by the time it stats — and so
+            // never learns that twenty documents just arrived.
+            for ino in inv.added.iter().chain(inv.changed.iter()) {
+                if let Some(rel) = tree.path_of(*ino) {
+                    nudger.touch_file(rel);
+                }
+            }
+            // And a real unlink for each document that left, which is the only
+            // way the kernel names it in an IN_DELETE.
+            for (_, ino, _) in &inv.vanished {
+                if let Some(rel) = tree.path_of(*ino) {
+                    nudger.unlink_file(rel);
                 }
             }
         }

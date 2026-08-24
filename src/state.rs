@@ -108,11 +108,26 @@ pub struct Invalidation {
     pub changed: Vec<u64>,
     /// Directory inodes whose listing changed — readdir cache must be dropped
     pub dirty_dirs: Vec<u64>,
+    /// File inodes that just appeared in the view. The daemon materializing a
+    /// file emits no fsnotify event of any kind, and a watcher that handles
+    /// events per FILE (rather than re-listing the directory on any signal)
+    /// therefore never learns it exists — see nudge.rs.
+    pub added: Vec<u64>,
+    /// (parent ino, child ino, name) — document files that LEFT the view and
+    /// are held as tombstones: still in the tree, so the nudge thread can
+    /// unlink them for real and the kernel emits an `IN_DELETE` that names
+    /// them. `notify_delete` emits no fsnotify event, so without this a
+    /// per-file watcher keeps every departed document as a ghost.
+    pub vanished: Vec<(u64, u64, String)>,
 }
 
 impl Invalidation {
     pub fn is_empty(&self) -> bool {
-        self.removed.is_empty() && self.changed.is_empty() && self.dirty_dirs.is_empty()
+        self.removed.is_empty()
+            && self.changed.is_empty()
+            && self.dirty_dirs.is_empty()
+            && self.added.is_empty()
+            && self.vanished.is_empty()
     }
 }
 
@@ -157,6 +172,16 @@ pub struct Tree {
     /// switches so open file handles survive a view swap.
     doc_inos: HashMap<(String, u64), u64>,
     ctx_inos: HashMap<String, u64>,
+    /// Document files that have left the view but are still in the tree, so a
+    /// real `unlink()` through the mount can name them (see Invalidation).
+    /// Cleared when that unlink lands; a missed one is retried on the next
+    /// refresh, since the document stays absent from the desired set.
+    tombstones: HashSet<u64>,
+    /// Whether departed documents are held for a real unlink (see tombstone).
+    /// Off unless something is there to make that call — a bare tree removes
+    /// entries outright, so the view is never left waiting on an actor that
+    /// does not exist.
+    defer_removals: bool,
     /// context id -> signature of the last `.by-schema/` grouping materialized
     /// for it (see `group_signature`).
     by_schema_sigs: HashMap<String, u64>,
@@ -251,6 +276,8 @@ impl Tree {
             next_ino: FIRST_DYNAMIC_INO,
             doc_inos: HashMap::new(),
             ctx_inos: HashMap::new(),
+            tombstones: HashSet::new(),
+            defer_removals: false,
             by_schema_sigs: HashMap::new(),
             ctx_workspaces: HashMap::new(),
             context_root,
@@ -303,6 +330,37 @@ impl Tree {
         self.children.remove(&ino);
         self.touch_dir(node.parent);
         Some(node)
+    }
+
+    /// Hold departed documents for a real unlink by the nudge thread. Set once
+    /// at mount, when there is a nudge thread to do the collecting.
+    pub fn set_deferred_removals(&mut self, on: bool) {
+        self.defer_removals = on;
+    }
+
+    /// Hold a departed document file in the tree so the nudge thread can unlink
+    /// it for real, which is the only way the kernel emits an `IN_DELETE` that
+    /// names it. Listings show it for the few milliseconds until that lands.
+    fn tombstone(&mut self, ino: u64) {
+        self.tombstones.insert(ino);
+    }
+
+    /// Resolve an unlink against the tombstone set. `Some(ino)` means "this is
+    /// the nudge thread collecting a document that already left the view" — the
+    /// caller drops it locally and must NOT touch the server.
+    pub fn take_tombstone(&mut self, parent: u64, name: &str) -> Option<u64> {
+        let ino = self.children.get(&parent)?.get(name).copied()?;
+        self.tombstones.remove(&ino).then_some(ino)
+    }
+
+    /// Drop a tombstoned node and its bookkeeping. Local only.
+    pub fn drop_tombstoned(&mut self, ino: u64) {
+        self.tombstones.remove(&ino);
+        self.remove_node(ino);
+        self.doc_inos.retain(|_, &mut i| i != ino);
+        if let Some(w) = self.ws.as_mut() {
+            w.file_docs.remove(&ino);
+        }
     }
 
     /// A directory's mtime is when its ENTRIES last changed — POSIX updates it
@@ -711,6 +769,13 @@ impl Tree {
                         inv.changed.push(ino);
                     }
                 }
+                _ if self.defer_removals => {
+                    // Held, not dropped: the unlink that names it has to find
+                    // it. See Invalidation::vanished.
+                    self.tombstone(ino);
+                    inv.vanished.push((dir_ino, ino, name));
+                    dirty = true;
+                }
                 _ => {
                     self.remove_node(ino);
                     self.doc_inos.retain(|_, &mut i| i != ino);
@@ -733,6 +798,7 @@ impl Tree {
                 content: content.clone(),
             });
             self.doc_inos.insert((ctx_id.to_string(), *doc_id), ino);
+            inv.added.push(ino);
             dirty = true;
         }
 
@@ -1179,6 +1245,7 @@ impl Tree {
                     doc_id,
                 },
             );
+            inv.added.push(ino);
             dirty = true;
         }
         if dirty {
@@ -1283,6 +1350,7 @@ impl Tree {
                     doc_id,
                 },
             );
+            inv.added.push(ino);
             dirty = true;
         }
         if dirty {

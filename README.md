@@ -246,7 +246,17 @@ calling `unmount()`) tears down the ws client, threads, and the kernel mount.
   (`--no-nudge` disables) so Obsidian/Dolphin/chokidar rescan. `.canvas-tmp`
   is reserved: virtual, hidden from `readdir`, never a server document.
 
-  Two things decide whether a client actually notices. The directory's **mtime**
+  A marker alone only reaches watchers that re-list a directory on any signal.
+  One that handles events per FILE — Obsidian — discards it: an unknown path
+  that no longer exists by the time it stats. So the daemon also emits events
+  that name the real documents: a `utimensat` on each file that appeared or
+  changed (`IN_ATTRIB`), and a real `unlink()` for each one that left, which is
+  the only way the kernel names it in an `IN_DELETE`. A departed document is
+  held in the tree as a tombstone purely so that unlink can find it; collecting
+  a tombstone is resolved entirely in the tree and never reaches the server, so
+  the document itself is untouched.
+
+  Two more things decide whether a client actually notices. The directory's **mtime**
   moves whenever its entries change, because a watcher that gets the event still
   re-stats before re-listing and skips the work when the timestamp is unchanged
   (KDE's lister does exactly this — it is why remote changes needed an F5). And

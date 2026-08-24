@@ -413,6 +413,17 @@ impl Filesystem for CanvasFs {
             reply.ok();
             return;
         }
+        // The nudge thread collecting a document that already left the view.
+        // Checked BEFORE the write path and resolved entirely in the tree, so
+        // this can never reach the server: a stale tombstone can only make a
+        // file vanish locally, which the next refresh puts back.
+        let tombstoned = self.tree.write().take_tombstone(parent, name);
+        if let Some(ino) = tombstoned {
+            self.tree.write().drop_tombstoned(ino);
+            log::trace!("collected tombstone {name}");
+            reply.ok();
+            return;
+        }
         match self.writes.unlink(parent, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.errno()),
