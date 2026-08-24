@@ -25,7 +25,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      # --locked here, not just in the release build: Cargo.lock records this
+      # package's OWN version, so bumping Cargo.toml without rebuilding leaves
+      # the two out of step. Without this the mismatch surfaces only when a tag
+      # builds with --locked, i.e. as a half-published release.
+      - run: cargo test --all --locked
 
   build:
     name: build ${{ matrix.target }}
