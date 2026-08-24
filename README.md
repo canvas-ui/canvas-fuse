@@ -45,7 +45,7 @@ the WebDAV mount serves it:
 | Schema | File |
 | --- | --- |
 | `file` | the bytes themselves, under their own name — lazily fetched |
-| `note` | `<title>.md`, the note's content verbatim |
+| `note` | `<title>.note.md`, the note's content verbatim |
 | `tab`, `link` | `<title>.url`, a `[InternetShortcut]` body |
 | `task` | `<title>.todo.json` |
 | `message/email` | `<from address>-<subject>.eml`, RFC 822 — a mailbox slot like `INBOX;UID=56909` never names a file |
@@ -78,6 +78,12 @@ Because context-bound browser tabs are just `.url` files, a file manager can
 drive them: `rm reddit.url` closes the tab, writing a `.url` opens one, editing
 one navigates it.
 
+Notes are `.note.md`. The compound suffix is what distinguishes a note from a
+markdown FILE — a bare `.md` is a file, since markdown is a general format and
+guessing would make "what does saving this mean" unanswerable. It still ends in
+`.md` so a notes app pointed at the mount reads it as a note: Obsidian only
+treats `.md` that way, and anything else is an attachment it will not render.
+
 ### What the verbs mean
 
 Rules live server-side, so this mount and WebDAV agree:
@@ -89,8 +95,8 @@ Rules live server-side, so this mount and WebDAV agree:
 - **`mv` re-tags.** Link at the destination, unlink at the source — no bytes
   through the mount. A folder move takes its documents with it.
 - **Deleting from a context** only detaches it from that view.
-- **Writing a file** stores its bytes. `.todo.json` and `.url` keep their canvas
-  meaning; everything else (markdown included) is a file. Saving over an
+- **Writing a file** stores its bytes. `.note.md`, `.todo.json` and `.url` keep
+  their canvas meaning; everything else (a bare `.md` included) is a file. Saving over an
   existing document updates it in its own schema. This holds in a context too:
   its bytes go to the backing workspace's blob store, addressed through the
   context (`POST /contexts/:id/blobs`).

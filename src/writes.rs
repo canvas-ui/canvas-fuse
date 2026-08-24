@@ -1444,7 +1444,9 @@ fn parent_of(path: &str) -> String {
 /// what a write means.
 fn ws_doc_schema(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
-    if lower.ends_with(".todo.json") {
+    if lower.ends_with(crate::render::NOTE_EXT) {
+        Some("data/schema/note")
+    } else if lower.ends_with(".todo.json") {
         Some("data/schema/task")
     } else if lower.ends_with(".url") {
         Some("data/schema/tab")
@@ -1500,7 +1502,7 @@ fn build_ws_document(name: &str, buffer: &[u8]) -> Option<Value> {
             }))
         }
         _ => {
-            let stem = name.strip_suffix(".md").unwrap_or(name);
+            let stem = name.strip_suffix(crate::render::NOTE_EXT).unwrap_or(name);
             let title = first_markdown_h1(&text).unwrap_or_else(|| stem.to_string());
             Some(json!({
                 "schema": schema,
@@ -1594,6 +1596,14 @@ mod tests {
 
         // Everything else — markdown included — is a file, and the caller
         // stores its bytes. Markdown is a general format, not a canvas one.
+        let note = build_ws_document("Ideas.note.md", b"# Real Title\n\nbody\n")
+            .expect("a .note.md is a note");
+        assert_eq!(note["schema"], "data/schema/note");
+        assert_eq!(note["data"]["title"], "Real Title");
+        assert_eq!(note["data"]["filename"], "Ideas.note.md");
+
+        // A bare .md is markdown, which is a general format — so it is a file,
+        // and the caller stores its bytes.
         assert!(build_ws_document("thoughts.md", b"# Real Title\n\nbody\n").is_none());
         assert!(build_ws_document("photo.jpg", b"\xff\xd8\xff").is_none());
     }

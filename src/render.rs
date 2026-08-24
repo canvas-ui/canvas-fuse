@@ -11,6 +11,19 @@ const LINK_SCHEMA: &str = "data/schema/link";
 const FILE_SCHEMA: &str = "data/schema/file";
 const EMAIL_SCHEMA: &str = "data/schema/message/email";
 
+/// What a note is called.
+///
+/// Markdown is a general format, so a plain `.md` is a FILE — which left notes
+/// and markdown files sharing an extension with no way to tell them apart, and
+/// made "what does a new .md mean here" unanswerable. A compound suffix settles
+/// it the same way `.todo.json` does: `.note.md` only ever comes from this
+/// renderer, so it can carry a canvas meaning without claiming markdown itself.
+///
+/// It still ENDS in `.md` deliberately. The consumer of a flat context mount is
+/// a notes app pointed at it, and Obsidian only treats `.md` as a note —
+/// anything else is an attachment it will not render, edit or link.
+pub const NOTE_EXT: &str = ".note.md";
+
 pub enum Content {
     /// Bytes rendered locally from the document JSON
     Inline(Vec<u8>),
@@ -92,7 +105,7 @@ pub fn doc_name(doc: &Document) -> String {
     }
     match doc.schema.as_str() {
         EMAIL_SCHEMA => email_name(doc),
-        NOTE_SCHEMA => format!("{}.md", titled(doc, &["title"], "note")),
+        NOTE_SCHEMA => format!("{}{NOTE_EXT}", titled(doc, &["title"], "note")),
         TODO_SCHEMA => format!("{}.todo.json", titled(doc, &["title"], "todo")),
         // A link names its target `uri` and itself `label`; a tab uses
         // `url`/`title`. Both are one address you can open, so both are `.url`.
@@ -502,7 +515,7 @@ mod tests {
     #[test]
     fn each_schema_renders_as_what_it_is() {
         let note = doc(1, NOTE_SCHEMA, json!({"title": "Plan", "content": "body"}));
-        assert_eq!(doc_name(&note), "Plan.md");
+        assert_eq!(doc_name(&note), "Plan.note.md");
         assert_eq!(inline(&note), "body");
 
         let tab = doc(2, TAB_SCHEMA, json!({"title": "Docs", "url": "https://d"}));

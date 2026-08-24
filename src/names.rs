@@ -11,8 +11,11 @@ use std::path::Path;
 // new rendering would only ever be visible on documents nobody had seen yet.
 // Bumping the generation retires those assignments in one step; collision
 // suffixes stay sticky from there on.
-const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames_v2");
-const LEGACY_FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames");
+const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames_v3");
+const LEGACY_FILENAMES: [TableDefinition<&str, &str>; 2] = [
+    TableDefinition::new("filenames"),
+    TableDefinition::new("filenames_v2"),
+];
 
 /// Persistent filename assignments. Once a (context, dir, doc) triple gets a
 /// filename it keeps it across restarts, so collision suffixes stay sticky and
@@ -35,7 +38,9 @@ impl NameStore {
         // reclaim any retired generation while we hold the write transaction.
         let tx = db.begin_write()?;
         tx.open_table(FILENAMES)?;
-        let _ = tx.delete_table(LEGACY_FILENAMES);
+        for legacy in LEGACY_FILENAMES {
+            let _ = tx.delete_table(legacy);
+        }
         tx.commit()?;
         Ok(Self { db })
     }

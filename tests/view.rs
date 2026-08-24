@@ -129,13 +129,13 @@ fn by_schema_groups_the_same_documents() {
         &names,
     );
 
-    assert_eq!(doc_names(&tree, "work"), vec!["Idea.md", "Rust.url"]);
+    assert_eq!(doc_names(&tree, "work"), vec!["Idea.note.md", "Rust.url"]);
     assert_eq!(
         names_in(
             &tree,
             by_schema_ino(&tree, "work", "Notes").expect("Notes group")
         ),
-        vec!["Idea.md"]
+        vec!["Idea.note.md"]
     );
     assert_eq!(
         names_in(
@@ -157,11 +157,14 @@ fn title_collisions_get_id_suffix_and_stick() {
     let docs = vec![note(1, "Meeting", "a"), note(2, "Meeting", "b")];
     tree.apply_documents("work", &docs, &names);
 
-    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.md", "Meeting_2.md"]);
+    assert_eq!(
+        doc_names(&tree, "work"),
+        vec!["Meeting.note.md", "Meeting.note_2.md"]
+    );
 
     // Doc 1 leaves; doc 2 must NOT inherit the clean name (sticky map)
     tree.apply_documents("work", &[note(2, "Meeting", "b")], &names);
-    assert_eq!(doc_names(&tree, "work"), vec!["Meeting_2.md"]);
+    assert_eq!(doc_names(&tree, "work"), vec!["Meeting.note_2.md"]);
 }
 
 #[test]
@@ -205,7 +208,7 @@ fn context_switch_diffs_and_keeps_inodes_stable() {
     // removals are reported for inotify push
     let removed: Vec<&str> = inv.removed.iter().map(|(_, _, n)| n.as_str()).collect();
     assert!(removed.contains(&"Jira ticket.url"));
-    assert!(removed.contains(&"Standup.md"));
+    assert!(removed.contains(&"Standup.note.md"));
 }
 
 #[test]
@@ -216,11 +219,11 @@ fn content_change_reports_inode_invalidation() {
     tree.apply_documents("work", &[note(1, "Plan", "v1")], &names);
 
     let notes_ino = docs_ino(&tree, "work");
-    let ino = tree.lookup(notes_ino, "Plan.md").unwrap().ino;
+    let ino = tree.lookup(notes_ino, "Plan.note.md").unwrap().ino;
 
     let inv = tree.apply_documents("work", &[note(1, "Plan", "v2 updated")], &names);
     assert!(inv.changed.contains(&ino));
-    let node = tree.lookup(notes_ino, "Plan.md").unwrap();
+    let node = tree.lookup(notes_ino, "Plan.note.md").unwrap();
     // The note IS its content — served verbatim, no trailing newline invented.
     assert_eq!(inline_bytes(&node.content), b"v2 updated");
     assert_eq!(node.size(), 10);
@@ -317,7 +320,7 @@ fn context_rooted_mount_puts_the_documents_at_root() {
     // Rooted at one context: its files hang directly off ROOT — no "Contexts"
     // wrapper, and no schema skeleton.
     let root_entries = names_in(&tree, ROOT_INO);
-    assert!(root_entries.contains(&"Hello.md".to_string()));
+    assert!(root_entries.contains(&"Hello.note.md".to_string()));
     assert!(root_entries.contains(&".context.json".to_string()));
     assert!(root_entries.contains(&".by-schema".to_string()));
     assert!(!root_entries.contains(&"Contexts".to_string()));
@@ -327,7 +330,7 @@ fn context_rooted_mount_puts_the_documents_at_root() {
     assert_eq!(tree.context_ino("mbag"), Some(ROOT_INO));
 
     // The write path still classifies a file here as belonging to the context.
-    let file_ino = tree.lookup(ROOT_INO, "Hello.md").unwrap().ino;
+    let file_ino = tree.lookup(ROOT_INO, "Hello.note.md").unwrap().ino;
     assert_eq!(tree.doc_for_ino(file_ino), Some(("mbag".to_string(), 1)));
     assert_eq!(tree.locate_context_dir(ROOT_INO), Some("mbag".to_string()));
 }
