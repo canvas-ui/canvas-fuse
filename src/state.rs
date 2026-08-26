@@ -417,6 +417,12 @@ impl Tree {
         )
     }
 
+    /// The workspace a context view's documents belong to — the scope every
+    /// document id is unique within, and so part of a sticky name's key.
+    pub fn workspace_of(&self, ctx_id: &str) -> Option<String> {
+        self.ctx_workspaces.get(ctx_id).cloned()
+    }
+
     pub fn context_ids(&self) -> Vec<String> {
         self.ctx_inos.keys().cloned().collect()
     }
@@ -668,6 +674,7 @@ impl Tree {
         let mut sorted: Vec<&Document> = docs.iter().collect();
         sorted.sort_by_key(|d| d.id);
         let workspace_id = self.ctx_workspaces.get(ctx_id).cloned();
+        let ws_key = workspace_id.clone().unwrap_or_default();
 
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut grouped: BTreeMap<String, Vec<(String, NodeContent, SystemTime)>> = BTreeMap::new();
@@ -694,7 +701,7 @@ impl Tree {
 
             // Sticky names are keyed per context now that there are no schema
             // dirs to key by; FLAT_NAME_KEY keeps the store's shape.
-            let persisted = names.get(ctx_id, FLAT_NAME_KEY, doc.id);
+            let persisted = names.get(ctx_id, &ws_key, FLAT_NAME_KEY, doc.id);
             let name = match persisted {
                 Some(n) if !taken.contains(&n) => n,
                 _ => {
@@ -703,7 +710,7 @@ impl Tree {
                     } else {
                         rendered.base_name.clone()
                     };
-                    if let Err(e) = names.put(ctx_id, FLAT_NAME_KEY, doc.id, &candidate) {
+                    if let Err(e) = names.put(ctx_id, &ws_key, FLAT_NAME_KEY, doc.id, &candidate) {
                         log::warn!("name store write failed: {e}");
                     }
                     candidate

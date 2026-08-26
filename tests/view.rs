@@ -420,3 +420,35 @@ fn a_directory_mtime_follows_its_entries() {
     tree.apply_documents("work", &[note(1, "Plan", "edited")], &names);
     assert_eq!(tree.get(dir).unwrap().mtime, steady);
 }
+
+/// Document ids are per workspace, and a context is a pointer that can be
+/// re-aimed at another workspace. A sticky name keyed by context alone let the
+/// note that is id 100056 in the new workspace inherit the `.url` name of the
+/// tab that was id 100056 in the old one — the mount showed a tab whose bytes
+/// were the note. The key carries the workspace, so it is a different document.
+#[test]
+fn sticky_names_are_scoped_to_the_workspace() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    let aimed_at = |ws: &str| ContextInfo {
+        id: "mbag".to_string(),
+        url: format!("{ws}://infra"),
+        workspace_id: Some(ws.to_string()),
+        raw: json!({ "id": "mbag", "url": format!("{ws}://infra"), "workspaceId": ws }),
+    };
+
+    tree.apply_contexts(&[aimed_at("universe")]);
+    tree.apply_documents(
+        "mbag",
+        &[tab(100056, "IT-Knowledge Base", "https://kb.example/nsx")],
+        &names,
+    );
+    let before = doc_names(&tree, "mbag");
+    assert!(before.iter().any(|n| n.ends_with(".url")), "{before:?}");
+
+    tree.apply_contexts(&[aimed_at("mbag")]);
+    tree.apply_documents("mbag", &[note(100056, "test", "tes foreman")], &names);
+    let after = doc_names(&tree, "mbag");
+    assert!(after.contains(&"test.note.md".to_string()), "{after:?}");
+    assert!(!after.iter().any(|n| n.ends_with(".url")), "{after:?}");
+}

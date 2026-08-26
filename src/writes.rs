@@ -745,8 +745,9 @@ impl WriteStore {
         match dst_tree_ino {
             None => {
                 // Plain rename: sticky-name reassignment, doc untouched
+                let ws = self.tree.read().workspace_of(&ctx).unwrap_or_default();
                 self.names
-                    .put(&ctx, &dir, src_doc, dst_name)
+                    .put(&ctx, &ws, &dir, src_doc, dst_name)
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?;
                 self.tree.write().rename_entry(src_ino, dst_name);
                 Ok(())
@@ -1362,8 +1363,9 @@ impl WriteStore {
 
         // Pin the exact filename so the server-driven view keeps it verbatim
         // (slug(title) may differ from what the editor named the file)
+        let ws = self.tree.read().workspace_of(ctx).unwrap_or_default();
         self.names
-            .put(ctx, dir, doc_id, name)
+            .put(ctx, &ws, dir, doc_id, name)
             .map_err(|e| WriteError::Io(format!("{e:#}")))?;
 
         self.tree.write().adopt_document(
