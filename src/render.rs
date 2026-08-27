@@ -498,6 +498,7 @@ mod tests {
             data,
             updated_at: SystemTime::UNIX_EPOCH,
             locations: Vec::new(),
+            linked_here: true,
             display_name: None,
             size: None,
             checksum: None,

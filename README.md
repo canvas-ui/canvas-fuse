@@ -78,6 +78,13 @@ Because context-bound browser tabs are just `.url` files, a file manager can
 drive them: `rm reddit.url` closes the tab, writing a `.url` opens one, editing
 one navigates it.
 
+A folder in a context tree lists everything filed at **or below** its path, so
+several documents can answer to one name in one folder. The document filed at
+the folder you are standing in keeps the plain name; the ones showing through
+from deeper paths take a `_<id>` suffix. Walking from `mbag://` to
+`mbag://dc-migration` therefore hands `CLAUDE.md` to the document filed there —
+the name follows the path, not the creation order.
+
 Notes are `.note.md`. The compound suffix is what distinguishes a note from a
 markdown FILE — a bare `.md` is a file, since markdown is a general format and
 guessing would make "what does saving this mean" unanswerable. It still ends in

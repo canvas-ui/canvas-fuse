@@ -18,11 +18,18 @@ use std::path::Path;
 // new rendering would only ever be visible on documents nobody had seen yet.
 // Bumping the generation retires those assignments in one step; collision
 // suffixes stay sticky from there on.
-const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames_v4");
-const LEGACY_FILENAMES: [TableDefinition<&str, &str>; 3] = [
+//
+// v5 retires the assignments made when a collision was settled by document id:
+// the document FILED at a path now keeps the plain name (see
+// `state::by_placement`), and every folder where the id order disagreed with
+// that had handed the plain name to a document standing in from a path below.
+// Those are exactly the assignments that must not stay sticky.
+const FILENAMES: TableDefinition<&str, &str> = TableDefinition::new("filenames_v5");
+const LEGACY_FILENAMES: [TableDefinition<&str, &str>; 4] = [
     TableDefinition::new("filenames"),
     TableDefinition::new("filenames_v2"),
     TableDefinition::new("filenames_v3"),
+    TableDefinition::new("filenames_v4"),
 ];
 
 /// Persistent filename assignments. Once a (context, workspace, dir, doc) key gets a

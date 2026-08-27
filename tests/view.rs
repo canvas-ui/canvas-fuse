@@ -20,6 +20,7 @@ fn doc(id: u64, schema: &str, data: serde_json::Value) -> Document {
         data,
         updated_at: SystemTime::UNIX_EPOCH,
         locations: Vec::new(),
+        linked_here: true,
         display_name: None,
         size: None,
         checksum: None,
@@ -451,4 +452,73 @@ fn sticky_names_are_scoped_to_the_workspace() {
     let after = doc_names(&tree, "mbag");
     assert!(after.contains(&"test.note.md".to_string()), "{after:?}");
     assert!(!after.iter().any(|n| n.ends_with(".url")), "{after:?}");
+}
+
+/// A context URL is a PATH into a tree, and a path lists everything filed at
+/// or below it — so a context at `mbag://dc-migration` holds its own documents
+/// AND the ones filed deeper. The document filed at the context's own path
+/// keeps the plain name; the rest take the `_<id>` suffix.
+///
+/// Re-aiming the context one path down hands the plain name to a different
+/// document, which is what navigating a tree means. The deepest note holds the
+/// LOWEST id here (it was created first) — document id used to decide this, so
+/// an id order that agrees with placement would pass either way.
+#[test]
+fn the_document_filed_at_the_context_path_keeps_the_plain_name() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("work", "/")]);
+
+    let from_below = |id: u64, content: &str| Document {
+        linked_here: false,
+        ..note(id, "CLAUDE", content)
+    };
+
+    // mbag:// — everything below shows through; only 100003 is filed here.
+    tree.apply_documents(
+        "work",
+        &[
+            from_below(100001, "task guidance"),
+            from_below(100002, "migration guidance"),
+            note(100003, "CLAUDE", "workspace guidance"),
+        ],
+        &names,
+    );
+    assert_eq!(
+        doc_names(&tree, "work"),
+        vec![
+            "CLAUDE.note.md".to_string(),
+            "CLAUDE.note_100001.md".to_string(),
+            "CLAUDE.note_100002.md".to_string(),
+        ]
+    );
+    let plain = tree
+        .lookup(docs_ino(&tree, "work"), "CLAUDE.note.md")
+        .unwrap()
+        .ino;
+    assert_eq!(tree.doc_for_ino(plain).map(|(_, id)| id), Some(100003));
+
+    // mbag://dc-migration — the same folder, one path down. A context is a
+    // pointer: re-aiming it is how you navigate.
+    tree.apply_contexts(&[ctx("work", "/dc-migration")]);
+    tree.apply_documents(
+        "work",
+        &[
+            from_below(100001, "task guidance"),
+            note(100002, "CLAUDE", "migration guidance"),
+        ],
+        &names,
+    );
+    assert_eq!(
+        doc_names(&tree, "work"),
+        vec![
+            "CLAUDE.note.md".to_string(),
+            "CLAUDE.note_100001.md".to_string(),
+        ]
+    );
+    let plain = tree
+        .lookup(docs_ino(&tree, "work"), "CLAUDE.note.md")
+        .unwrap()
+        .ino;
+    assert_eq!(tree.doc_for_ino(plain).map(|(_, id)| id), Some(100002));
 }

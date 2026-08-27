@@ -11,6 +11,15 @@ fn ti(id: &str, name: &str, tree_type: &str) -> TreeInfo {
     }
 }
 
+/// A note that is filed SOMEWHERE BELOW the path being listed: the server says
+/// so with `linkedHere: false` (see api::Document::linked_here).
+fn note_from_below(id: u64, title: &str, content: &str) -> Document {
+    Document {
+        linked_here: false,
+        ..note(id, title, content)
+    }
+}
+
 fn note(id: u64, title: &str, content: &str) -> Document {
     Document {
         id,
@@ -18,6 +27,7 @@ fn note(id: u64, title: &str, content: &str) -> Document {
         data: json!({ "title": title, "content": content }),
         updated_at: SystemTime::UNIX_EPOCH,
         locations: Vec::new(),
+        linked_here: true,
         display_name: None,
         size: None,
         checksum: None,
@@ -319,4 +329,92 @@ fn path_of_resolves_mount_relative_paths() {
     );
     // Unknown inos resolve to nothing (the nudge queue then drops them).
     assert_eq!(tree.path_of(999_999), None);
+}
+
+/// A context-tree folder lists everything filed at OR BELOW its path, so three
+/// documents called `CLAUDE.md` — filed at `/`, `/dc-migration` and
+/// `/dc-migration/tasks/foo` — are all listed at `/`. The one filed at the
+/// folder keeps the plain name; the ones standing in from below take the
+/// `_<id>` suffix. Walking to `/dc-migration` hands the plain name to the
+/// document filed THERE.
+///
+/// Deepest document first, deliberately: this used to be settled by document
+/// id, so an order that agrees with depth passes either way and tests nothing.
+///
+/// The server's WebDAV views name the same documents by the same rule — see
+/// `tests/transports/webdav/context-path-names.test.js` in canvas-server.
+#[test]
+fn the_document_filed_at_a_path_keeps_the_plain_name() {
+    let mut tree = Tree::workspace_rooted("ws-1".to_string(), "myws".to_string());
+    tree.apply_trees(&[ti("t-ctx", "context", "context")]);
+    tree.apply_tree_paths(
+        "context",
+        &[
+            "/".to_string(),
+            "/dc-migration".to_string(),
+            "/dc-migration/tasks".to_string(),
+            "/dc-migration/tasks/foo".to_string(),
+        ],
+    );
+
+    // The deepest note was created FIRST, so it holds the lowest id — the
+    // case where document id and placement disagree, which is the whole bug.
+    let task = note(100001, "CLAUDE", "task guidance");
+    let project = note(100002, "CLAUDE", "migration guidance");
+    let root = note(100003, "CLAUDE", "workspace guidance");
+
+    // At '/', only the root note is filed here.
+    tree.apply_tree_documents(
+        "context",
+        "/",
+        &[
+            note_from_below(100001, "CLAUDE", "task guidance"),
+            note_from_below(100002, "CLAUDE", "migration guidance"),
+            root.clone(),
+        ],
+    );
+    let root_dir = ino_at(&tree, &["Trees", "context"]);
+    assert_eq!(
+        names_in(&tree, root_dir),
+        vec![
+            "CLAUDE.note.md".to_string(),
+            "CLAUDE.note_100001.md".to_string(),
+            "CLAUDE.note_100002.md".to_string(),
+            "dc-migration".to_string(),
+        ]
+    );
+    let plain = tree.lookup(root_dir, "CLAUDE.note.md").unwrap().ino;
+    assert_eq!(tree.tree_file(plain).unwrap().4, 100003);
+
+    // One path down, the same three names mean different documents.
+    tree.apply_tree_documents(
+        "context",
+        "/dc-migration",
+        &[
+            note_from_below(100001, "CLAUDE", "task guidance"),
+            project.clone(),
+        ],
+    );
+    let project_dir = ino_at(&tree, &["Trees", "context", "dc-migration"]);
+    assert_eq!(
+        names_in(&tree, project_dir),
+        vec![
+            "CLAUDE.note.md".to_string(),
+            "CLAUDE.note_100001.md".to_string(),
+            "tasks".to_string(),
+        ]
+    );
+    let plain = tree.lookup(project_dir, "CLAUDE.note.md").unwrap().ino;
+    assert_eq!(tree.tree_file(plain).unwrap().4, 100002);
+
+    // And at the leaf it is the leaf's own document, with nothing to suffix.
+    tree.apply_tree_documents(
+        "context",
+        "/dc-migration/tasks/foo",
+        std::slice::from_ref(&task),
+    );
+    let leaf = ino_at(&tree, &["Trees", "context", "dc-migration", "tasks", "foo"]);
+    assert_eq!(names_in(&tree, leaf), vec!["CLAUDE.note.md".to_string()]);
+    let plain = tree.lookup(leaf, "CLAUDE.note.md").unwrap().ino;
+    assert_eq!(tree.tree_file(plain).unwrap().4, 100001);
 }

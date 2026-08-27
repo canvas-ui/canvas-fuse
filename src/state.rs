@@ -5,12 +5,38 @@ use crate::render;
 /// The derived, read-only grouping inside a context folder.
 pub const BY_SCHEMA_DIR: &str = ".by-schema";
 
-/// Sticky-name key for the flat context view (there are no schema dirs to key
-/// by anymore; the store's shape is unchanged).
+/// Sticky-name key for a context whose URL is not known yet. Normally the
+/// context's URL fills this slot (see `Tree::ctx_urls`); there are no schema
+/// dirs to key by anymore, and the store's shape is unchanged.
 pub const FLAT_NAME_KEY: &str = "";
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+/// The order filenames are handed out in.
+///
+/// A folder in a context tree lists everything filed at OR BELOW its path — a
+/// context path is AND(layers along the path) — so three documents called
+/// `CLAUDE.md`, filed at `/`, `/dc-migration` and `/dc-migration/tasks/foo`,
+/// are all listed at `/`. Only one of them is filed at the folder you are
+/// standing in, and that one keeps the plain name; the rest take the `_<id>`
+/// suffix (see `render::with_id_suffix`).
+///
+/// Placement first, then id: the id is only the tie-break among documents of
+/// equal standing, and on its own it made the name `CLAUDE.md` mean whichever
+/// one happened to be created first — a different document at every path, and
+/// a different one again after a re-file. `linked_here` comes from the server,
+/// which is the only party that knows the tree (see `linkedHere` in the REST
+/// listings); when it says nothing every document counts as filed here and
+/// this is exactly the old id order.
+///
+/// The server's own views (WebDAV) name documents by the same rule, because a
+/// document opened over two wires has to be one file with one name.
+fn by_placement(docs: &[Document]) -> Vec<&Document> {
+    let mut sorted: Vec<&Document> = docs.iter().collect();
+    sorted.sort_by_key(|d| (!d.linked_here, d.id));
+    sorted
+}
 
 /// What `.by-schema/` would contain, as one comparable value: every folder and
 /// the names in it. A content edit does not move a document between folders, so
@@ -187,6 +213,13 @@ pub struct Tree {
     by_schema_sigs: HashMap<String, u64>,
     /// context id -> workspaceId, needed to address the content route
     ctx_workspaces: HashMap<String, String>,
+    /// context id -> its current URL. Part of the sticky-name key: a context is
+    /// a POINTER, and re-aiming it from `mbag://` to `mbag://dc-migration`
+    /// changes which document is filed at the path and therefore which one owns
+    /// a name (see `by_placement`). Keyed by context alone, the assignment made
+    /// at the old URL followed the context to the new one and pinned the plain
+    /// name to a document that no longer had any claim on it.
+    ctx_urls: HashMap<String, String>,
     /// When set, the mount is rooted at a single context: that context's schema
     /// dirs hang directly off ROOT (no `Contexts/<id>` wrapper), so mounting
     /// `-c mbag <path>` yields `<path>/mbag/{Notes,Tabs,…}`. None = global mount
@@ -280,6 +313,7 @@ impl Tree {
             defer_removals: false,
             by_schema_sigs: HashMap::new(),
             ctx_workspaces: HashMap::new(),
+            ctx_urls: HashMap::new(),
             context_root,
             ws: None,
         };
@@ -547,6 +581,7 @@ impl Tree {
             }
             self.doc_inos.retain(|(c, _), _| c != &ctx_id);
             self.ctx_workspaces.remove(&ctx_id);
+            self.ctx_urls.remove(&ctx_id);
             inv.dirty_dirs.push(self.contexts_parent());
         }
 
@@ -578,6 +613,7 @@ impl Tree {
                     if let Some(ws) = &ctx.workspace_id {
                         self.ctx_workspaces.insert(ctx.id.clone(), ws.clone());
                     }
+                    self.ctx_urls.insert(ctx.id.clone(), ctx.url.clone());
                 }
                 None => {
                     // The context's "directory": ROOT itself when context-rooted
@@ -600,6 +636,7 @@ impl Tree {
                     if let Some(ws) = &ctx.workspace_id {
                         self.ctx_workspaces.insert(ctx.id.clone(), ws.clone());
                     }
+                    self.ctx_urls.insert(ctx.id.clone(), ctx.url.clone());
                     // Grouping is a DERIVED view, dotted and read-only. The
                     // documents themselves are the context's files (flat), so a
                     // gesture means the same thing here as anywhere else on the
@@ -669,12 +706,16 @@ impl Tree {
             return inv;
         };
 
-        // Render every doc once, deterministically (id order), and assign the
-        // sticky filename the flat view shows.
-        let mut sorted: Vec<&Document> = docs.iter().collect();
-        sorted.sort_by_key(|d| d.id);
+        // Render every doc once, deterministically, and assign the sticky
+        // filename the flat view shows.
+        let sorted = by_placement(docs);
         let workspace_id = self.ctx_workspaces.get(ctx_id).cloned();
         let ws_key = workspace_id.clone().unwrap_or_default();
+        let name_key = self
+            .ctx_urls
+            .get(ctx_id)
+            .cloned()
+            .unwrap_or_else(|| FLAT_NAME_KEY.to_string());
 
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut grouped: BTreeMap<String, Vec<(String, NodeContent, SystemTime)>> = BTreeMap::new();
@@ -699,9 +740,10 @@ impl Tree {
                 },
             };
 
-            // Sticky names are keyed per context now that there are no schema
-            // dirs to key by; FLAT_NAME_KEY keeps the store's shape.
-            let persisted = names.get(ctx_id, &ws_key, FLAT_NAME_KEY, doc.id);
+            // Sticky names are keyed per context AND per context URL: there
+            // are no schema dirs to key by anymore, and the URL is what decides
+            // which documents are filed here (see `ctx_urls`).
+            let persisted = names.get(ctx_id, &ws_key, &name_key, doc.id);
             let name = match persisted {
                 Some(n) if !taken.contains(&n) => n,
                 _ => {
@@ -710,7 +752,7 @@ impl Tree {
                     } else {
                         rendered.base_name.clone()
                     };
-                    if let Err(e) = names.put(ctx_id, &ws_key, FLAT_NAME_KEY, doc.id, &candidate) {
+                    if let Err(e) = names.put(ctx_id, &ws_key, &name_key, doc.id, &candidate) {
                         log::warn!("name store write failed: {e}");
                     }
                     candidate
@@ -1192,8 +1234,7 @@ impl Tree {
         }
         let ws_id = self.ws().ws_id.clone();
 
-        let mut sorted: Vec<&Document> = docs.iter().collect();
-        sorted.sort_by_key(|d| d.id);
+        let sorted = by_placement(docs);
 
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut taken: HashSet<String> = HashSet::new();
@@ -1278,8 +1319,7 @@ impl Tree {
         };
         let ws_id = self.ws().ws_id.clone();
 
-        let mut sorted: Vec<&Document> = docs.iter().collect();
-        sorted.sort_by_key(|d| d.id);
+        let sorted = by_placement(docs);
 
         let mut desired: BTreeMap<String, (u64, NodeContent, SystemTime)> = BTreeMap::new();
         let mut taken: HashSet<String> = HashSet::new();

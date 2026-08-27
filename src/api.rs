@@ -57,6 +57,15 @@ pub struct Document {
     /// `resolve_display_name`). None when nothing names it and the renderer
     /// must derive one.
     pub display_name: Option<String>,
+    /// Whether the server says this document is filed AT the path being listed,
+    /// rather than showing through from a path below it (a context path lists
+    /// its whole subtree). Decides who keeps the plain filename when two
+    /// documents in one folder answer to the same name.
+    ///
+    /// True when the server said nothing — an older server, or a listing with
+    /// no placement to report. That is the old behaviour: everything counts as
+    /// filed here, and id order breaks the tie.
+    pub linked_here: bool,
     /// metadata.size — getattr size for blob-backed docs
     pub size: Option<u64>,
     /// checksumArray[0] — blob cache key (content-addressed dedupe)
@@ -940,6 +949,10 @@ fn parse_document(doc: &Value) -> Option<Document> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let display_name = resolve_display_name(doc);
+    let linked_here = doc
+        .get("linkedHere")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let raw = if crate::render::has_renderer(&schema) {
         None
     } else {
@@ -952,6 +965,7 @@ fn parse_document(doc: &Value) -> Option<Document> {
         data,
         updated_at,
         locations,
+        linked_here,
         size,
         checksum,
         raw,
