@@ -228,6 +228,9 @@ pub struct Tree {
     /// Set when the mount roots a workspace tree view (`-w`). Mutually
     /// exclusive with the context maps above.
     ws: Option<WsState>,
+    /// Home is fed from the mirror store (`--mirror`): directories are never
+    /// listed from the server, so every HomeDir is born `loaded`.
+    home_mirrored: bool,
 }
 
 impl Default for Tree {
@@ -302,6 +305,10 @@ impl Tree {
         self.ws.is_some()
     }
 
+    pub fn is_home_mirrored(&self) -> bool {
+        self.home_mirrored
+    }
+
     fn bare(context_root: Option<String>) -> Self {
         let mut t = Self {
             nodes: HashMap::new(),
@@ -316,6 +323,7 @@ impl Tree {
             ctx_urls: HashMap::new(),
             context_root,
             ws: None,
+            home_mirrored: false,
         };
         t.insert_node(Node {
             ino: ROOT_INO,
@@ -1221,6 +1229,326 @@ impl Tree {
             *loaded = true;
         }
         inv.dirty_dirs.push(dir_ino);
+        inv
+    }
+
+    // ── Home, addressed by key ──────────────────────────────────────────────
+    // In mirror mode Home is fed from the mirror store rather than listed on
+    // demand: keys are relative, `/`-separated paths, and directories exist
+    // because a key passes through them (or because the store says so).
+
+    /// Serve every Home directory as already listed: nothing is fetched on
+    /// look, the store is the listing.
+    pub fn set_home_mirrored(&mut self, on: bool) {
+        self.home_mirrored = on;
+        if let Some(NodeContent::HomeDir { loaded, .. }) =
+            self.nodes.get_mut(&HOME_INO).map(|n| &mut n.content)
+        {
+            *loaded = on || *loaded;
+        }
+    }
+
+    /// The store key a Home node addresses (`Docs/a.md`), None outside Home.
+    /// The Home root itself is the empty key.
+    pub fn home_key(&self, ino: u64) -> Option<String> {
+        let (path, _) = self.home_path(ino)?;
+        Some(path.trim_matches('/').to_string())
+    }
+
+    /// The Home node at a key, walking from the Home root.
+    pub fn home_ino_for_key(&self, key: &str) -> Option<u64> {
+        let mut ino = HOME_INO;
+        for seg in key.split('/').filter(|s| !s.is_empty()) {
+            ino = self.lookup(ino, seg)?.ino;
+        }
+        Some(ino)
+    }
+
+    /// Ensure every directory along `key` exists (the key's own leaf is a
+    /// directory too). Returns the leaf dir's ino.
+    fn ensure_home_dirs(&mut self, key: &str, inv: &mut Invalidation) -> u64 {
+        let mut ino = HOME_INO;
+        let mut path = String::new();
+        for seg in key.split('/').filter(|s| !s.is_empty()) {
+            path.push('/');
+            path.push_str(seg);
+            match self.lookup(ino, seg).map(|n| (n.ino, n.is_dir())) {
+                Some((child, true)) => ino = child,
+                Some((child, false)) => {
+                    // A file where a directory must be: the file loses (a
+                    // rename on the hub turned it into a folder name).
+                    self.remove_node(child);
+                    inv.removed.push((ino, child, seg.to_string()));
+                    let new = self.alloc_ino();
+                    self.insert_node(Node {
+                        ino: new,
+                        parent: ino,
+                        name: seg.to_string(),
+                        mtime: SystemTime::now(),
+                        content: NodeContent::HomeDir {
+                            path: path.clone(),
+                            loaded: true,
+                        },
+                    });
+                    inv.dirty_dirs.push(ino);
+                    ino = new;
+                }
+                None => {
+                    let new = self.alloc_ino();
+                    self.insert_node(Node {
+                        ino: new,
+                        parent: ino,
+                        name: seg.to_string(),
+                        mtime: SystemTime::now(),
+                        content: NodeContent::HomeDir {
+                            path: path.clone(),
+                            loaded: true,
+                        },
+                    });
+                    inv.dirty_dirs.push(ino);
+                    inv.added.push(new);
+                    ino = new;
+                }
+            }
+        }
+        ino
+    }
+
+    /// An explicit directory (mkdir'd, or empty on the hub).
+    pub fn ensure_home_dir_key(&mut self, key: &str) -> Invalidation {
+        let mut inv = Invalidation::default();
+        self.ensure_home_dirs(key, &mut inv);
+        inv
+    }
+
+    /// Create or update the file at `key` (size/mtime), creating the
+    /// directories it passes through.
+    pub fn upsert_home_key(&mut self, key: &str, size: u64, mtime: SystemTime) -> Invalidation {
+        let mut inv = Invalidation::default();
+        let key = key.trim_matches('/');
+        let (dir_key, name) = match key.rsplit_once('/') {
+            Some((d, n)) => (d, n),
+            None => ("", key),
+        };
+        if name.is_empty() {
+            return inv;
+        }
+        let dir_ino = self.ensure_home_dirs(dir_key, &mut inv);
+        let path = format!("/{key}");
+        let content = NodeContent::HomeFile { path, size };
+        match self.lookup(dir_ino, name).map(|n| (n.ino, n.is_dir())) {
+            Some((ino, false)) => {
+                let node = self.nodes.get_mut(&ino).unwrap();
+                if node.content != content || node.mtime != mtime {
+                    node.content = content;
+                    node.mtime = mtime;
+                    inv.changed.push(ino);
+                }
+            }
+            Some((ino, true)) => {
+                // A directory where a file must be: the subtree is gone.
+                self.remove_subtree(ino, &mut inv);
+                self.remove_node(ino);
+                inv.removed.push((dir_ino, ino, name.to_string()));
+                let new = self.alloc_ino();
+                self.insert_node(Node {
+                    ino: new,
+                    parent: dir_ino,
+                    name: name.to_string(),
+                    mtime,
+                    content,
+                });
+                inv.added.push(new);
+                inv.dirty_dirs.push(dir_ino);
+            }
+            None => {
+                let new = self.alloc_ino();
+                self.insert_node(Node {
+                    ino: new,
+                    parent: dir_ino,
+                    name: name.to_string(),
+                    mtime,
+                    content,
+                });
+                inv.added.push(new);
+                inv.dirty_dirs.push(dir_ino);
+            }
+        }
+        inv
+    }
+
+    /// Remove the node at `key` (file or directory subtree), then prune the
+    /// directories above it that are now empty — unless `keep_dirs` names
+    /// them (explicit dirs the store still holds).
+    pub fn remove_home_key(&mut self, key: &str, keep_dirs: &HashSet<String>) -> Invalidation {
+        let mut inv = Invalidation::default();
+        let key = key.trim_matches('/');
+        let Some(ino) = self.home_ino_for_key(key) else {
+            return inv;
+        };
+        if ino == HOME_INO {
+            return inv;
+        }
+        self.remove_subtree(ino, &mut inv);
+        let Some(node) = self.remove_node(ino) else {
+            return inv;
+        };
+        inv.removed.push((node.parent, ino, node.name));
+        inv.dirty_dirs.push(node.parent);
+        // Prune upward.
+        let mut cur = node.parent;
+        let mut cur_key = crate::mirror::parent_key(key).to_string();
+        while cur != HOME_INO {
+            let empty = self.children.get(&cur).map(|c| c.is_empty()).unwrap_or(true);
+            if !empty || keep_dirs.contains(&cur_key) {
+                break;
+            }
+            let Some(dir) = self.remove_node(cur) else {
+                break;
+            };
+            inv.removed.push((dir.parent, cur, dir.name));
+            inv.dirty_dirs.push(dir.parent);
+            cur = dir.parent;
+            cur_key = crate::mirror::parent_key(&cur_key).to_string();
+        }
+        inv
+    }
+
+    /// Re-key a Home node (file or directory) from one key to another,
+    /// creating the destination's directories. Used for hub-side renames.
+    pub fn rename_home_key(&mut self, from: &str, to: &str) -> Invalidation {
+        let mut inv = Invalidation::default();
+        let Some(ino) = self.home_ino_for_key(from) else {
+            return inv;
+        };
+        if ino == HOME_INO {
+            return inv;
+        }
+        let (dst_dir, dst_name) = match to.rsplit_once('/') {
+            Some((d, n)) => (d, n),
+            None => ("", to),
+        };
+        let dst_parent = self.ensure_home_dirs(dst_dir, &mut inv);
+        if let Some(existing) = self.lookup(dst_parent, dst_name).map(|n| n.ino) {
+            if existing != ino {
+                self.remove_subtree(existing, &mut inv);
+                self.remove_node(existing);
+                inv.removed.push((dst_parent, existing, dst_name.to_string()));
+            }
+        }
+        let old_parent = self.nodes.get(&ino).map(|n| n.parent).unwrap_or(HOME_INO);
+        let old_name = self.nodes.get(&ino).map(|n| n.name.clone()).unwrap_or_default();
+        self.rename_home(ino, dst_parent, dst_name);
+        inv.removed.push((old_parent, ino, old_name));
+        inv.dirty_dirs.push(old_parent);
+        inv.dirty_dirs.push(dst_parent);
+        inv.added.push(ino);
+        inv
+    }
+
+    /// Move a Home node to a new parent/name and re-key the `path` of it and
+    /// everything below (the write path's `mv`; the kernel already knows).
+    pub fn rename_home(&mut self, ino: u64, new_parent: u64, new_name: &str) {
+        let Some((parent_path, _)) = self.home_path(new_parent) else {
+            return;
+        };
+        self.move_entry(ino, new_parent, new_name);
+        let new_path = join_home_path(&parent_path, new_name);
+        self.rekey_home_subtree(ino, &new_path);
+        self.touch_dir(new_parent);
+    }
+
+    fn rekey_home_subtree(&mut self, ino: u64, path: &str) {
+        let children: Vec<(String, u64)> = self
+            .children
+            .get(&ino)
+            .map(|c| c.iter().map(|(n, i)| (n.clone(), *i)).collect())
+            .unwrap_or_default();
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            match &mut node.content {
+                NodeContent::HomeDir { path: p, .. } | NodeContent::HomeFile { path: p, .. } => {
+                    *p = path.to_string();
+                }
+                _ => {}
+            }
+        }
+        for (name, child) in children {
+            let child_path = join_home_path(path, &name);
+            self.rekey_home_subtree(child, &child_path);
+        }
+    }
+
+    /// Replace the whole Home tree with the store's view: `files` as
+    /// (key, size, mtime), `dirs` the explicit directories. Nodes that
+    /// survive keep their inos.
+    pub fn apply_home_snapshot(
+        &mut self,
+        files: &[(String, u64, SystemTime)],
+        dirs: &[String],
+    ) -> Invalidation {
+        let mut inv = Invalidation::default();
+        let wanted_files: HashSet<&str> = files.iter().map(|(k, _, _)| k.as_str()).collect();
+        let mut wanted_dirs: HashSet<String> = dirs.iter().cloned().collect();
+        for (k, _, _) in files {
+            let mut p = crate::mirror::parent_key(k);
+            while !p.is_empty() {
+                wanted_dirs.insert(p.to_string());
+                p = crate::mirror::parent_key(p);
+            }
+        }
+        // Walk the existing Home tree and drop what is not wanted.
+        let mut stack: Vec<(u64, String)> = vec![(HOME_INO, String::new())];
+        let mut victims: Vec<u64> = Vec::new();
+        while let Some((ino, key)) = stack.pop() {
+            let children: Vec<(String, u64, bool)> = self
+                .children
+                .get(&ino)
+                .map(|c| {
+                    c.iter()
+                        .filter_map(|(n, i)| self.nodes.get(i).map(|node| (n.clone(), *i, node.is_dir())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, child, is_dir) in children {
+                let child_key = if key.is_empty() {
+                    name
+                } else {
+                    format!("{key}/{name}")
+                };
+                let keep = if is_dir {
+                    wanted_dirs.contains(&child_key)
+                } else {
+                    wanted_files.contains(child_key.as_str())
+                };
+                if keep {
+                    if is_dir {
+                        stack.push((child, child_key));
+                    }
+                } else {
+                    victims.push(child);
+                }
+            }
+        }
+        for ino in victims {
+            if let Some(node) = self.nodes.get(&ino) {
+                let parent = node.parent;
+                let name = node.name.clone();
+                self.remove_subtree(ino, &mut inv);
+                self.remove_node(ino);
+                inv.removed.push((parent, ino, name));
+                inv.dirty_dirs.push(parent);
+            }
+        }
+        for d in &wanted_dirs {
+            self.ensure_home_dirs(d, &mut inv);
+        }
+        for (k, size, mtime) in files {
+            let sub = self.upsert_home_key(k, *size, *mtime);
+            inv.removed.extend(sub.removed);
+            inv.changed.extend(sub.changed);
+            inv.dirty_dirs.extend(sub.dirty_dirs);
+            inv.added.extend(sub.added);
+        }
         inv
     }
 

@@ -134,6 +134,7 @@ pub fn connect(
         }
         // Catch up on anything missed while disconnected
         let _ = auth_tx.send(Job::RefreshAll);
+        let _ = auth_tx.send(Job::MirrorReconnect);
     };
 
     // Server acks each subscription with a `subscribed` event; record it so the
@@ -157,6 +158,13 @@ pub fn connect(
             if name.starts_with("tree.") || name.starts_with("document.") {
                 log::debug!("ws event (workspace): {name}");
                 let _ = event_tx.send(Job::RefreshAll);
+            }
+            // Mirror mode: the hub's change log advanced (or a conflict was
+            // resolved there). Treat it as "poll the feed now", never as the
+            // change itself.
+            if name == "backend.changed" || name.starts_with("sync.conflict.") {
+                log::debug!("ws event (mirror): {name}");
+                let _ = event_tx.send(Job::MirrorNudge);
             }
             return;
         }

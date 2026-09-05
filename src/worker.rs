@@ -12,6 +12,14 @@ use std::sync::Arc;
 pub enum Job {
     RefreshAll,
     RefreshContext(String),
+    /// The mirror engine changed Home nodes; push its queued invalidations
+    /// to the kernel (and the nudge thread) from the worker, which owns the
+    /// notifier.
+    MirrorInvalidations,
+    /// A `backend.changed` / conflict event on the socket: wake the mirror.
+    MirrorNudge,
+    /// The socket re-authenticated: the hub is back, tell the mirror.
+    MirrorReconnect,
 }
 
 /// Notifies the ws layer to subscribe to a newly discovered context's channel.
@@ -40,6 +48,10 @@ pub struct Worker {
     /// change (see nudge.rs). None on the pre-mount bootstrap worker and under
     /// --no-nudge.
     pub nudger: Option<crate::nudge::Nudger>,
+    /// Mirror mode: the engine's queued Home invalidations, drained on
+    /// `Job::MirrorInvalidations`, and the engine itself for nudges.
+    pub mirror_invalidations: Option<Arc<parking_lot::Mutex<Vec<Invalidation>>>>,
+    pub mirror: Option<Arc<crate::mirror::sync::Mirror>>,
 }
 
 impl Worker {
@@ -52,6 +64,23 @@ impl Worker {
             while let Ok(job) = rx.try_recv() {
                 jobs.insert(job);
             }
+            // Mirror jobs are cheap and independent of the refresh below.
+            if jobs.remove(&Job::MirrorInvalidations) {
+                self.flush_mirror_invalidations();
+            }
+            if jobs.remove(&Job::MirrorReconnect) {
+                if let Some(m) = &self.mirror {
+                    m.reconnect();
+                }
+            }
+            if jobs.remove(&Job::MirrorNudge) {
+                if let Some(m) = &self.mirror {
+                    m.wake();
+                }
+            }
+            if jobs.is_empty() {
+                continue;
+            }
             if jobs.contains(&Job::RefreshAll) {
                 self.refresh_all();
             } else {
@@ -63,6 +92,16 @@ impl Worker {
             }
         }
         log::debug!("worker channel closed, exiting");
+    }
+
+    fn flush_mirror_invalidations(&self) {
+        let Some(queue) = &self.mirror_invalidations else {
+            return;
+        };
+        let pending: Vec<Invalidation> = std::mem::take(&mut *queue.lock());
+        for inv in pending {
+            self.notify(inv);
+        }
     }
 
     pub fn refresh_all(&self) {

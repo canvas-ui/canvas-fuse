@@ -3,6 +3,7 @@ pub mod blobs;
 pub mod config;
 pub mod events;
 pub mod fsimpl;
+pub mod mirror;
 pub mod names;
 pub mod nudge;
 pub mod render;
