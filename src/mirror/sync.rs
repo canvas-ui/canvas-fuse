@@ -367,10 +367,6 @@ impl Mirror {
         self.with_view(|t| t.rename_home_key(from, to));
     }
 
-    fn view_mkdir(&self, key: &str) {
-        self.with_view(|t| t.ensure_home_dir_key(key));
-    }
-
     /// Build the whole Home tree from the store (mount time).
     pub fn snapshot_into(&self, tree: &mut Tree) {
         let files: Vec<(String, u64, SystemTime)> = self
@@ -692,12 +688,17 @@ impl Mirror {
         let pool: Vec<Sender<FetchJob>> = (0..workers.max(1))
             .map(|i| {
                 let (tx, rx) = channel::<FetchJob>();
-                let me = self.clone();
+                // Weak: the pool must not keep the mirror (and its redb lock)
+                // alive after the mount dropped it.
+                let me = Arc::downgrade(self);
                 std::thread::Builder::new()
                     .name(format!("canvas-fuse-mirror-fetch-{i}"))
                     .spawn(move || {
                         while let Ok(job) = rx.recv() {
-                            me.run_fetch(job);
+                            let Some(m) = me.upgrade() else {
+                                break;
+                            };
+                            m.run_fetch(job);
                         }
                     })
                     .expect("spawning mirror fetch worker");
@@ -748,7 +749,10 @@ impl Mirror {
         match result {
             Ok(got) => {
                 for w in waiters {
-                    match self.cache.pread(&got, w.offset.max(0) as u64, w.size as usize) {
+                    match self
+                        .cache
+                        .pread(&got, w.offset.max(0) as u64, w.size as usize)
+                    {
                         Ok(bytes) => w.reply.data(&bytes),
                         Err(_) => w.reply.error(libc::EIO),
                     }
@@ -836,7 +840,12 @@ impl Mirror {
             head: self.store.number(HEAD_KEY),
             pending: jobs.len() as u64,
             failed: jobs.iter().filter(|j| j.attempts > 0).count() as u64,
-            conflicts: self.store.conflicts().iter().filter(|c| !c.resolved).count() as u64,
+            conflicts: self
+                .store
+                .conflicts()
+                .iter()
+                .filter(|c| !c.resolved)
+                .count() as u64,
             skipped: rt.skipped.len() as u64,
             pinned: self.pins.read().clone(),
             cache_used: self.cache.used(),
@@ -974,7 +983,8 @@ impl Mirror {
     /// One pass: catch up, reconcile, drain, materialize, evict, report.
     /// Public so tests drive it without a thread.
     pub fn cycle(&self, full: bool) {
-        if self.rt.lock().state == SyncState::Paused && !full {
+        let before = self.rt.lock().state;
+        if before == SyncState::Paused && !full {
             return;
         }
         self.set_state(SyncState::Syncing);
@@ -989,7 +999,13 @@ impl Mirror {
                 let msg = e.to_string();
                 match &e {
                     HubError::Offline(_) => {
-                        log::info!("mirror: hub unreachable, going offline ({msg})");
+                        // Loud once, on the way down; every wake while
+                        // offline would otherwise repeat it.
+                        if before != SyncState::Offline {
+                            log::info!("mirror: hub unreachable, going offline ({msg})");
+                        } else {
+                            log::debug!("mirror: still offline ({msg})");
+                        }
                         self.set_error(Some(msg));
                         self.set_state(SyncState::Offline);
                     }
@@ -1152,7 +1168,10 @@ impl Mirror {
         };
         let base = self.store.base(from);
         let clean = entry.state == EntryState::Clean
-            && base.as_ref().map(|b| b.sha256 == entry.sha256).unwrap_or(false);
+            && base
+                .as_ref()
+                .map(|b| b.sha256 == entry.sha256)
+                .unwrap_or(false);
         if !clean || self.is_open_for_write(from) {
             let _ = self.store.remove_base(from);
             if entry.state == EntryState::Dirty && !self.is_ignored(from) {
@@ -1206,7 +1225,11 @@ impl Mirror {
             base.as_ref().map(|b| b.sha256.as_str()),
             remote.map(|r| r.sha256.as_str()),
         );
-        log::trace!("reconcile {key}: L={local:?} B={:?} R={:?} → {action:?}", base.as_ref().map(|b| &b.sha256), remote.map(|r| &r.sha256));
+        log::trace!(
+            "reconcile {key}: L={local:?} B={:?} R={:?} → {action:?}",
+            base.as_ref().map(|b| &b.sha256),
+            remote.map(|r| &r.sha256)
+        );
         match action {
             Action::Nothing => {}
             Action::Push { if_match } => {
@@ -1257,29 +1280,27 @@ impl Mirror {
                 self.view_remove(key);
                 log::info!("{key}: deleted on the hub; local copy kept in the mirror trash");
             }
-            Action::Adopt => {
-                match entry {
-                    Some(mut e) => {
-                        let _ = self.store.put_base(
-                            key,
-                            &Base {
-                                sha256: e.sha256.clone(),
-                                size: e.size,
-                                mtime: remote.map(|r| r.mtime).unwrap_or(e.mtime),
-                                remote_seq: seq,
-                            },
-                        );
-                        e.state = EntryState::Clean;
-                        let _ = self.store.put_entry(key, &e);
-                        let _ = self.store.remove_jobs_for(key);
-                    }
-                    None => {
-                        let _ = self.store.remove_entry(key);
-                        let _ = self.store.remove_base(key);
-                        let _ = self.store.remove_jobs_for(key);
-                    }
+            Action::Adopt => match entry {
+                Some(mut e) => {
+                    let _ = self.store.put_base(
+                        key,
+                        &Base {
+                            sha256: e.sha256.clone(),
+                            size: e.size,
+                            mtime: remote.map(|r| r.mtime).unwrap_or(e.mtime),
+                            remote_seq: seq,
+                        },
+                    );
+                    e.state = EntryState::Clean;
+                    let _ = self.store.put_entry(key, &e);
+                    let _ = self.store.remove_jobs_for(key);
                 }
-            }
+                None => {
+                    let _ = self.store.remove_entry(key);
+                    let _ = self.store.remove_base(key);
+                    let _ = self.store.remove_jobs_for(key);
+                }
+            },
             Action::Conflict { remote: r } => {
                 let Some(e) = entry else {
                     return Ok(());
@@ -1300,10 +1321,8 @@ impl Mirror {
         seq: u64,
         entry: Option<&Entry>,
     ) -> Result<(), HubError> {
-        let want_bytes = self.is_pinned(key)
-            || entry
-                .map(|e| self.cache.has(&e.sha256))
-                .unwrap_or(false);
+        let want_bytes =
+            self.is_pinned(key) || entry.map(|e| self.cache.has(&e.sha256)).unwrap_or(false);
         let mut sha = r.sha256.clone();
         if want_bytes && !self.cache.has(&sha) {
             match self.cache.fetch(&self.hub, key, &sha) {
@@ -1319,7 +1338,10 @@ impl Mirror {
         let size = if sha == r.sha256 {
             r.size
         } else {
-            self.store.cache_meta(&sha).map(|m| m.size).unwrap_or(r.size)
+            self.store
+                .cache_meta(&sha)
+                .map(|m| m.size)
+                .unwrap_or(r.size)
         };
         let new_entry = Entry {
             sha256: sha.clone(),
@@ -1413,7 +1435,12 @@ impl Mirror {
             let wanted = match e.state {
                 EntryState::Clean => continue,
                 EntryState::Dirty => {
-                    if self.store.conflict(&key).map(|c| !c.uploaded).unwrap_or(false) {
+                    if self
+                        .store
+                        .conflict(&key)
+                        .map(|c| !c.uploaded)
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     JobKind::Push { key: key.clone() }
@@ -1430,19 +1457,39 @@ impl Mirror {
     /// same keys (a push of `b` must not overtake the rename `a → b`), and
     /// the first offline answer stops the pass.
     fn drain_jobs(&self) -> Result<(), HubError> {
-        let now = super::now_ms();
-        let mut blocked: HashSet<String> = HashSet::new();
-        for job in self.store.jobs() {
-            if job.kind.keys().iter().any(|k| blocked.contains(*k)) {
-                continue;
+        // A job can queue another (a 412 turns a push into a conflict
+        // upload); keep going until a pass runs nothing.
+        for _round in 0..8 {
+            let now = super::now_ms();
+            let mut blocked: HashSet<String> = HashSet::new();
+            let mut ran = false;
+            let jobs = self.store.jobs();
+            if jobs.is_empty() {
+                break;
             }
-            if job.not_before > now {
-                for k in job.kind.keys() {
-                    blocked.insert(k.to_string());
+            for job in jobs {
+                if job.kind.keys().iter().any(|k| blocked.contains(*k)) {
+                    continue;
                 }
-                continue;
+                if job.not_before > now {
+                    for k in job.kind.keys() {
+                        blocked.insert(k.to_string());
+                    }
+                    continue;
+                }
+                ran = true;
+                self.run_one(&job, &mut blocked)?;
             }
-            match self.run_job(&job) {
+            if !ran {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_one(&self, job: &Job, blocked: &mut HashSet<String>) -> Result<(), HubError> {
+        {
+            match self.run_job(job) {
                 Ok(()) => {
                     let _ = self.store.remove_job(job.seq);
                     self.write_status(false);
@@ -1507,7 +1554,10 @@ impl Mirror {
         }
         let path = self.cache.path_for(&entry.sha256);
         if !path.is_file() {
-            log::error!("{key}: dirty but its bytes ({}) are not in the cache", entry.sha256);
+            log::error!(
+                "{key}: dirty but its bytes ({}) are not in the cache",
+                entry.sha256
+            );
             return Err(HubError::Refused {
                 status: 0,
                 code: Some("BYTES_MISSING".into()),
@@ -1529,7 +1579,11 @@ impl Mirror {
                 } else {
                     res.sha256.clone()
                 };
-                let mtime = if res.mtime > 0 { res.mtime } else { entry.mtime };
+                let mtime = if res.mtime > 0 {
+                    res.mtime
+                } else {
+                    entry.mtime
+                };
                 let _ = self.store.put_base(
                     key,
                     &Base {
@@ -1601,9 +1655,13 @@ impl Mirror {
                     if self.cache.has(&e.sha256) {
                         e.state = EntryState::Dirty;
                         let _ = self.store.put_entry(to, &e);
-                        self.ensure_job(JobKind::Push { key: to.to_string() });
+                        self.ensure_job(JobKind::Push {
+                            key: to.to_string(),
+                        });
                     } else {
-                        log::warn!("{to}: source vanished on the hub and bytes are not cached; dropping");
+                        log::warn!(
+                            "{to}: source vanished on the hub and bytes are not cached; dropping"
+                        );
                         let _ = self.store.remove_entry(to);
                         self.view_remove(to);
                     }
@@ -1626,7 +1684,9 @@ impl Mirror {
                 if let Some(mut e) = self.store.entry(to) {
                     e.state = EntryState::Dirty;
                     let _ = self.store.put_entry(to, &e);
-                    self.ensure_job(JobKind::Push { key: to.to_string() });
+                    self.ensure_job(JobKind::Push {
+                        key: to.to_string(),
+                    });
                 }
                 self.reconcile_key(from, current.as_ref(), 0)
             }

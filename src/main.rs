@@ -1,8 +1,9 @@
 use anyhow::{Context as _, Result};
+use canvas_fuse::mirror::{control, ConflictMode, DeleteMode, MirrorOptions};
 use canvas_fuse::{api::ApiClient, config, runtime, MountOptions};
-use clap::{Args, Parser, Subcommand};
-use serde_json::json;
-use std::path::PathBuf;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 /// Mount Canvas context views as live folders.
 ///
@@ -44,6 +45,9 @@ impl ConnectArgs {
     }
 }
 
+// `Mount` carries every flag; the other variants a path. The enum is built
+// once per process, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Mount a workspace (or one of its context views) at a directory
@@ -116,6 +120,68 @@ enum Command {
         /// In-memory cache budget for file content, in MB
         #[arg(long, default_value_t = 256)]
         blob_cache_mb: usize,
+
+        /// Serve Home/ as an offline-capable device mirror of the workspace
+        /// drive (persistent tree, on-disk content cache, write-back with
+        /// preconditions, conflict handling). Workspace mounts only.
+        #[arg(long, requires = "workspace")]
+        mirror: bool,
+
+        /// Mirror: always keep these paths/globs materialized locally
+        /// (repeatable; persisted — `canvas-fuse pin` manages them later)
+        #[arg(long = "pin", value_name = "GLOB", requires = "mirror")]
+        pins: Vec<String>,
+
+        /// Mirror: on-disk content cache budget in MB (pinned files never
+        /// count against eviction)
+        #[arg(long, default_value_t = 4096, requires = "mirror")]
+        cache_budget_mb: u64,
+
+        /// Mirror: what to do when a file changed here AND on the hub
+        #[arg(long, value_enum, default_value_t = ConflictsArg::Prompt, requires = "mirror")]
+        conflicts: ConflictsArg,
+
+        /// Mirror: whether `rm` in the mount deletes on the hub
+        #[arg(long, value_enum, default_value_t = DeletesArg::Propagate, requires = "mirror")]
+        deletes: DeletesArg,
+
+        /// Mirror: never upload keys matching this glob (repeatable; the
+        /// hub's own exclusions and dotfiles are always ignored)
+        #[arg(long = "ignore", value_name = "GLOB", requires = "mirror")]
+        ignore: Vec<String>,
+
+        /// Mirror: change-feed poll interval in seconds (socket nudges
+        /// arrive sooner)
+        #[arg(long, default_value_t = 30, requires = "mirror")]
+        poll: u64,
+    },
+
+    /// Mirror: run a full reconcile now and wait for it
+    Sync {
+        #[command(subcommand)]
+        what: SyncCommand,
+    },
+
+    /// Mirror: manage pinned paths (always materialized, never evicted)
+    Pin {
+        #[command(subcommand)]
+        what: PinCommand,
+    },
+
+    /// Mirror: list conflicts recorded on this device
+    Conflicts {
+        /// Mountpoint of a --mirror mount
+        mountpoint: PathBuf,
+
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Mirror: local copies of files the hub deleted (kept 30 days)
+    Trash {
+        #[command(subcommand)]
+        what: TrashCommand,
     },
 
     /// Unmount a canvas mount and stop its daemon
@@ -153,6 +219,55 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum SyncCommand {
+    /// Reconcile against the hub now (full listing pass) and drain the queue
+    Now {
+        /// Mountpoint of a --mirror mount
+        mountpoint: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PinCommand {
+    /// Pin a path or glob (`Docs/`, `*.md`, `Photos/2026*`)
+    Add { mountpoint: PathBuf, glob: String },
+    /// Unpin
+    Rm { mountpoint: PathBuf, glob: String },
+    /// Show the pinned globs
+    List { mountpoint: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum TrashCommand {
+    /// What the hub deleted that this device still holds
+    List {
+        mountpoint: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put a trashed key back (uploads it to the hub as a new file)
+    Restore { mountpoint: PathBuf, key: String },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum ConflictsArg {
+    /// Upload ours to the hub's conflict inbox, keep the hub's version at
+    /// the name; resolve in the web UI or CLI
+    Prompt,
+    /// Dropbox style: ours is saved next to it as `name (conflict from
+    /// <device> <date>).ext`
+    Rename,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum DeletesArg {
+    /// `rm` deletes on the hub (with a precondition; an edit there wins)
+    Propagate,
+    /// `rm` only drops the local copy; the hub keeps the file
+    Keep,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -170,6 +285,13 @@ fn main() -> Result<()> {
             resync,
             data_dir,
             blob_cache_mb,
+            mirror,
+            pins,
+            cache_budget_mb,
+            conflicts,
+            deletes,
+            ignore,
+            poll,
         } => {
             // `mount <selector> <mountpoint>` vs `mount <mountpoint>`: clap
             // cannot express "optional first positional", so the pair is
@@ -181,6 +303,20 @@ fn main() -> Result<()> {
                 (None, None) => anyhow::bail!("a mountpoint is required"),
             };
             let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
+            let mirror_opts = mirror.then(|| MirrorOptions {
+                pins,
+                cache_budget_bytes: cache_budget_mb * 1024 * 1024,
+                conflicts: match conflicts {
+                    ConflictsArg::Prompt => ConflictMode::Prompt,
+                    ConflictsArg::Rename => ConflictMode::Rename,
+                },
+                deletes: match deletes {
+                    DeletesArg::Propagate => DeleteMode::Propagate,
+                    DeletesArg::Keep => DeleteMode::Keep,
+                },
+                ignore,
+                poll_secs: poll,
+            });
             cmd_mount(
                 mountpoint,
                 connect,
@@ -193,8 +329,22 @@ fn main() -> Result<()> {
                 resync,
                 data_dir,
                 blob_cache_mb,
+                mirror_opts,
             )
         }
+        Command::Sync {
+            what: SyncCommand::Now { mountpoint },
+        } => cmd_sync_now(&mountpoint),
+        Command::Pin { what } => match what {
+            PinCommand::Add { mountpoint, glob } => cmd_pin(&mountpoint, "add", Some(&glob)),
+            PinCommand::Rm { mountpoint, glob } => cmd_pin(&mountpoint, "rm", Some(&glob)),
+            PinCommand::List { mountpoint } => cmd_pin(&mountpoint, "list", None),
+        },
+        Command::Conflicts { mountpoint, json } => cmd_conflicts(&mountpoint, json),
+        Command::Trash { what } => match what {
+            TrashCommand::List { mountpoint, json } => cmd_trash_list(&mountpoint, json),
+            TrashCommand::Restore { mountpoint, key } => cmd_trash_restore(&mountpoint, &key),
+        },
         Command::Unmount { mountpoint } => cmd_unmount(mountpoint),
         Command::Status { json } => cmd_status(json),
         Command::Ping { connect, json } => cmd_ping(connect, json),
@@ -285,6 +435,7 @@ fn cmd_mount(
     resync: u64,
     data_dir: Option<PathBuf>,
     blob_cache_mb: usize,
+    mirror: Option<MirrorOptions>,
 ) -> Result<()> {
     canvas_fuse::nudge::set_nudge_file(&nudge_name);
     let endpoint = connect.endpoint()?;
@@ -293,6 +444,9 @@ fn cmd_mount(
     // mounts the CONTEXT view, not the workspace tree view — so the workspace
     // only selects the mount shape when no context was asked for.
     let workspace_mount = contexts.is_empty().then(|| workspace.clone()).flatten();
+    if mirror.is_some() && workspace_mount.is_none() {
+        anyhow::bail!("--mirror applies to workspace mounts (`-w <workspace>`), not context views");
+    }
     let context_root = if contexts.len() == 1 {
         Some(contexts[0].clone())
     } else {
@@ -388,6 +542,7 @@ fn cmd_mount(
         workspace: workspace_mount.clone(),
         context_workspace: workspace.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
+        mirror: mirror.clone(),
     })?;
 
     runtime::write_state(&runtime::MountState {
@@ -401,6 +556,8 @@ fn cmd_mount(
             Some(contexts)
         },
         log_file,
+        workspace: workspace_mount,
+        mirror: mirror.is_some(),
     })?;
 
     let (sig_tx, sig_rx) = std::sync::mpsc::channel::<()>();
@@ -488,7 +645,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
         let report: Vec<_> = entries
             .iter()
             .map(|(s, alive, mounted)| {
-                json!({
+                let mut row = json!({
                     "mountpoint": s.mountpoint,
                     "server": s.server,
                     "pid": s.pid,
@@ -497,8 +654,17 @@ fn cmd_status(as_json: bool) -> Result<()> {
                     "status": status_word(*alive, *mounted).trim(),
                     "startedAt": s.started_at,
                     "contexts": s.contexts,
+                    "workspace": s.workspace,
                     "logFile": s.log_file,
-                })
+                });
+                // The daemon's own account of the mirror, written to a file
+                // next to the state (this process cannot open its redb).
+                if s.mirror {
+                    row["mirror"] = runtime::read_mirror_status(&s.mountpoint)
+                        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null);
+                }
+                row
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -522,7 +688,186 @@ fn cmd_status(as_json: bool) -> Result<()> {
                 .map(|c| format!("  contexts: {}", c.join(",")))
                 .unwrap_or_default()
         );
+        if s.mirror {
+            match runtime::read_mirror_status(&s.mountpoint) {
+                Some(m) => println!(
+                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  cache {}/{} MB  pins {}{}",
+                    m.state,
+                    m.cursor.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                    m.head.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                    m.pending,
+                    m.failed,
+                    m.conflicts,
+                    m.skipped,
+                    m.cache_used / (1024 * 1024),
+                    m.cache_budget / (1024 * 1024),
+                    if m.pinned.is_empty() { "-".to_string() } else { m.pinned.join(",") },
+                    m.last_error.as_ref().map(|e| format!("  error: {e}")).unwrap_or_default(),
+                ),
+                None => println!("          mirror: (no status yet)"),
+            }
+        }
     }
+    Ok(())
+}
+
+// ── mirror subcommands (through the daemon's control socket) ─────────────────
+
+fn mirror_socket(mountpoint: &Path) -> Result<PathBuf> {
+    let state = runtime::resolve_mount(mountpoint)
+        .with_context(|| format!("{} is not a known canvas mount", mountpoint.display()))?;
+    if !state.mirror {
+        anyhow::bail!(
+            "{} is not a --mirror mount (remount with --mirror)",
+            state.mountpoint.display()
+        );
+    }
+    if !runtime::pid_alive(state.pid) {
+        anyhow::bail!(
+            "the daemon for {} (pid {}) is not running",
+            state.mountpoint.display(),
+            state.pid
+        );
+    }
+    Ok(runtime::control_socket_for(&state.mountpoint))
+}
+
+fn cmd_sync_now(mountpoint: &Path) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({ "cmd": "sync" }))?;
+    let m = resp.get("mirror").cloned().unwrap_or(Value::Null);
+    let finished = resp
+        .get("finished")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "{}: state {}, cursor {}, pending {}, conflicts {}{}",
+        if finished {
+            "synced"
+        } else {
+            "sync still running"
+        },
+        m.get("state").and_then(Value::as_str).unwrap_or("?"),
+        m.get("cursor")
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into()),
+        m.get("pending").and_then(Value::as_u64).unwrap_or(0),
+        m.get("conflicts").and_then(Value::as_u64).unwrap_or(0),
+        m.get("lastError")
+            .and_then(Value::as_str)
+            .map(|e| format!(" (last error: {e})"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_pin(mountpoint: &Path, op: &str, glob: Option<&str>) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({ "cmd": "pin", "op": op, "glob": glob }))?;
+    let pins = resp
+        .get("pins")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if op == "rm" && resp.get("removed").and_then(Value::as_bool) == Some(false) {
+        eprintln!("{} was not pinned", glob.unwrap_or(""));
+    }
+    if pins.is_empty() {
+        println!("no pins");
+    }
+    for p in pins {
+        println!("{}", p.as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn cmd_conflicts(mountpoint: &Path, as_json: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({ "cmd": "conflicts" }))?;
+    let list = resp
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.is_empty() {
+        println!("no conflicts");
+        return Ok(());
+    }
+    for c in list {
+        let ts = c.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        let when = chrono::DateTime::<chrono::Utc>::from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(ts),
+        )
+        .to_rfc3339();
+        println!(
+            "{}  {}  ours {}  hub {}  {}{}",
+            when,
+            c.get("key").and_then(Value::as_str).unwrap_or("?"),
+            c.get("local_sha256")
+                .and_then(Value::as_str)
+                .map(|s| &s[..s.len().min(12)])
+                .unwrap_or("?"),
+            c.get("hub_sha256")
+                .and_then(Value::as_str)
+                .map(|s| &s[..s.len().min(12)])
+                .unwrap_or("?"),
+            if c.get("uploaded").and_then(Value::as_bool).unwrap_or(false) {
+                "uploaded"
+            } else {
+                "upload pending"
+            },
+            c.get("copy_key")
+                .and_then(Value::as_str)
+                .map(|k| format!(" → {k}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_trash_list(mountpoint: &Path, as_json: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({ "cmd": "trash", "op": "list" }))?;
+    let list = resp
+        .get("trash")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.is_empty() {
+        println!("mirror trash is empty");
+        return Ok(());
+    }
+    for t in list {
+        println!(
+            "{}  {}  {} bytes{}",
+            t.get("deletedAt").and_then(Value::as_str).unwrap_or("?"),
+            t.get("key").and_then(Value::as_str).unwrap_or("?"),
+            t.get("size").and_then(Value::as_u64).unwrap_or(0),
+            if t.get("cached").and_then(Value::as_bool).unwrap_or(false) {
+                ""
+            } else {
+                "  (bytes evicted; cannot restore)"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_trash_restore(mountpoint: &Path, key: &str) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    control::request(
+        &sock,
+        &json!({ "cmd": "trash", "op": "restore", "key": key }),
+    )?;
+    println!("restored {key}; it will be pushed to the hub");
     Ok(())
 }
 

@@ -1399,7 +1399,11 @@ impl Tree {
         let mut cur = node.parent;
         let mut cur_key = crate::mirror::parent_key(key).to_string();
         while cur != HOME_INO {
-            let empty = self.children.get(&cur).map(|c| c.is_empty()).unwrap_or(true);
+            let empty = self
+                .children
+                .get(&cur)
+                .map(|c| c.is_empty())
+                .unwrap_or(true);
             if !empty || keep_dirs.contains(&cur_key) {
                 break;
             }
@@ -1433,11 +1437,16 @@ impl Tree {
             if existing != ino {
                 self.remove_subtree(existing, &mut inv);
                 self.remove_node(existing);
-                inv.removed.push((dst_parent, existing, dst_name.to_string()));
+                inv.removed
+                    .push((dst_parent, existing, dst_name.to_string()));
             }
         }
         let old_parent = self.nodes.get(&ino).map(|n| n.parent).unwrap_or(HOME_INO);
-        let old_name = self.nodes.get(&ino).map(|n| n.name.clone()).unwrap_or_default();
+        let old_name = self
+            .nodes
+            .get(&ino)
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
         self.rename_home(ino, dst_parent, dst_name);
         inv.removed.push((old_parent, ino, old_name));
         inv.dirty_dirs.push(old_parent);
@@ -1505,7 +1514,9 @@ impl Tree {
                 .get(&ino)
                 .map(|c| {
                     c.iter()
-                        .filter_map(|(n, i)| self.nodes.get(i).map(|node| (n.clone(), *i, node.is_dir())))
+                        .filter_map(|(n, i)| {
+                            self.nodes.get(i).map(|node| (n.clone(), *i, node.is_dir()))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();

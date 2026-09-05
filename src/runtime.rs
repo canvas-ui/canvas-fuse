@@ -13,6 +13,13 @@ pub struct MountState {
     pub contexts: Option<Vec<String>>,
     #[serde(default)]
     pub log_file: Option<PathBuf>,
+    /// The workspace a `-w` mount roots (None for context mounts).
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// `--mirror`: Home is a device mirror; `status` reads the daemon's
+    /// status file and the control socket exists.
+    #[serde(default)]
+    pub mirror: bool,
 }
 
 pub fn state_dir() -> PathBuf {
@@ -99,6 +106,48 @@ fn state_file_for(mountpoint: &Path) -> PathBuf {
         .join(format!("{name}.{hash:08x}.json"))
 }
 
+/// The daemon's throttled mirror status, next to the state file. Written by
+/// the daemon (the only process that can open its redb), read by `status`.
+pub fn status_file_for(mountpoint: &Path) -> PathBuf {
+    state_file_for(mountpoint).with_extension("status.json")
+}
+
+/// The mirror control socket (see `mirror::control`), next to the state
+/// file but named by the hash alone: a unix socket path must fit in
+/// `sockaddr_un` (108 bytes), and the readable prefix would not.
+pub fn control_socket_for(mountpoint: &Path) -> PathBuf {
+    let raw = mountpoint.to_string_lossy();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in raw.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    state_dir().join("mounts").join(format!("{hash:016x}.sock"))
+}
+
+pub fn read_mirror_status(mountpoint: &Path) -> Option<crate::mirror::sync::MirrorStatus> {
+    let raw = std::fs::read(status_file_for(mountpoint)).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Find the mount a CLI argument names: the exact mountpoint, or the
+/// directory the user passed to `mount` (the kernel mount is one level
+/// below it, at `<mountpoint>/<workspace>`), when that is unambiguous.
+pub fn resolve_mount(arg: &Path) -> Option<MountState> {
+    let canon = arg.canonicalize().unwrap_or_else(|_| arg.to_path_buf());
+    if let Some(s) = read_state(&canon) {
+        return Some(s);
+    }
+    let below: Vec<MountState> = list_states()
+        .into_iter()
+        .filter(|s| s.mountpoint.parent() == Some(canon.as_path()))
+        .collect();
+    if below.len() == 1 {
+        return below.into_iter().next();
+    }
+    None
+}
+
 pub fn write_state(state: &MountState) -> Result<PathBuf> {
     let path = state_file_for(&state.mountpoint);
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -108,6 +157,7 @@ pub fn write_state(state: &MountState) -> Result<PathBuf> {
 
 pub fn remove_state(mountpoint: &Path) {
     let _ = std::fs::remove_file(state_file_for(mountpoint));
+    let _ = std::fs::remove_file(status_file_for(mountpoint));
 }
 
 pub fn read_state(mountpoint: &Path) -> Option<MountState> {

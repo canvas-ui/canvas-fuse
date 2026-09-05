@@ -1,5 +1,6 @@
 use crate::api::ApiClient;
 use crate::blobs::{reply_slice, BlobStore};
+use crate::mirror::sync::Mirror;
 use crate::nudge::{nudge_file, NUDGE_INO};
 use crate::state::{NodeContent, Tree};
 use crate::writes::WriteStore;
@@ -24,6 +25,9 @@ pub struct CanvasFs {
     /// demand rather than reconciled into the tree by the worker, so the
     /// filesystem itself needs the client.
     api: Arc<ApiClient>,
+    /// Mirror mode: Home reads come from the content cache (or a fetch off
+    /// this thread), never from the server inline.
+    mirror: Option<Arc<Mirror>>,
     uid: u32,
     gid: u32,
 }
@@ -34,11 +38,13 @@ impl CanvasFs {
         blobs: Arc<BlobStore>,
         writes: Arc<WriteStore>,
         api: Arc<ApiClient>,
+        mirror: Option<Arc<Mirror>>,
     ) -> Self {
         Self {
             tree,
             blobs,
             api,
+            mirror,
             writes,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -119,6 +125,10 @@ impl CanvasFs {
     /// loop for one REST call — the same trade the write path already makes on
     /// close-time flush.
     fn ensure_home_loaded(&self, ino: u64) {
+        // Mirror mode: the store IS the listing; nothing is fetched on look.
+        if self.mirror.is_some() {
+            return;
+        }
         let Some((path, loaded)) = self.tree.read().home_path(ino) else {
             return;
         };
@@ -495,6 +505,12 @@ impl Filesystem for CanvasFs {
             } => {
                 if offset as u64 >= file_size {
                     reply.data(&[]);
+                    return;
+                }
+                if let Some(m) = &self.mirror {
+                    // Cache pread, or a fetch on the pool; never the network
+                    // on this thread.
+                    m.read(path.trim_matches('/'), offset, size, reply);
                     return;
                 }
                 let start = offset as u64;

@@ -90,7 +90,11 @@ fn handle(mut stream: UnixStream, mirror: &Mirror) {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(stream, "{}", json!({ "ok": false, "error": format!("bad request: {e}") }));
+            let _ = writeln!(
+                stream,
+                "{}",
+                json!({ "ok": false, "error": format!("bad request: {e}") })
+            );
             return;
         }
     };

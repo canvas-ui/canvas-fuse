@@ -44,6 +44,9 @@ pub struct MountOptions {
     /// Emit inotify nudges (create+unlink of the virtual `.canvas-tmp`) so
     /// directory watchers see remote-driven view changes. See nudge.rs.
     pub enable_nudge: bool,
+    /// `--mirror`: serve Home/ from a local mirror of the hub's
+    /// `workspace:home` backend (workspace mounts only). See mirror/mod.rs.
+    pub mirror: Option<mirror::MirrorOptions>,
 }
 
 /// A live mount. Dropping it (or calling unmount) tears everything down:
@@ -53,6 +56,11 @@ pub struct MountHandle {
     job_tx: Sender<worker::Job>,
     stop: Arc<AtomicBool>,
     pub mountpoint: PathBuf,
+    /// Mirror mode: the engine's inbox and the control socket (its file is
+    /// removed on drop).
+    mirror_tx: Option<Sender<mirror::sync::EngineMsg>>,
+    control: Option<mirror::control::Control>,
+    pub mirror: Option<Arc<mirror::sync::Mirror>>,
 }
 
 impl MountHandle {
@@ -68,6 +76,13 @@ impl MountHandle {
         // Signals the ws supervisor and resync threads to stop; the supervisor
         // disconnects its ws client on seeing this.
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(tx) = self.mirror_tx.take() {
+            let _ = tx.send(mirror::sync::EngineMsg::Stop);
+        }
+        if let Some(m) = &self.mirror {
+            m.write_status(true);
+        }
+        self.control.take();
         if let Some(session) = self.session.take() {
             drop(session); // joins the FUSE thread and unmounts
         }
@@ -99,10 +114,48 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     // so the tree is built in the right mode. Live updates ride the
     // `workspace:<id>` ws channel (every tree/document change is forwarded there).
     let workspace_mode = opts.workspace.is_some();
+    let mirror_mode = workspace_mode && opts.mirror.is_some();
+    // A mirror must mount without the hub: the workspace id it learned on
+    // its first online mount is kept in the data dir for that.
+    let ws_id_file = opts.data_dir.join("workspace.json");
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
-        let ws = api
-            .get_workspace(ws_name)
-            .with_context(|| format!("resolving workspace {ws_name}"))?;
+        let ws = match api.get_workspace(ws_name) {
+            Ok(ws) => {
+                if mirror_mode {
+                    let _ = std::fs::create_dir_all(&opts.data_dir);
+                    let _ = std::fs::write(
+                        &ws_id_file,
+                        serde_json::json!({ "id": ws.id, "name": ws.name }).to_string(),
+                    );
+                }
+                ws
+            }
+            Err(e) if mirror_mode => {
+                let cached = std::fs::read_to_string(&ws_id_file)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| {
+                        Some(api::WorkspaceInfo {
+                            id: v.get("id")?.as_str()?.to_string(),
+                            name: v.get("name")?.as_str()?.to_string(),
+                        })
+                    });
+                match cached {
+                    Some(ws) => {
+                        log::warn!(
+                            "workspace {ws_name}: hub unreachable ({e:#}); mounting the mirror offline"
+                        );
+                        ws
+                    }
+                    None => {
+                        return Err(e).with_context(|| {
+                            format!("resolving workspace {ws_name} (no offline record yet)")
+                        })
+                    }
+                }
+            }
+            Err(e) => return Err(e).with_context(|| format!("resolving workspace {ws_name}")),
+        };
         state::Tree::workspace_rooted(ws.id, ws.name)
     } else {
         match &opts.context_root {
@@ -131,6 +184,40 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         _ => None,
     };
 
+    // Mirror: open the store and build Home from it before the mount exists,
+    // so the first readdir is served locally whether or not the hub is up.
+    // Bind the id first: a `tree.read()` inside the match scrutinee would
+    // live for the whole match and deadlock the `tree.write()` below.
+    let mirror_ws_id = tree.read().ws_id();
+    let mirror: Option<Arc<mirror::sync::Mirror>> = match (&opts.mirror, mirror_ws_id) {
+        (Some(mopts), Some(ws_id)) => {
+            let device = mirror::DeviceIdentity::resolve();
+            let m = mirror::sync::Mirror::open(mirror::sync::MirrorConfig {
+                data_dir: opts.data_dir.clone(),
+                server: opts.server.clone(),
+                token: opts.token.clone(),
+                workspace_id: ws_id,
+                backend: mirror::DEFAULT_BACKEND.to_string(),
+                opts: mopts.clone(),
+                device,
+                mountpoint: opts.mountpoint.clone(),
+                status_path: Some(runtime::status_file_for(&opts.mountpoint)),
+            })?;
+            {
+                let mut t = tree.write();
+                t.set_home_mirrored(true);
+                m.snapshot_into(&mut t);
+            }
+            log::info!(
+                "mirror: {} entries from the store, device {}",
+                m.store.entry_count(),
+                m.device.id
+            );
+            Some(m)
+        }
+        _ => None,
+    };
+
     // Populate before mounting so the first readdir is already correct.
     // Server being down is not fatal: the resync loop recovers.
     let bootstrap = worker::Worker {
@@ -145,6 +232,8 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         // No nudging before the mount exists (the syscalls would hit the
         // underlying directory).
         nudger: None,
+        mirror_invalidations: None,
+        mirror: None,
     };
     bootstrap.refresh_all();
 
@@ -153,8 +242,15 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         api.clone(),
         tree.clone(),
         names.clone(),
+        mirror.clone(),
     ));
-    let fs = fsimpl::CanvasFs::new(tree.clone(), blobs, write_store.clone(), api.clone());
+    let fs = fsimpl::CanvasFs::new(
+        tree.clone(),
+        blobs,
+        write_store.clone(),
+        api.clone(),
+        mirror.clone(),
+    );
     let session = fuser::spawn_mount2(
         fs,
         &opts.mountpoint,
@@ -196,6 +292,15 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         None
     };
 
+    let mirror_invalidations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    if let Some(m) = &mirror {
+        m.attach_view(mirror::sync::ViewLink {
+            tree: tree.clone(),
+            refresh_lock: write_store.sync_handle(),
+            invalidations: mirror_invalidations.clone(),
+            job_tx: job_tx.clone(),
+        });
+    }
     let worker = worker::Worker {
         api,
         tree: tree.clone(),
@@ -206,6 +311,8 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         context_workspace_id,
         refresh_lock: Some(write_store.sync_handle()),
         nudger,
+        mirror_invalidations: Some(mirror_invalidations),
+        mirror: mirror.clone(),
     };
     std::thread::Builder::new()
         .name("canvas-fuse-worker".into())
@@ -241,10 +348,27 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
             }
         })?;
 
+    // Mirror engine + control socket, once everything they reach exists.
+    let (mirror_tx, control) = match &mirror {
+        Some(m) => {
+            let tx = m.spawn_engine(stop.clone())?;
+            let control = mirror::control::Control::spawn(
+                &runtime::control_socket_for(&opts.mountpoint),
+                m.clone(),
+                stop.clone(),
+            )?;
+            (Some(tx), Some(control))
+        }
+        None => (None, None),
+    };
+
     Ok(MountHandle {
         session: Some(session),
         job_tx,
         stop,
         mountpoint: opts.mountpoint,
+        mirror_tx,
+        control,
+        mirror,
     })
 }

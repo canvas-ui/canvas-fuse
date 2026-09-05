@@ -21,17 +21,25 @@ pub enum Action {
     Nothing,
     /// `PUT` the local bytes. `if_match` is B; None means the key must be
     /// free (`If-None-Match: *`).
-    Push { if_match: Option<String> },
+    Push {
+        if_match: Option<String>,
+    },
     /// `DELETE` with `If-Match: B`.
-    DeleteRemote { if_match: String },
+    DeleteRemote {
+        if_match: String,
+    },
     /// Fetch R into place; base := R.
-    Pull { sha256: String },
+    Pull {
+        sha256: String,
+    },
     /// The hub deleted it and we have no local change: local copy to trash.
     TrashLocal,
     /// Both sides ended up with the same bytes: base := L, no traffic.
     Adopt,
     /// Both changed, differently: upload L as a conflict, then pull R.
-    Conflict { remote: String },
+    Conflict {
+        remote: String,
+    },
 }
 
 pub fn decide(local: Option<&str>, base: Option<&str>, remote: Option<&str>) -> Action {
@@ -119,19 +127,9 @@ mod tests {
 
     #[test]
     fn row_pull_when_only_remote_changed() {
-        assert_eq!(
-            decide(A, A, B),
-            Action::Pull {
-                sha256: "b".into()
-            }
-        );
+        assert_eq!(decide(A, A, B), Action::Pull { sha256: "b".into() });
         // Brand new on the hub.
-        assert_eq!(
-            decide(X, X, A),
-            Action::Pull {
-                sha256: "a".into()
-            }
-        );
+        assert_eq!(decide(X, X, A), Action::Pull { sha256: "a".into() });
         // Hub deleted, we had not touched it: trash the local copy.
         assert_eq!(decide(A, A, X), Action::TrashLocal);
     }
@@ -147,30 +145,15 @@ mod tests {
 
     #[test]
     fn row_conflict_when_both_changed_differently() {
-        assert_eq!(
-            decide(B, A, C),
-            Action::Conflict {
-                remote: "c".into()
-            }
-        );
+        assert_eq!(decide(B, A, C), Action::Conflict { remote: "c".into() });
         // No base at all (two devices created the same key independently).
-        assert_eq!(
-            decide(A, X, B),
-            Action::Conflict {
-                remote: "b".into()
-            }
-        );
+        assert_eq!(decide(A, X, B), Action::Conflict { remote: "b".into() });
     }
 
     #[test]
     fn row_edit_beats_delete_both_ways() {
         // We deleted, hub edited: pull the hub's edit back.
-        assert_eq!(
-            decide(X, A, B),
-            Action::Pull {
-                sha256: "b".into()
-            }
-        );
+        assert_eq!(decide(X, A, B), Action::Pull { sha256: "b".into() });
         // Hub deleted, we edited: push as new.
         assert_eq!(decide(B, A, X), Action::Push { if_match: None });
     }

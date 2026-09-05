@@ -42,6 +42,7 @@ const RETIRED: [&str; 0] = [];
 
 pub const CURSOR_KEY: &str = "cursor";
 pub const HEAD_KEY: &str = "head";
+const JOB_SEQ_KEY: &str = "job_seq";
 pub const META_INSTANCE: &str = "instance_id";
 pub const META_LISTED: &str = "listed";
 
@@ -81,11 +82,18 @@ pub struct Base {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobKind {
     /// `PUT objects/<key>` with the current local bytes.
-    Push { key: String },
+    Push {
+        key: String,
+    },
     /// `DELETE objects/<key>` with `If-Match` = base.
-    Delete { key: String },
+    Delete {
+        key: String,
+    },
     /// `POST objects/rename`.
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     /// Upload our version of a key the hub changed too.
     Conflict {
         key: String,
@@ -94,8 +102,12 @@ pub enum JobKind {
     },
     /// Real directory on the hub (the objects protocol has no directories;
     /// this rides the older `/home/mkdir` route).
-    Mkdir { key: String },
-    Rmdir { key: String },
+    Mkdir {
+        key: String,
+    },
+    Rmdir {
+        key: String,
+    },
 }
 
 impl JobKind {
@@ -437,7 +449,13 @@ impl Store {
             for s in existing {
                 t.remove(s)?;
             }
-            seq = t.last()?.map(|(k, _)| k.value() + 1).unwrap_or(1);
+            // Monotonic, never reused: a job queued while another is being
+            // removed must not inherit its number (and be removed with it).
+            let mut counter = tx.open_table(CURSOR)?;
+            let next = counter.get(JOB_SEQ_KEY)?.map(|v| v.value()).unwrap_or(0) + 1;
+            counter.insert(JOB_SEQ_KEY, next)?;
+            drop(counter);
+            seq = next;
             let job = Job {
                 seq,
                 kind,

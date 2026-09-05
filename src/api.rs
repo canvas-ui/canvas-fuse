@@ -583,6 +583,33 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Rename a file on a path-addressed backend (`POST …/objects/rename`,
+    /// the sync protocol's route): same bytes, same document, new key. The
+    /// hub renames files only; a folder move is one call per file.
+    pub fn rename_object(
+        &self,
+        ws: &str,
+        backend: &str,
+        from: &str,
+        to: &str,
+        if_match: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "from": from, "to": to });
+        if let Some(m) = if_match {
+            body["ifMatch"] = Value::String(m.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &format!(
+                "/rest/v2/workspaces/{}/backends/file/{}/objects/rename",
+                encode_segment(ws),
+                encode_segment(backend)
+            ),
+            &body,
+        )?;
+        Ok(())
+    }
+
     /// Permanently delete documents that are in the trash. The one call that
     /// destroys — same as "delete from trash" in a file manager.
     pub fn empty_trash(&self, ws: &str, ids: &[u64]) -> Result<()> {

@@ -4,15 +4,15 @@
 //!
 //! The pieces, each a file here:
 //!
-//! - `store`     — the persistent Home tree, base ledger, job queue, pins,
-//!                 cache index, conflicts and trash (one redb, `mirror.redb`).
-//! - `cache`     — sha256-addressed content cache on disk with a byte budget.
-//! - `hub`       — the objects-protocol client (`docs/sync-protocol.md`).
-//! - `reconcile` — the pure three-way decision per key.
-//! - `sync`      — the engine thread: change feed, push/pull, conflicts,
-//!                 pins, eviction, status; plus the `Mirror` facade the FUSE
-//!                 layer talks to (local writes, reads, renames, deletes).
-//! - `control`   — the unix-socket control channel the CLI subcommands use.
+//! - `store`: the persistent Home tree, base ledger, job queue, pins, cache
+//!   index, conflicts and trash (one redb, `mirror.redb`).
+//! - `cache`: sha256-addressed content cache on disk with a byte budget.
+//! - `hub`: the objects-protocol client (`docs/sync-protocol.md`).
+//! - `reconcile`: the pure three-way decision per key.
+//! - `sync`: the engine thread (change feed, push/pull, conflicts, pins,
+//!   eviction, status) plus the `Mirror` facade the FUSE layer talks to
+//!   (local writes, reads, renames, deletes).
+//! - `control`: the unix-socket control channel the CLI subcommands use.
 //!
 //! Identity on the wire is the KEY (relative `/`-separated path, NFC) and the
 //! DIGEST of the bytes. Hub document ids are never stored — they are recycled
@@ -330,7 +330,11 @@ mod tests {
 
     #[test]
     fn ignore_rules_cover_dotfiles_and_globs() {
-        let rules = IgnoreRules::new(MIRROR_IGNORE_DEFAULTS.iter().chain(["**/node_modules/**"].iter()));
+        let rules = IgnoreRules::new(
+            MIRROR_IGNORE_DEFAULTS
+                .iter()
+                .chain(["**/node_modules/**"].iter()),
+        );
         assert!(rules.is_ignored(".git"));
         assert!(rules.is_ignored("a/.cache/x"));
         assert!(rules.is_ignored("proj/node_modules/x/y.js"));
@@ -340,7 +344,11 @@ mod tests {
 
     #[test]
     fn pins_match_subtrees_and_globs() {
-        let pins = vec!["Docs/".to_string(), "*.md".to_string(), "Photos/2026*".to_string()];
+        let pins = vec![
+            "Docs/".to_string(),
+            "*.md".to_string(),
+            "Photos/2026*".to_string(),
+        ];
         assert!(is_pinned(&pins, "Docs/a/b.txt"));
         assert!(is_pinned(&pins, "Docs"));
         assert!(is_pinned(&pins, "notes.md"));

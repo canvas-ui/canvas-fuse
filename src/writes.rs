@@ -1,4 +1,5 @@
 use crate::api::ApiClient;
+use crate::mirror::sync::Mirror;
 use crate::names::NameStore;
 use crate::state::Tree;
 use parking_lot::{Mutex, RwLock};
@@ -81,6 +82,9 @@ pub struct WriteStore {
     api: Arc<ApiClient>,
     tree: Arc<RwLock<Tree>>,
     names: Arc<NameStore>,
+    /// Mirror mode: Home writes go to the local store + cache and are pushed
+    /// by the engine, never PUT from here.
+    mirror: Option<Arc<Mirror>>,
     inner: Mutex<Inner>,
     /// Serializes tree-mutating write ops (flush/create-adopt, rename, unlink)
     /// against the refresh worker's fetch+apply. The two run on different
@@ -116,11 +120,17 @@ impl WriteError {
 type WResult<T> = Result<T, WriteError>;
 
 impl WriteStore {
-    pub fn new(api: Arc<ApiClient>, tree: Arc<RwLock<Tree>>, names: Arc<NameStore>) -> Self {
+    pub fn new(
+        api: Arc<ApiClient>,
+        tree: Arc<RwLock<Tree>>,
+        names: Arc<NameStore>,
+        mirror: Option<Arc<Mirror>>,
+    ) -> Self {
         Self {
             api,
             tree,
             names,
+            mirror,
             inner: Mutex::new(Inner {
                 states: HashMap::new(),
                 overlay: HashMap::new(),
@@ -234,14 +244,28 @@ impl WriteStore {
                 .read()
                 .home_file(ino)
                 .ok_or(WriteError::NotFound)?;
-            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
             let content = if truncate || size == 0 {
                 Vec::new()
+            } else if let Some(m) = &self.mirror {
+                // Cache hit, or one blocking fetch while online. Offline and
+                // uncached is EIO: there is nothing to edit.
+                m.bytes_for_edit(home_key(&path)).map_err(|errno| {
+                    if errno == libc::ENOENT {
+                        WriteError::NotFound
+                    } else {
+                        WriteError::Io("bytes not available".into())
+                    }
+                })?
             } else {
+                let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
                 self.api
                     .read_home_range(&ws, &path, 0, size.saturating_sub(1))
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?
             };
+            if let Some(m) = &self.mirror {
+                // A remote landing must not swap the bytes under this handle.
+                m.note_open_write(home_key(&path));
+            }
             let mut inner = self.inner.lock();
             let state = inner.states.entry(ino).or_insert_with(|| OpenWrite {
                 buffer: content,
@@ -325,8 +349,12 @@ impl WriteStore {
         // Home is a real drive: any name is a file, no schema inference.
         let home_dir = self.tree.read().home_path(dir_ino);
         let target = if let Some((dir_path, _)) = home_dir {
+            let path = crate::state::join_home_path(&dir_path, name);
+            if let Some(m) = &self.mirror {
+                m.note_open_write(home_key(&path));
+            }
             FlushTarget::HomeFile {
-                path: crate::state::join_home_path(&dir_path, name),
+                path,
                 dir_ino,
                 name: name.to_string(),
             }
@@ -478,10 +506,17 @@ impl WriteStore {
                 name,
             } => {
                 if dirty {
-                    let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
-                    self.api
-                        .write_home(&ws, path, buffer.clone())
-                        .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                    if let Some(m) = &self.mirror {
+                        // Local commit: bytes to the cache, entry dirty, push
+                        // queued. Never fails for lack of a hub.
+                        m.commit_write(home_key(path), &buffer)
+                            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                    } else {
+                        let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+                        self.api
+                            .write_home(&ws, path, buffer.clone())
+                            .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                    }
                 }
                 // Publish into the view so the next lookup/readdir sees the
                 // file at its real size. ONLY on the final flush: retiring the
@@ -584,6 +619,10 @@ impl WriteStore {
         if let Some(state) = inner.states.get_mut(&ino) {
             state.refs = state.refs.saturating_sub(1);
             if state.refs == 0 {
+                if let (Some(m), FlushTarget::HomeFile { path, .. }) = (&self.mirror, &state.target)
+                {
+                    m.note_close_write(home_key(path));
+                }
                 inner.states.remove(&ino);
                 // Any leftover overlay entry dies with the last handle:
                 // abandoned creates vanish (failed/empty save), and renamed
@@ -622,10 +661,16 @@ impl WriteStore {
             .lookup(dir_ino, name)
             .and_then(|n| self.tree.read().home_file(n.ino).map(|(p, _)| (n.ino, p)));
         if let Some((ino, path)) = home_child {
-            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
-            self.api
-                .remove_home(&ws, &path)
-                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            if let Some(m) = &self.mirror {
+                m.delete_local(home_key(&path))
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                m.note_close_write(home_key(&path));
+            } else {
+                let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+                self.api
+                    .remove_home(&ws, &path)
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            }
             self.tree.write().remove_node(ino);
             self.inner.lock().states.remove(&ino);
             return Ok(());
@@ -671,6 +716,9 @@ impl WriteStore {
         dst_dir: u64,
         dst_name: &str,
     ) -> WResult<()> {
+        if let Some(result) = self.rename_home(src_dir, src_name, dst_dir, dst_name) {
+            return result;
+        }
         if self.tree.read().is_workspace() {
             return self.rename_ws(src_dir, src_name, dst_dir, dst_name);
         }
@@ -813,11 +861,16 @@ impl WriteStore {
             if self.tree.read().lookup(parent_ino, name).is_some() {
                 return Err(WriteError::Exists);
             }
-            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
             let child = crate::state::join_home_path(&parent_path, name);
-            self.api
-                .mkdir_home(&ws, &child)
-                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            if let Some(m) = &self.mirror {
+                m.mkdir_local(home_key(&child))
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            } else {
+                let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+                self.api
+                    .mkdir_home(&ws, &child)
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            }
             return Ok(self.tree.write().insert_home_dir(parent_ino, name, &child));
         }
 
@@ -856,10 +909,23 @@ impl WriteStore {
             if self.tree.read().list(ino).is_some_and(|c| !c.is_empty()) {
                 return Err(WriteError::NotEmpty);
             }
-            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
-            self.api
-                .remove_home(&ws, &path)
-                .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            if !self.overlay_entries(ino).is_empty() {
+                return Err(WriteError::NotEmpty);
+            }
+            if let Some(m) = &self.mirror {
+                // The store knows the whole subtree, the tree only what was
+                // materialized; the store's answer is the one that counts.
+                match m.rmdir_local(home_key(&path)) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(WriteError::NotEmpty),
+                    Err(e) => return Err(WriteError::Io(format!("{e:#}"))),
+                }
+            } else {
+                let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+                self.api
+                    .remove_home(&ws, &path)
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            }
             self.tree.write().remove_node(ino);
             return Ok(());
         }
@@ -889,6 +955,275 @@ impl WriteStore {
         // The kernel drops the dentry itself on a successful rmdir; we only need
         // to keep our local view consistent.
         let _ = self.tree.write().remove_tree_dir(child_ino);
+        Ok(())
+    }
+
+    // ── Home rename ─────────────────────────────────────────────────────────
+
+    /// `mv` inside `Home/`. None when neither side is Home (the caller falls
+    /// through to the document paths); `EXDEV` when only one is — `mv` then
+    /// composes copy + unlink from primitives that exist on both sides.
+    ///
+    /// Live mode talks to the hub per file (`POST objects/rename`, file-only
+    /// on the hub, so a folder move is one call per file below it). Mirror
+    /// mode re-keys the store and queues the same calls for the engine.
+    fn rename_home(
+        &self,
+        src_dir: u64,
+        src_name: &str,
+        dst_dir: u64,
+        dst_name: &str,
+    ) -> Option<WResult<()>> {
+        let src_home = self.tree.read().home_path(src_dir).map(|(p, _)| p);
+        let dst_home = self.tree.read().home_path(dst_dir).map(|(p, _)| p);
+        let (src_dir_path, dst_dir_path) = match (src_home, dst_home) {
+            (Some(s), Some(d)) => (s, d),
+            (None, None) => return None,
+            _ => return Some(Err(WriteError::CrossDir)),
+        };
+        Some(self.rename_home_inner(
+            src_dir,
+            src_name,
+            &src_dir_path,
+            dst_dir,
+            dst_name,
+            &dst_dir_path,
+        ))
+    }
+
+    fn rename_home_inner(
+        &self,
+        src_dir: u64,
+        src_name: &str,
+        src_dir_path: &str,
+        dst_dir: u64,
+        dst_name: &str,
+        dst_dir_path: &str,
+    ) -> WResult<()> {
+        let _sync = self.sync.lock();
+        let src_path = crate::state::join_home_path(src_dir_path, src_name);
+        let dst_path = crate::state::join_home_path(dst_dir_path, dst_name);
+        let dst_ino = self.tree.read().lookup(dst_dir, dst_name).map(|n| n.ino);
+        let dst_is_dir = dst_ino
+            .and_then(|i| self.tree.read().get(i).map(|n| n.is_dir()))
+            .unwrap_or(false);
+
+        // A pending create renamed before close (editor tmp → target): the
+        // buffer simply flushes under the new name. An existing target is
+        // overwritten by that flush, so its node goes now — the kernel's
+        // post-rename dentry points at the overlay ino.
+        let src_overlay = self
+            .inner
+            .lock()
+            .overlay_names
+            .get(&(src_dir, src_name.to_string()))
+            .copied();
+        if let Some(src_ino) = src_overlay {
+            if dst_is_dir {
+                return Err(WriteError::Exists);
+            }
+            if let Some(dst_ino) = dst_ino {
+                if self.has_state(dst_ino) {
+                    return Err(WriteError::Exists);
+                }
+                self.tree.write().remove_node(dst_ino);
+            }
+            let mut inner = self.inner.lock();
+            inner.overlay_names.remove(&(src_dir, src_name.to_string()));
+            inner
+                .overlay_names
+                .insert((dst_dir, dst_name.to_string()), src_ino);
+            if let Some(entry) = inner.overlay.get_mut(&src_ino) {
+                entry.0 = dst_dir;
+                entry.1 = dst_name.to_string();
+            }
+            if let Some(state) = inner.states.get_mut(&src_ino) {
+                if let FlushTarget::HomeFile {
+                    path,
+                    dir_ino,
+                    name,
+                } = &mut state.target
+                {
+                    *path = dst_path.clone();
+                    *dir_ino = dst_dir;
+                    *name = dst_name.to_string();
+                }
+                state.dirty = true;
+            }
+            if let Some(m) = &self.mirror {
+                m.note_close_write(home_key(&src_path));
+                m.note_open_write(home_key(&dst_path));
+            }
+            return Ok(());
+        }
+
+        let src_ino = self
+            .tree
+            .read()
+            .lookup(src_dir, src_name)
+            .map(|n| n.ino)
+            .ok_or(WriteError::NotFound)?;
+        let src_is_dir = self
+            .tree
+            .read()
+            .get(src_ino)
+            .map(|n| n.is_dir())
+            .unwrap_or(false);
+        if let Some(dst_ino) = dst_ino {
+            // POSIX: a file may replace a file, a directory an EMPTY directory.
+            if src_is_dir != dst_is_dir {
+                return Err(if dst_is_dir {
+                    WriteError::Exists
+                } else {
+                    WriteError::NotPermitted
+                });
+            }
+            if dst_is_dir
+                && self
+                    .tree
+                    .read()
+                    .list(dst_ino)
+                    .is_some_and(|c| !c.is_empty())
+            {
+                return Err(WriteError::NotEmpty);
+            }
+            if self.has_state(dst_ino) {
+                return Err(WriteError::Exists);
+            }
+        }
+
+        if let Some(m) = &self.mirror {
+            let result = if src_is_dir {
+                if let Some(dst_ino) = dst_ino {
+                    // Replacing an empty directory.
+                    match m.rmdir_local(home_key(&dst_path)) {
+                        Ok(true) => {}
+                        Ok(false) => return Err(WriteError::NotEmpty),
+                        Err(e) => return Err(WriteError::Io(format!("{e:#}"))),
+                    }
+                    self.tree.write().remove_node(dst_ino);
+                }
+                m.rename_dir_local(home_key(&src_path), home_key(&dst_path))
+            } else {
+                m.rename_local(home_key(&src_path), home_key(&dst_path))
+            };
+            result.map_err(|e| WriteError::Io(format!("{e:#}")))?;
+        } else {
+            let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
+            if src_is_dir {
+                self.rename_home_dir_live(&ws, src_ino, &src_path, &dst_path)?;
+                if let Some(dst_ino) = dst_ino {
+                    // The empty target directory: gone on the hub, our
+                    // files now live under its name.
+                    let _ = dst_ino;
+                }
+            } else {
+                if dst_ino.is_some() {
+                    self.api
+                        .remove_home(&ws, &dst_path)
+                        .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                }
+                self.api
+                    .rename_object(
+                        &ws,
+                        crate::mirror::DEFAULT_BACKEND,
+                        home_key(&src_path),
+                        home_key(&dst_path),
+                        None,
+                    )
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+            }
+        }
+
+        {
+            let mut tree = self.tree.write();
+            if let Some(dst_ino) = dst_ino {
+                if dst_ino != src_ino {
+                    tree.remove_node(dst_ino);
+                }
+            }
+            tree.rename_home(src_ino, dst_dir, dst_name);
+        }
+        // An open handle on the source keeps writing — to the new name.
+        let mut inner = self.inner.lock();
+        if let Some(state) = inner.states.get_mut(&src_ino) {
+            if let FlushTarget::HomeFile {
+                path,
+                dir_ino,
+                name,
+            } = &mut state.target
+            {
+                *path = dst_path.clone();
+                *dir_ino = dst_dir;
+                *name = dst_name.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// Live-mode folder move: the hub renames files, not folders, so every
+    /// file below the folder moves on its own. Unlisted subfolders are
+    /// listed first — the tree only holds what something has looked at.
+    fn rename_home_dir_live(
+        &self,
+        ws: &str,
+        dir_ino: u64,
+        src_path: &str,
+        dst_path: &str,
+    ) -> WResult<()> {
+        let mut stack: Vec<(u64, String, String)> =
+            vec![(dir_ino, src_path.to_string(), dst_path.to_string())];
+        let mut empty_dirs: Vec<String> = Vec::new();
+        while let Some((ino, from, to)) = stack.pop() {
+            let loaded = self
+                .tree
+                .read()
+                .home_path(ino)
+                .map(|(_, l)| l)
+                .unwrap_or(true);
+            if !loaded {
+                let entries = self
+                    .api
+                    .list_home(ws, &from)
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                self.tree.write().apply_home_entries(ino, &entries);
+            }
+            let children: Vec<(u64, String, bool)> = self
+                .tree
+                .read()
+                .list(ino)
+                .map(|c| {
+                    c.iter()
+                        .map(|n| (n.ino, n.name.clone(), n.is_dir()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if children.is_empty() {
+                empty_dirs.push(to.clone());
+            }
+            for (child, name, is_dir) in children {
+                let cf = crate::state::join_home_path(&from, &name);
+                let ct = crate::state::join_home_path(&to, &name);
+                if is_dir {
+                    stack.push((child, cf, ct));
+                } else {
+                    self.api
+                        .rename_object(
+                            ws,
+                            crate::mirror::DEFAULT_BACKEND,
+                            home_key(&cf),
+                            home_key(&ct),
+                            None,
+                        )
+                        .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                }
+            }
+        }
+        for d in empty_dirs {
+            let _ = self.api.mkdir_home(ws, &d);
+        }
+        // The old folder is empty now (or holds only what the hub hides).
+        let _ = self.api.remove_home(ws, src_path);
         Ok(())
     }
 
@@ -1417,6 +1752,11 @@ fn apply_buffer_to_data(schema: &str, data: &mut Value, buffer: &[u8]) {
 }
 
 /// Join a normalized parent path with a child name ("/" + "x" -> "/x").
+/// A Home path (`/Docs/a.md`) as the hub's key (`Docs/a.md`).
+fn home_key(path: &str) -> &str {
+    path.trim_matches('/')
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")

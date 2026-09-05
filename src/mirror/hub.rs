@@ -102,9 +102,14 @@ pub enum HubError {
     Unauthorized,
     /// `412`: the key is not what the caller's `If-Match` said. `current` is
     /// the hub's version, or None when the key is gone.
-    PreconditionFailed { current: Option<RemoteStat> },
+    PreconditionFailed {
+        current: Option<RemoteStat>,
+    },
     /// `410` on the change feed: rebuild from the listing.
-    CursorTooOld { oldest: u64, head: u64 },
+    CursorTooOld {
+        oldest: u64,
+        head: u64,
+    },
     NotFound,
     /// `409 TARGET_EXISTS` on rename.
     TargetExists,
@@ -116,7 +121,10 @@ pub enum HubError {
         message: String,
     },
     /// `429`/`5xx` after the in-call retries ran out; backoff and retry later.
-    Retryable { status: u16, message: String },
+    Retryable {
+        status: u16,
+        message: String,
+    },
     Other(String),
 }
 
@@ -137,7 +145,11 @@ impl std::fmt::Display for HubError {
                 status,
                 code,
                 message,
-            } => write!(f, "refused: HTTP {status} {} {message}", code.as_deref().unwrap_or("")),
+            } => write!(
+                f,
+                "refused: HTTP {status} {} {message}",
+                code.as_deref().unwrap_or("")
+            ),
             HubError::Retryable { status, message } => write!(f, "HTTP {status}: {message}"),
             HubError::Other(m) => write!(f, "{m}"),
         }
@@ -235,10 +247,7 @@ impl HubClient {
     fn classify(resp: reqwest::blocking::Response) -> HubError {
         let status = resp.status();
         let body: Value = resp.json().unwrap_or(Value::Null);
-        let code = body
-            .get("code")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let code = body.get("code").and_then(Value::as_str).map(str::to_string);
         let message = body
             .get("message")
             .and_then(Value::as_str)
@@ -338,8 +347,13 @@ impl HubClient {
         let body = Self::json_ok(resp)?;
         let payload = body.get("payload").cloned().unwrap_or(Value::Null);
         let payload = payload.get("backend").cloned().unwrap_or(payload);
-        Ok(payload
-            .get("effectiveExclusions")
+        // `getBackend` nests them under `config`; older shapes put them on
+        // the payload itself.
+        let list = payload
+            .get("config")
+            .and_then(|c| c.get("effectiveExclusions"))
+            .or_else(|| payload.get("effectiveExclusions"));
+        Ok(list
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
@@ -421,10 +435,7 @@ impl HubClient {
                             seq: c.get("seq").and_then(Value::as_u64)?,
                             op,
                             key: c.get("key")?.as_str()?.to_string(),
-                            from: c
-                                .get("from")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
+                            from: c.get("from").and_then(Value::as_str).map(str::to_string),
                             sha256: c
                                 .get("sha256")
                                 .and_then(Value::as_str)
@@ -432,10 +443,7 @@ impl HubClient {
                                 .map(|s| s.to_lowercase()),
                             size: c.get("size").and_then(Value::as_u64).unwrap_or(0),
                             mtime: parse_ms(c.get("mtime")),
-                            origin: c
-                                .get("origin")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
+                            origin: c.get("origin").and_then(Value::as_str).map(str::to_string),
                         })
                     })
                     .collect()
@@ -635,7 +643,8 @@ impl HubClient {
             encode_segment(&self.ws)
         );
         let body = serde_json::json!({ "path": key });
-        let resp = self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(&body)))?;
+        let resp =
+            self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(&body)))?;
         Self::json_ok(resp).map(|_| ())
     }
 
@@ -659,7 +668,8 @@ impl HubClient {
             encode_segment(&self.ws),
             encode_segment(&self.device_id)
         );
-        let resp = self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(status)))?;
+        let resp =
+            self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(status)))?;
         let body = Self::json_ok(resp)?;
         Ok(body
             .get("payload")
@@ -680,7 +690,10 @@ fn parse_stat(v: &Value) -> Option<RemoteStat> {
 /// `mtime` arrives as ms (number) or ISO (string) depending on the route.
 pub fn parse_ms(v: Option<&Value>) -> u64 {
     match v {
-        Some(Value::Number(n)) => n.as_u64().or_else(|| n.as_f64().map(|f| f as u64)).unwrap_or(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_f64().map(|f| f as u64))
+            .unwrap_or(0),
         Some(Value::String(s)) => {
             if let Ok(n) = s.parse::<u64>() {
                 n

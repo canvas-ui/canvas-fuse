@@ -134,7 +134,12 @@ impl Cache {
     /// Resumes a `.part` if one is there. Returns the digest actually
     /// received (the hub's ETag), which may differ from `expected_sha` when
     /// the key changed under us — the caller then decides what to do with it.
-    pub fn fetch(&self, hub: &super::hub::HubClient, key: &str, expected_sha: &str) -> Result<String, super::hub::HubError> {
+    pub fn fetch(
+        &self,
+        hub: &super::hub::HubClient,
+        key: &str,
+        expected_sha: &str,
+    ) -> Result<String, super::hub::HubError> {
         use super::hub::HubError;
         if self.has(expected_sha) {
             self.touch(expected_sha);
@@ -152,7 +157,9 @@ impl Cache {
             let mut f = std::fs::File::open(&part).map_err(|e| HubError::Other(e.to_string()))?;
             let mut buf = vec![0u8; 1 << 16];
             loop {
-                let n = f.read(&mut buf).map_err(|e| HubError::Other(e.to_string()))?;
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| HubError::Other(e.to_string()))?;
                 if n == 0 {
                     break;
                 }
@@ -187,7 +194,8 @@ impl Cache {
                 .map_err(|e| HubError::Other(e.to_string()))?;
             total += n as u64;
         }
-        out.sync_data().map_err(|e| HubError::Other(e.to_string()))?;
+        out.sync_data()
+            .map_err(|e| HubError::Other(e.to_string()))?;
         drop(out);
         let got = super::hex(&hasher.finalize());
         if let Some(etag) = &etag {
