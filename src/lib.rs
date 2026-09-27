@@ -21,6 +21,32 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Explicit workspace sources. Empty selects the traditional full workspace.
+/// One source is rooted directly; multiple sources retain Home/ and Trees/.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceSelection {
+    pub trees: Vec<String>,
+    pub home: bool,
+}
+
+impl WorkspaceSelection {
+    pub fn is_explicit(&self) -> bool {
+        self.home || !self.trees.is_empty()
+    }
+
+    pub fn includes_home(&self) -> bool {
+        !self.is_explicit() || self.home
+    }
+
+    pub fn includes_tree(&self, name: &str) -> bool {
+        !self.is_explicit() || self.trees.iter().any(|t| t == name)
+    }
+
+    pub fn single_tree(&self) -> bool {
+        !self.home && self.trees.len() == 1
+    }
+}
+
 pub struct MountOptions {
     pub server: String,
     pub token: String,
@@ -36,6 +62,8 @@ pub struct MountOptions {
     /// When set, mount a workspace's trees (context + directory) read/write,
     /// mirroring each tree's path hierarchy. Mutually exclusive with contexts.
     pub workspace: Option<String>,
+    /// Sources to expose; default preserves the full workspace layout.
+    pub selection: WorkspaceSelection,
     /// The workspace a CONTEXT mount is scoped to. A mount is always one
     /// workspace; contexts belonging to any other are not materialized.
     pub context_workspace: Option<String>,
@@ -99,6 +127,14 @@ impl Drop for MountHandle {
 }
 
 pub fn mount(opts: MountOptions) -> Result<MountHandle> {
+    if opts.selection.is_explicit()
+        && (opts.workspace.is_none() || opts.context_root.is_some() || opts.contexts.is_some())
+    {
+        anyhow::bail!("tree/backend selection requires a workspace mount without context views");
+    }
+    if opts.mirror.is_some() && (opts.workspace.is_none() || !opts.selection.includes_home()) {
+        anyhow::bail!("mirror mode requires the workspace:home backend");
+    }
     // Clear a stale mount left behind by a previous crash, then ensure the dir
     let _ = std::process::Command::new("fusermount3")
         .arg("-uz")
@@ -156,7 +192,23 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
             }
             Err(e) => return Err(e).with_context(|| format!("resolving workspace {ws_name}")),
         };
-        state::Tree::workspace_rooted(ws.id, ws.name)
+        if !opts.selection.trees.is_empty() {
+            match api.list_trees(&ws.id) {
+                Ok(available) => {
+                    for name in &opts.selection.trees {
+                        anyhow::ensure!(
+                            available.iter().any(|t| &t.name == name),
+                            "tree `{name}` not found in workspace `{ws_name}`"
+                        );
+                    }
+                }
+                Err(e) if mirror_mode => {
+                    log::warn!("tree selection cannot be checked while hub is unavailable: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        state::Tree::workspace_selected(ws.id, ws.name, opts.selection.clone())
     } else {
         match &opts.context_root {
             Some(id) => state::Tree::context_rooted(id.clone()),

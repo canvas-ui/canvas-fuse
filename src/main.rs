@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use canvas_fuse::mirror::{control, ConflictMode, DeleteMode, MirrorOptions};
-use canvas_fuse::{api::ApiClient, config, runtime, MountOptions};
+use canvas_fuse::{api::ApiClient, config, runtime, MountOptions, WorkspaceSelection};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -89,6 +89,14 @@ enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
 
+        /// Include a virtual tree by name (repeatable). One source mounts directly.
+        #[arg(long = "tree", value_name = "NAME", conflicts_with = "contexts")]
+        trees: Vec<String>,
+
+        /// Include a storage backend (currently workspace:home; repeatable)
+        #[arg(long = "backend", value_name = "BACKEND", value_parser = ["workspace:home"], conflicts_with = "contexts")]
+        backends: Vec<String>,
+
         /// Run in the background (logs to the state dir)
         #[arg(short = 'd', long)]
         detach: bool,
@@ -124,7 +132,7 @@ enum Command {
         /// Serve Home/ as an offline-capable device mirror of the workspace
         /// drive (persistent tree, on-disk content cache, write-back with
         /// preconditions, conflict handling). Workspace mounts only.
-        #[arg(long, requires = "workspace")]
+        #[arg(long)]
         mirror: bool,
 
         /// Mirror: always keep these paths/globs materialized locally
@@ -278,6 +286,8 @@ fn main() -> Result<()> {
             root,
             contexts,
             workspace,
+            trees,
+            backends,
             detach,
             no_ws,
             no_nudge,
@@ -302,7 +312,13 @@ fn main() -> Result<()> {
                 (None, Some(path)) => (None, path),
                 (None, None) => anyhow::bail!("a mountpoint is required"),
             };
+            if selector.is_some() && (root.is_some() || workspace.is_some() || !contexts.is_empty())
+            {
+                anyhow::bail!("use either a positional selector or --root/-w/-c");
+            }
             let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
+            let selection =
+                resolve_selection(trees, backends, workspace.as_deref(), &contexts, mirror)?;
             let mirror_opts = mirror.then(|| MirrorOptions {
                 pins,
                 cache_budget_bytes: cache_budget_mb * 1024 * 1024,
@@ -322,6 +338,7 @@ fn main() -> Result<()> {
                 connect,
                 contexts,
                 workspace,
+                selection,
                 detach,
                 no_ws,
                 no_nudge,
@@ -421,6 +438,42 @@ fn resolve_root(
     Ok((ws, ids))
 }
 
+fn resolve_selection(
+    mut trees: Vec<String>,
+    backends: Vec<String>,
+    workspace: Option<&str>,
+    contexts: &[String],
+    mirror: bool,
+) -> Result<WorkspaceSelection> {
+    anyhow::ensure!(
+        trees.iter().all(|t| !t.trim().is_empty()),
+        "tree name cannot be empty"
+    );
+    trees.sort();
+    trees.dedup();
+    anyhow::ensure!(
+        backends.iter().all(|b| b == "workspace:home"),
+        "unsupported backend"
+    );
+    let selection = WorkspaceSelection {
+        trees,
+        home: !backends.is_empty(),
+    };
+    if selection.is_explicit() {
+        anyhow::ensure!(
+            workspace.is_some() && contexts.is_empty(),
+            "--tree/--backend require a workspace and cannot select context views"
+        );
+    }
+    if mirror {
+        anyhow::ensure!(
+            workspace.is_some() && contexts.is_empty() && selection.includes_home(),
+            "--mirror requires a workspace mount including workspace:home"
+        );
+    }
+    Ok(selection)
+}
+
 // Flat CLI plumbing: one parameter per mount flag, folded into MountOptions below.
 #[allow(clippy::too_many_arguments)]
 fn cmd_mount(
@@ -428,6 +481,7 @@ fn cmd_mount(
     connect: ConnectArgs,
     contexts: Vec<String>,
     workspace: Option<String>,
+    selection: WorkspaceSelection,
     detach: bool,
     no_ws: bool,
     no_nudge: bool,
@@ -452,10 +506,14 @@ fn cmd_mount(
     } else {
         None
     };
-    let mountpoint = match (&workspace_mount, &context_root) {
-        (Some(ws), _) => mountpoint.join(ws),
-        (None, Some(ctx)) => mountpoint.join(ctx),
-        (None, None) => mountpoint,
+    let mountpoint = if selection.is_explicit() {
+        mountpoint
+    } else {
+        match (&workspace_mount, &context_root) {
+            (Some(ws), _) => mountpoint.join(ws),
+            (None, Some(ctx)) => mountpoint.join(ctx),
+            (None, None) => mountpoint,
+        }
     };
 
     // Canonicalize before any daemonize/fork so relative paths stay valid
@@ -479,6 +537,13 @@ fn cmd_mount(
                 .to_string()
         });
         match &workspace_mount {
+            Some(ws) if selection.is_explicit() => runtime::workspace_data_dir(&remote_label, ws)
+                .join("mounts")
+                .join(
+                    runtime::mount_data_dir(&remote_label, &[], &mountpoint)
+                        .file_name()
+                        .expect("mount state directory"),
+                ),
             Some(ws) => runtime::workspace_data_dir(&remote_label, ws),
             None => runtime::mount_data_dir(&remote_label, &contexts, &mountpoint),
         }
@@ -540,6 +605,7 @@ fn cmd_mount(
         },
         context_root: context_root.clone(),
         workspace: workspace_mount.clone(),
+        selection,
         context_workspace: workspace.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
         mirror: mirror.clone(),
@@ -955,6 +1021,62 @@ mod root_selector_tests {
             contexts.iter().map(|c| c.to_string()).collect(),
         )
         .expect("selector should resolve")
+    }
+
+    #[test]
+    fn source_flags_parse_and_validate_before_connecting() {
+        use super::{resolve_selection, Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "myws",
+            "/tmp/home",
+            "--backend",
+            "workspace:home",
+            "--mirror",
+        ])
+        .unwrap();
+        let Command::Mount {
+            backends, trees, ..
+        } = cli.command
+        else {
+            panic!("mount expected")
+        };
+        let selection = resolve_selection(trees, backends, Some("myws"), &[], true).unwrap();
+        assert!(selection.home);
+        assert!(selection.trees.is_empty());
+        assert!(Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "myws",
+            "/tmp/home",
+            "--backend",
+            "unknown"
+        ])
+        .is_err());
+        assert!(
+            resolve_selection(vec![], vec!["workspace:home".into()], None, &[], false).is_err()
+        );
+        assert!(resolve_selection(
+            vec!["context".into()],
+            vec![],
+            Some("ws"),
+            &["id".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_selection(vec!["context".into()], vec![], Some("ws"), &[], true).is_err());
+        let selection = resolve_selection(
+            vec!["context".into(), "directory".into(), "context".into()],
+            vec![],
+            Some("ws"),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(selection.trees, vec!["context", "directory"]);
+        assert!(!selection.includes_home());
     }
 
     #[test]

@@ -143,6 +143,11 @@ impl Worker {
         };
         let _guard = self.refresh_lock.as_ref().map(|l| l.lock());
 
+        let selection = self.tree.read().selection().clone();
+        // Home is loaded on demand (or by the mirror); no document API calls.
+        if selection.home && selection.trees.is_empty() {
+            return;
+        }
         let trees = match self.api.list_trees(&ws) {
             Ok(t) => t,
             Err(e) => {
@@ -150,6 +155,10 @@ impl Worker {
                 return;
             }
         };
+        let trees: Vec<_> = trees
+            .into_iter()
+            .filter(|t| selection.includes_tree(&t.name))
+            .collect();
         let inv = self.tree.write().apply_trees(&trees);
         self.notify(inv);
 
@@ -165,14 +174,15 @@ impl Worker {
         }
 
         // The trash is a root of its own, not a tree path.
-        match self.api.list_trash(&ws) {
-            Ok(docs) => {
-                let inv = self.tree.write().apply_trash_documents(&docs);
-                self.notify(inv);
+        if !selection.is_explicit() {
+            match self.api.list_trash(&ws) {
+                Ok(docs) => {
+                    let inv = self.tree.write().apply_trash_documents(&docs);
+                    self.notify(inv);
+                }
+                Err(e) => log::warn!("workspace {ws}: trash fetch failed: {e:#}"),
             }
-            Err(e) => log::warn!("workspace {ws}: trash fetch failed: {e:#}"),
         }
-
         // Populate documents at every known path. Snapshot the path list into an
         // owned Vec first: holding a read guard as the for-loop iterator
         // temporary would deadlock against the per-path tree.write() below

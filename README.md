@@ -273,6 +273,43 @@ canvas-fuse ping [--json]                                # server reachability, 
 canvas-fuse contexts [--json]                            # list accessible contexts
 ```
 
+### Mount only selected sources
+
+Use `--backend workspace:home` to mount just the home drive:
+
+```sh
+canvas-fuse mount -w universe --backend workspace:home ~/CanvasHome
+# Optional persistent cache and offline writes:
+canvas-fuse mount -w universe --backend workspace:home ~/CanvasHome --mirror
+```
+
+The drive's files appear directly in `~/CanvasHome`, with no workspace or
+`Home/` wrapper. Unselected trees and trash are neither exposed nor fetched.
+
+`--tree <name>` selects a virtual tree by its exact workspace tree name (not
+its type or a context view id). Repeat it to include several trees, and combine
+it with `--backend` when needed:
+
+```sh
+canvas-fuse mount universe ~/Directory --tree directory
+canvas-fuse mount universe ~/Selected --tree context --tree directory
+canvas-fuse mount universe ~/Selected --tree directory --backend workspace:home
+```
+
+One distinct source mounts its contents directly at the supplied mountpoint.
+Multiple sources expose `Trees/<name>/` and, when selected, `Home/` at that
+same mountpoint. Duplicate selectors are ignored. Explicit selections omit
+`Trash/`; tree deletes still follow the server's usual detach/trash rules.
+Only `workspace:home` is currently supported as a backend. `--mirror` requires
+Home to be included. Source selectors cannot be combined with `--context`.
+Unknown tree names fail before mounting when the hub is available. Offline
+mirror mounts defer tree loading until reconnect.
+
+Without source selectors, existing workspace and context layouts are unchanged.
+Selected mounts get separate state directories per workspace and mountpoint,
+so they can run alongside a full workspace mount. Use the exact supplied path
+for `unmount`, `sync`, and `pin` commands.
+
 ### mount flags
 
 | Flag | Default | Description |
@@ -280,6 +317,8 @@ canvas-fuse contexts [--json]                            # list accessible conte
 | `<selector>` | - | Positional, before the mountpoint: `<workspace>` or `<workspace>/Contexts/<id>`. |
 | `-c/--context <id>` | - | A context view as `<workspace>/<id>` (or a bare id alongside `-w`). Repeatable; a single one roots the mount at it. |
 | `-w/--workspace <name>` | - | The workspace to mount, at `<mountpoint>/<name>/`. With `-c` it scopes the context mount instead. |
+| `--tree <name>` | - | Include this virtual tree; repeatable. |
+| `--backend workspace:home` | - | Include the home drive; repeatable. |
 | `--root <selector>` | - | The selector as a flag, for when it comes from config or a script. |
 | `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only). |
@@ -310,6 +349,9 @@ CANVAS_SERVER=https://canvas.example CANVAS_API_TOKEN=canvas-... \
 `canvas_fuse::mount(MountOptions) -> MountHandle` — dropping the handle (or
 calling `unmount()`) tears down the ws client, threads, and the kernel mount.
 `MountOptions.contexts` filters which contexts are materialized.
+`MountOptions.selection` accepts a `WorkspaceSelection { trees, home }`;
+`WorkspaceSelection::default()` preserves the full workspace layout. Set
+`workspace` for source selection and leave context options unset.
 
 ## Internals
 

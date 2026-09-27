@@ -418,3 +418,55 @@ fn the_document_filed_at_a_path_keeps_the_plain_name() {
     let plain = tree.lookup(leaf, "CLAUDE.note.md").unwrap().ino;
     assert_eq!(tree.tree_file(plain).unwrap().4, 100001);
 }
+
+#[test]
+fn selected_tree_is_rooted_and_survives_removal_and_reappearance() {
+    let mut tree = Tree::workspace_selected(
+        "ws1".into(),
+        "ws1".into(),
+        canvas_fuse::WorkspaceSelection {
+            trees: vec!["directory".into()],
+            home: false,
+        },
+    );
+    let available = [
+        ti("a", "context", "context"),
+        ti("b", "directory", "directory"),
+    ];
+    tree.apply_trees(&available);
+    tree.apply_tree_paths("directory", &["/Docs".into()]);
+    tree.apply_tree_documents("directory", "/", &[note(1, "hello", "content")]);
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["Docs", "hello.note.md"]);
+    assert_eq!(tree.locate_tree_dir(ROOT_INO).unwrap().0, "directory");
+    assert!(tree.ws_tree_meta("context").is_none());
+    tree.apply_trees(&[]);
+    assert!(tree.get(ROOT_INO).is_some());
+    assert!(names_in(&tree, ROOT_INO).is_empty());
+    assert!(tree.ws_paths().is_empty());
+    tree.apply_trees(&available);
+    tree.apply_tree_paths("directory", &["/Again".into()]);
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["Again"]);
+}
+
+#[test]
+fn multiple_sources_keep_wrappers_and_exclude_unselected_trees_and_trash() {
+    let mut tree = Tree::workspace_selected(
+        "ws1".into(),
+        "ws1".into(),
+        canvas_fuse::WorkspaceSelection {
+            trees: vec!["context".into(), "directory".into()],
+            home: true,
+        },
+    );
+    tree.apply_trees(&[
+        ti("a", "context", "context"),
+        ti("b", "directory", "directory"),
+        ti("c", "private", "context"),
+    ]);
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["Home", "Trees"]);
+    assert_eq!(
+        names_in(&tree, ino_at(&tree, &["Trees"])),
+        vec!["context", "directory"]
+    );
+    assert!(tree.ws_tree_meta("private").is_none());
+}

@@ -123,3 +123,40 @@ fn snapshot_replaces_the_tree_and_keeps_surviving_inos() {
     assert!(t.home_ino_for_key("Empty").is_some());
     assert_eq!(names(&t, HOME_INO), vec!["Empty", "keep.txt", "new"]);
 }
+
+#[test]
+fn home_only_mount_supports_lazy_listing_and_mirror_operations_at_root() {
+    use canvas_fuse::api::HomeEntry;
+    use canvas_fuse::state::ROOT_INO;
+    let mut t = Tree::workspace_selected(
+        "ws1".into(),
+        "ws1".into(),
+        canvas_fuse::WorkspaceSelection {
+            trees: vec![],
+            home: true,
+        },
+    );
+    assert_eq!(t.home_root_ino(), ROOT_INO);
+    assert!(names(&t, ROOT_INO).is_empty());
+    assert_eq!(t.home_path(ROOT_INO), Some(("/".into(), false)));
+    t.apply_home_entries(
+        ROOT_INO,
+        &[HomeEntry {
+            name: "hello.txt".into(),
+            is_dir: false,
+            size: 5,
+            mtime: None,
+        }],
+    );
+    assert_eq!(names(&t, ROOT_INO), vec!["hello.txt"]);
+    assert_eq!(t.home_key(ROOT_INO).as_deref(), Some(""));
+    t.set_home_mirrored(true);
+    t.apply_home_snapshot(&[("Docs/a.txt".into(), 3, SystemTime::UNIX_EPOCH)], &[]);
+    assert_eq!(names(&t, ROOT_INO), vec!["Docs"]);
+    t.rename_home_key("Docs/a.txt", "Other/b.txt");
+    assert!(t.home_ino_for_key("Other/b.txt").is_some());
+    t.remove_home_key("Other/b.txt", &HashSet::new());
+    t.apply_home_snapshot(&[], &[]);
+    assert!(names(&t, ROOT_INO).is_empty());
+    assert!(t.get(ROOT_INO).is_some());
+}

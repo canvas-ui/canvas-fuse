@@ -181,6 +181,7 @@ pub struct WsFile {
 struct WsState {
     ws_id: String,
     ws_name: String,
+    selection: crate::WorkspaceSelection,
     /// tree name -> mounted tree
     trees: HashMap<String, WsTree>,
     /// (tree name, normalized path) -> directory ino. Path "/" maps to the
@@ -263,42 +264,80 @@ impl Tree {
     /// Workspace mount. ROOT holds the same roots the WebDAV view exposes:
     /// `Trees/` (one directory per tree, mirroring its path hierarchy with
     /// documents as files) and `Trash/` (flat; what a delete parked there).
-    /// `Home/` is not served here yet — see the README.
+    /// `Home/` exposes the workspace drive.
     pub fn workspace_rooted(ws_id: String, ws_name: String) -> Self {
+        Self::workspace_selected(ws_id, ws_name, crate::WorkspaceSelection::default())
+    }
+
+    pub fn workspace_selected(
+        ws_id: String,
+        ws_name: String,
+        mut selection: crate::WorkspaceSelection,
+    ) -> Self {
+        selection.trees.sort();
+        selection.trees.dedup();
         let mut t = Self::bare(None);
         let now = SystemTime::now();
-        t.insert_node(Node {
-            ino: TREES_INO,
-            parent: ROOT_INO,
-            name: "Trees".to_string(),
-            mtime: now,
-            content: NodeContent::Dir,
-        });
-        t.insert_node(Node {
-            ino: TRASH_INO,
-            parent: ROOT_INO,
-            name: "Trash".to_string(),
-            mtime: now,
-            content: NodeContent::Dir,
-        });
-        t.insert_node(Node {
-            ino: HOME_INO,
-            parent: ROOT_INO,
-            name: "Home".to_string(),
-            mtime: now,
-            content: NodeContent::HomeDir {
-                path: "/".to_string(),
-                loaded: false,
-            },
-        });
+        if !selection.is_explicit() || (!selection.trees.is_empty() && !selection.single_tree()) {
+            t.insert_node(Node {
+                ino: TREES_INO,
+                parent: ROOT_INO,
+                name: "Trees".to_string(),
+                mtime: now,
+                content: NodeContent::Dir,
+            });
+        }
+        if !selection.is_explicit() {
+            t.insert_node(Node {
+                ino: TRASH_INO,
+                parent: ROOT_INO,
+                name: "Trash".to_string(),
+                mtime: now,
+                content: NodeContent::Dir,
+            });
+        }
+        if selection.includes_home() {
+            let home_only = selection.home && selection.trees.is_empty();
+            t.insert_node(Node {
+                ino: if home_only { ROOT_INO } else { HOME_INO },
+                parent: ROOT_INO,
+                name: if home_only {
+                    String::new()
+                } else {
+                    "Home".to_string()
+                },
+                mtime: now,
+                content: NodeContent::HomeDir {
+                    path: "/".to_string(),
+                    loaded: false,
+                },
+            });
+        }
         t.ws = Some(WsState {
             ws_id,
             ws_name,
+            selection,
             trees: HashMap::new(),
             path_inos: HashMap::new(),
             file_docs: HashMap::new(),
         });
         t
+    }
+
+    pub fn selection(&self) -> &crate::WorkspaceSelection {
+        &self.ws().selection
+    }
+
+    pub fn home_root_ino(&self) -> u64 {
+        if self
+            .ws
+            .as_ref()
+            .is_some_and(|w| w.selection.home && w.selection.trees.is_empty())
+        {
+            ROOT_INO
+        } else {
+            HOME_INO
+        }
     }
 
     pub fn is_workspace(&self) -> bool {
@@ -951,6 +990,11 @@ impl Tree {
     pub fn apply_trees(&mut self, trees: &[TreeInfo]) -> Invalidation {
         let mut inv = Invalidation::default();
         let now = SystemTime::now();
+        let trees: Vec<&TreeInfo> = trees
+            .iter()
+            .filter(|t| self.selection().includes_tree(&t.name))
+            .collect();
+        let rooted = self.selection().single_tree();
         let wanted: HashSet<&str> = trees.iter().map(|t| t.name.as_str()).collect();
 
         let stale: Vec<String> = self
@@ -963,11 +1007,16 @@ impl Tree {
         for name in stale {
             let root_ino = self.ws().trees[&name].root_ino;
             self.remove_subtree(root_ino, &mut inv);
-            if let Some(node) = self.remove_node(root_ino) {
+            if let Some(node) = (root_ino != ROOT_INO)
+                .then(|| self.remove_node(root_ino))
+                .flatten()
+            {
                 inv.removed.push((node.parent, root_ino, node.name));
             }
             self.ws_mut().trees.remove(&name);
-            inv.dirty_dirs.push(TREES_INO);
+            self.ws_mut().path_inos.retain(|(tree, _), _| tree != &name);
+            inv.dirty_dirs
+                .push(if rooted { ROOT_INO } else { TREES_INO });
         }
 
         for t in trees {
@@ -984,14 +1033,16 @@ impl Tree {
                     );
                 }
                 None => {
-                    let ino = self.alloc_ino();
-                    self.insert_node(Node {
-                        ino,
-                        parent: TREES_INO,
-                        name: t.name.clone(),
-                        mtime: now,
-                        content: NodeContent::Dir,
-                    });
+                    let ino = if rooted { ROOT_INO } else { self.alloc_ino() };
+                    if !rooted {
+                        self.insert_node(Node {
+                            ino,
+                            parent: TREES_INO,
+                            name: t.name.clone(),
+                            mtime: now,
+                            content: NodeContent::Dir,
+                        });
+                    }
                     let w = self.ws_mut();
                     w.trees.insert(
                         t.name.clone(),
@@ -1241,8 +1292,9 @@ impl Tree {
     /// look, the store is the listing.
     pub fn set_home_mirrored(&mut self, on: bool) {
         self.home_mirrored = on;
+        let home_root = self.home_root_ino();
         if let Some(NodeContent::HomeDir { loaded, .. }) =
-            self.nodes.get_mut(&HOME_INO).map(|n| &mut n.content)
+            self.nodes.get_mut(&home_root).map(|n| &mut n.content)
         {
             *loaded = on || *loaded;
         }
@@ -1257,7 +1309,7 @@ impl Tree {
 
     /// The Home node at a key, walking from the Home root.
     pub fn home_ino_for_key(&self, key: &str) -> Option<u64> {
-        let mut ino = HOME_INO;
+        let mut ino = self.home_root_ino();
         for seg in key.split('/').filter(|s| !s.is_empty()) {
             ino = self.lookup(ino, seg)?.ino;
         }
@@ -1267,7 +1319,7 @@ impl Tree {
     /// Ensure every directory along `key` exists (the key's own leaf is a
     /// directory too). Returns the leaf dir's ino.
     fn ensure_home_dirs(&mut self, key: &str, inv: &mut Invalidation) -> u64 {
-        let mut ino = HOME_INO;
+        let mut ino = self.home_root_ino();
         let mut path = String::new();
         for seg in key.split('/').filter(|s| !s.is_empty()) {
             path.push('/');
@@ -1386,7 +1438,7 @@ impl Tree {
         let Some(ino) = self.home_ino_for_key(key) else {
             return inv;
         };
-        if ino == HOME_INO {
+        if ino == self.home_root_ino() {
             return inv;
         }
         self.remove_subtree(ino, &mut inv);
@@ -1398,7 +1450,7 @@ impl Tree {
         // Prune upward.
         let mut cur = node.parent;
         let mut cur_key = crate::mirror::parent_key(key).to_string();
-        while cur != HOME_INO {
+        while cur != self.home_root_ino() {
             let empty = self
                 .children
                 .get(&cur)
@@ -1425,7 +1477,7 @@ impl Tree {
         let Some(ino) = self.home_ino_for_key(from) else {
             return inv;
         };
-        if ino == HOME_INO {
+        if ino == self.home_root_ino() {
             return inv;
         }
         let (dst_dir, dst_name) = match to.rsplit_once('/') {
@@ -1441,7 +1493,11 @@ impl Tree {
                     .push((dst_parent, existing, dst_name.to_string()));
             }
         }
-        let old_parent = self.nodes.get(&ino).map(|n| n.parent).unwrap_or(HOME_INO);
+        let old_parent = self
+            .nodes
+            .get(&ino)
+            .map(|n| n.parent)
+            .unwrap_or(self.home_root_ino());
         let old_name = self
             .nodes
             .get(&ino)
@@ -1506,7 +1562,7 @@ impl Tree {
             }
         }
         // Walk the existing Home tree and drop what is not wanted.
-        let mut stack: Vec<(u64, String)> = vec![(HOME_INO, String::new())];
+        let mut stack: Vec<(u64, String)> = vec![(self.home_root_ino(), String::new())];
         let mut victims: Vec<u64> = Vec::new();
         while let Some((ino, key)) = stack.pop() {
             let children: Vec<(String, u64, bool)> = self
