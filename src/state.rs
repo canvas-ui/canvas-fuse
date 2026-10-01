@@ -226,6 +226,7 @@ pub struct Tree {
     /// `-c mbag <path>` yields `<path>/mbag/{Notes,Tabs,…}`. None = global mount
     /// (root holds `Contexts/`, and later `Workspaces/`).
     context_root: Option<String>,
+    contexts_at_root: bool,
     /// Set when the mount roots a workspace tree view (`-w`). Mutually
     /// exclusive with the context maps above.
     ws: Option<WsState>,
@@ -255,8 +256,14 @@ impl Tree {
         t
     }
 
-    /// Single-context mount: the context's schema dirs are materialized directly
-    /// under ROOT (no `Contexts/` wrapper, no per-context dir).
+    /// A workspace context collection, directly beneath ROOT.
+    pub fn context_collection() -> Self {
+        let mut tree = Self::bare(None);
+        tree.contexts_at_root = true;
+        tree
+    }
+
+    /// Single-context mount: documents are materialized directly beneath ROOT.
     pub fn context_rooted(ctx_id: String) -> Self {
         Self::bare(Some(ctx_id))
     }
@@ -361,6 +368,7 @@ impl Tree {
             ctx_workspaces: HashMap::new(),
             ctx_urls: HashMap::new(),
             context_root,
+            contexts_at_root: false,
             ws: None,
             home_mirrored: false,
         };
@@ -377,7 +385,7 @@ impl Tree {
     /// The directory whose listing changes when contexts appear/disappear:
     /// ROOT in context-rooted mode, the `Contexts/` dir in global mode.
     fn contexts_parent(&self) -> u64 {
-        if self.context_root.is_some() {
+        if self.context_root.is_some() || self.contexts_at_root {
             ROOT_INO
         } else {
             CONTEXTS_INO
@@ -527,7 +535,7 @@ impl Tree {
             return (ino == ROOT_INO).then(|| root_ctx.clone());
         }
         // Global: context dir -> Contexts.
-        (node.parent == CONTEXTS_INO).then(|| node.name.clone())
+        (ino != ROOT_INO && node.parent == self.contexts_parent()).then(|| node.name.clone())
     }
 
     pub fn ino_for_doc(&self, ctx: &str, doc_id: u64) -> Option<u64> {
@@ -672,7 +680,7 @@ impl Tree {
                         let i = self.alloc_ino();
                         self.insert_node(Node {
                             ino: i,
-                            parent: CONTEXTS_INO,
+                            parent: self.contexts_parent(),
                             name: ctx.id.clone(),
                             mtime: now,
                             content: NodeContent::Dir,

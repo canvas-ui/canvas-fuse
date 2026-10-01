@@ -522,3 +522,18 @@ fn the_document_filed_at_the_context_path_keeps_the_plain_name() {
         .ino;
     assert_eq!(tree.doc_for_ino(plain).map(|(_, id)| id), Some(100002));
 }
+
+#[test]
+fn workspace_context_collection_is_directly_rooted() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::context_collection();
+    tree.apply_contexts(&[ctx("first", "canvas://test")]);
+    tree.apply_documents("first", &[note(42, "Hello", "body")], &names);
+    assert!(tree.lookup(ROOT_INO, "Contexts").is_none());
+    let folder = tree.lookup(ROOT_INO, "first").unwrap();
+    assert_eq!(tree.locate_context_dir(folder.ino), Some("first".into()));
+    assert_eq!(tree.locate_context_dir(ROOT_INO), None);
+    assert!(tree.ino_for_doc("first", 42).is_some());
+    tree.apply_contexts(&[]);
+    assert!(tree.lookup(ROOT_INO, "first").is_none());
+}

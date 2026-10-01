@@ -89,6 +89,10 @@ enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<String>,
 
+        /// Mount all context views of the selected workspace, without trees/Home.
+        #[arg(long, requires = "workspace", conflicts_with_all = ["contexts", "trees", "backends", "mirror"])]
+        contexts_only: bool,
+
         /// Include a virtual tree by name (repeatable). One source mounts directly.
         #[arg(long = "tree", value_name = "NAME", conflicts_with = "contexts")]
         trees: Vec<String>,
@@ -288,6 +292,7 @@ fn main() -> Result<()> {
             workspace,
             trees,
             backends,
+            contexts_only,
             detach,
             no_ws,
             no_nudge,
@@ -339,6 +344,7 @@ fn main() -> Result<()> {
                 contexts,
                 workspace,
                 selection,
+                contexts_only,
                 detach,
                 no_ws,
                 no_nudge,
@@ -482,6 +488,7 @@ fn cmd_mount(
     contexts: Vec<String>,
     workspace: Option<String>,
     selection: WorkspaceSelection,
+    contexts_only: bool,
     detach: bool,
     no_ws: bool,
     no_nudge: bool,
@@ -497,7 +504,9 @@ fn cmd_mount(
     // A mount is one workspace. Naming a context inside it (`myws/Contexts/foo`)
     // mounts the CONTEXT view, not the workspace tree view — so the workspace
     // only selects the mount shape when no context was asked for.
-    let workspace_mount = contexts.is_empty().then(|| workspace.clone()).flatten();
+    let workspace_mount = (contexts.is_empty() && !contexts_only)
+        .then(|| workspace.clone())
+        .flatten();
     if mirror.is_some() && workspace_mount.is_none() {
         anyhow::bail!("--mirror applies to workspace mounts (`-w <workspace>`), not context views");
     }
@@ -506,7 +515,7 @@ fn cmd_mount(
     } else {
         None
     };
-    let mountpoint = if selection.is_explicit() {
+    let mountpoint = if selection.is_explicit() || contexts_only {
         mountpoint
     } else {
         match (&workspace_mount, &context_root) {
@@ -604,6 +613,7 @@ fn cmd_mount(
             Some(contexts.clone())
         },
         context_root: context_root.clone(),
+        contexts_at_root: contexts_only,
         workspace: workspace_mount.clone(),
         selection,
         context_workspace: workspace.clone(),
@@ -1008,7 +1018,8 @@ fn cmd_contexts(connect: ConnectArgs, as_json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod root_selector_tests {
-    use super::resolve_root;
+    use super::{resolve_root, Cli};
+    use clap::Parser;
 
     fn resolved(
         selector: Option<&str>,
@@ -1077,6 +1088,38 @@ mod root_selector_tests {
         .unwrap();
         assert_eq!(selection.trees, vec!["context", "directory"]);
         assert!(!selection.includes_home());
+    }
+
+    #[test]
+    fn context_collection_requires_workspace_and_rejects_other_sources() {
+        assert!(Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "/tmp/contexts",
+            "--workspace",
+            "test",
+            "--contexts-only"
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["canvas-fuse", "mount", "/tmp/contexts", "--contexts-only"])
+                .is_err()
+        );
+        for incompatible in ["--mirror", "--context", "--tree", "--backend"] {
+            let mut args = vec![
+                "canvas-fuse",
+                "mount",
+                "/tmp/contexts",
+                "--workspace",
+                "test",
+                "--contexts-only",
+                incompatible,
+            ];
+            if incompatible != "--mirror" {
+                args.push("example");
+            }
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

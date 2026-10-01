@@ -59,6 +59,8 @@ pub struct MountOptions {
     /// When set, the mount is rooted at this single context (its schema dirs at
     /// the mount's top level, no `Contexts/` wrapper).
     pub context_root: Option<String>,
+    /// Root the workspace context collection directly at the mountpoint.
+    pub contexts_at_root: bool,
     /// When set, mount a workspace's trees (context + directory) read/write,
     /// mirroring each tree's path hierarchy. Mutually exclusive with contexts.
     pub workspace: Option<String>,
@@ -212,6 +214,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     } else {
         match &opts.context_root {
             Some(id) => state::Tree::context_rooted(id.clone()),
+            None if opts.contexts_at_root => state::Tree::context_collection(),
             None => state::Tree::new(),
         }
     }));
@@ -221,18 +224,13 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     } else {
         opts.contexts.as_ref().map(|c| c.iter().cloned().collect())
     };
-    // A context mount is still one workspace: resolve its id once so the worker
-    // can drop contexts that belong elsewhere. A lookup failure is not fatal —
-    // the mount then shows every context it can see, which is what it did
-    // before this scoping existed.
+    // Fail closed: an unavailable workspace must never expose other workspaces.
     let context_workspace_id: Option<String> = match (&opts.context_workspace, workspace_mode) {
-        (Some(name), false) => match api.get_workspace(name) {
-            Ok(ws) => Some(ws.id),
-            Err(e) => {
-                log::warn!("workspace {name}: lookup failed, mounting contexts unscoped: {e:#}");
-                None
-            }
-        },
+        (Some(name), false) => Some(
+            api.get_workspace(name)
+                .with_context(|| format!("resolving context workspace {name}"))?
+                .id,
+        ),
         _ => None,
     };
 

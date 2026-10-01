@@ -12,7 +12,13 @@ pub struct Endpoint {
 }
 
 fn canvas_config_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".canvas").join("config"))
+    if let Some(home) = std::env::var_os("CANVAS_USER_HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home).join("config"));
+    }
+    dirs::home_dir().map(|h| {
+        h.join(if cfg!(windows) { "Canvas" } else { ".canvas" })
+            .join("config")
+    })
 }
 
 fn read_json(path: &PathBuf) -> Option<Value> {
@@ -28,8 +34,12 @@ pub fn resolve(
     token_flag: Option<&str>,
     remote_flag: Option<&str>,
 ) -> Result<Endpoint> {
-    let env_server = std::env::var("CANVAS_SERVER").ok();
-    let env_token = std::env::var("CANVAS_API_TOKEN").ok();
+    let env_server = std::env::var("CANVAS_SERVER")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let env_token = std::env::var("CANVAS_API_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
 
     let server = server_flag.map(str::to_string).or(env_server);
     let token = token_flag.map(str::to_string).or(env_token);
