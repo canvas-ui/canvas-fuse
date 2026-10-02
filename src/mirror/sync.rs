@@ -1078,7 +1078,7 @@ impl Mirror {
         let mut head = 0u64;
         loop {
             let page = self.hub.list_objects("", cursor.as_deref(), LIST_PAGE)?;
-            if head == 0 {
+            if cursor.is_none() {
                 head = page.head;
             }
             for o in page.objects {
@@ -1140,23 +1140,26 @@ impl Mirror {
 
     fn apply_change(&self, change: &Change) -> Result<(), HubError> {
         let key = super::normalize_key(&change.key);
-        let stat = change.sha256.as_ref().map(|s| RemoteStat {
-            sha256: s.clone(),
-            size: change.size,
-            mtime: change.mtime,
-        });
-        match change.op {
-            ChangeOp::Put => self.reconcile_key(&key, stat.as_ref(), change.seq),
-            ChangeOp::Delete => self.reconcile_key(&key, None, change.seq),
-            ChangeOp::Rename => {
-                let from = change.from.as_deref().map(super::normalize_key);
-                if let Some(from) = from {
+        // Feed entries are notifications, not snapshots. An old put (including
+        // our own echo) must never roll the base back or invent a conflict.
+        let stat = self.hub.head_object(&key)?;
+        if change.op == ChangeOp::Rename {
+            if let Some(from) = change.from.as_deref().map(super::normalize_key) {
+                let source = self.hub.head_object(&from)?;
+                // Only preserve rename identity while the advertised move is
+                // still current. A recreated source or edited target is instead
+                // reconciled independently against its current bytes.
+                if source.is_none()
+                    && stat.as_ref().map(|s| &s.sha256) == change.sha256.as_ref()
+                    && stat.is_some()
+                {
                     self.apply_remote_rename(&from, &key, change.seq)?;
+                } else {
+                    self.reconcile_key(&from, source.as_ref(), change.seq)?;
                 }
-                // Whatever the hub says is at the new key now.
-                self.reconcile_key(&key, stat.as_ref(), change.seq)
             }
         }
+        self.reconcile_key(&key, stat.as_ref(), change.seq)
     }
 
     /// A hub-side rename: re-key locally when our copy is clean; a dirty
@@ -1210,7 +1213,10 @@ impl Mirror {
         if key.is_empty() || self.is_ignored(key) {
             return Ok(());
         }
-        if self.is_open_for_write(key) {
+        let pending_rename = self.store.jobs().iter().any(
+            |job| matches!(&job.kind, JobKind::Rename { from, to } if from == key || to == key),
+        );
+        if self.is_open_for_write(key) || pending_rename {
             self.rt.lock().recheck.insert(key.to_string());
             return Ok(());
         }

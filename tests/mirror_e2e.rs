@@ -476,3 +476,73 @@ fn store_survives_a_restart_with_cursor_and_queue() {
     m.cycle(false);
     assert_eq!(hub.lock().bytes_of("queued.txt").unwrap(), b"q");
 }
+
+#[test]
+fn delayed_notifications_do_not_conflict_with_current_local_edits() {
+    let r = rig(opts());
+    r.hub.lock().put("doc.txt", b"base");
+    r.mirror.cycle(true);
+    r.hub.lock().put("doc.txt", b"intermediate");
+    r.hub.lock().put("doc.txt", b"current");
+    r.mirror.commit_write("doc.txt", b"current").unwrap();
+    r.mirror.cycle(true);
+    r.mirror.store.set_cursor(1).unwrap();
+    r.mirror.commit_write("doc.txt", b"local edit").unwrap();
+    r.mirror.cycle(false);
+    assert!(r.mirror.conflicts().is_empty());
+    assert!(r.hub.lock().inbox.is_empty());
+    assert_eq!(r.hub.lock().bytes_of("doc.txt").unwrap(), b"local edit");
+}
+
+#[test]
+fn delayed_delete_does_not_resurrect_a_recreated_file() {
+    let r = rig(opts());
+    r.hub.lock().put("doc.txt", b"base");
+    r.mirror.cycle(true);
+    r.hub.lock().delete("doc.txt");
+    r.hub.lock().put("doc.txt", b"replacement");
+    r.mirror.cycle(false);
+    assert_eq!(
+        r.mirror.entry("doc.txt").unwrap().sha256,
+        sha_hex(b"replacement")
+    );
+    assert_eq!(r.mirror.status().pending, 0);
+    assert!(r.mirror.conflicts().is_empty());
+}
+
+#[test]
+fn full_listing_preserves_pending_local_rename() {
+    let r = rig(opts());
+    r.hub.lock().put("old.txt", b"bytes");
+    r.mirror.cycle(true);
+    r.mirror.bytes_for_edit("old.txt").unwrap();
+    r.mirror.rename_local("old.txt", "new.txt").unwrap();
+    r.mirror.cycle(true);
+    r.mirror.cycle(false);
+    assert!(r.hub.lock().bytes_of("old.txt").is_none());
+    assert!(r.mirror.entry("old.txt").is_none());
+    assert_eq!(r.hub.lock().bytes_of("new.txt").unwrap(), b"bytes");
+    assert_eq!(r.mirror.entry("new.txt").unwrap().state, EntryState::Clean);
+    assert!(r.mirror.conflicts().is_empty());
+}
+
+#[test]
+fn delayed_rename_does_not_move_a_recreated_source() {
+    let r = rig(opts());
+    r.hub.lock().put("old.txt", b"original");
+    r.mirror.cycle(true);
+    r.hub.lock().rename("old.txt", "new.txt");
+    r.hub.lock().put("old.txt", b"recreated");
+    r.hub.lock().put("new.txt", b"edited target");
+    r.mirror.cycle(false);
+    assert_eq!(
+        r.mirror.entry("old.txt").unwrap().sha256,
+        sha_hex(b"recreated")
+    );
+    assert_eq!(
+        r.mirror.entry("new.txt").unwrap().sha256,
+        sha_hex(b"edited target")
+    );
+    assert!(r.mirror.conflicts().is_empty());
+    assert_eq!(r.mirror.status().pending, 0);
+}
