@@ -420,3 +420,25 @@ The Canvas clients stay free software in all cases.
 Contributing needs no CLA here, only a DCO sign-off (`git commit -s`). See
 [CONTRIBUTING.md](CONTRIBUTING.md). The dual-licensed Canvas components are
 listed in [NOTICE](NOTICE).
+
+### Client certificate authentication
+
+FUSE reads `tls: { certFile, keyFile }` from the selected CLI remote before
+connecting. Configure it with `canvas remote tls set`. Direct connections can use:
+
+```sh
+canvas-fuse ping --server https://canvas.example.org --token YOUR_TOKEN --tls-cert /absolute/path/client-chain.crt --tls-key /absolute/path/client.key
+```
+
+Connection flags override environment; `CANVAS_TLS_CERT` and `CANVAS_TLS_KEY`
+override the selected remote as a pair. An explicit named remote is still read
+when server/token flags are supplied. Inheriting its identity across a server
+origin change is rejected. HTTP and Socket.IO use the same validated identity,
+including mirror uploads/downloads and reconnects. Server verification is enabled.
+Use a protected unencrypted PEM RSA/EC key and a leaf-first certificate chain.
+Renewal requires restarting/remounting; a running mount retains its loaded identity.
+
+`cargo build --example tls-smoke` plus `node examples/check-tls.mjs` runs native
+HTTP/mirror/upload/Socket.IO checks through a generated nginx fixture. The test
+requires a sibling canvas-common checkout with test dependencies installed,
+OpenSSL, nginx, and permission to bind loopback ports; no kernel mount is needed.

@@ -104,6 +104,7 @@ fn context_id_of(payload: &Payload) -> Option<String> {
 pub fn connect(
     server: &str,
     token: &str,
+    tls: Option<&crate::tls::ClientIdentity>,
     tx: Sender<Job>,
     tree: Arc<RwLock<Tree>>,
     subscriber: Subscriber,
@@ -185,7 +186,11 @@ pub fn connect(
         let _ = event_tx.send(job);
     };
 
-    let client = ClientBuilder::new(server)
+    let mut builder = ClientBuilder::new(server);
+    if let Some(identity) = tls {
+        builder = builder.tls_config(identity.connector()?);
+    }
+    let client = builder
         // canvas-server registers socket.io with transports: ['websocket'],
         // so the default polling handshake gets rejected with a JSON error
         .transport_type(TransportType::Websocket)
@@ -230,6 +235,7 @@ pub fn connect(
 pub fn supervise(
     server: String,
     token: String,
+    tls: Option<crate::tls::ClientIdentity>,
     tx: Sender<Job>,
     tree: Arc<RwLock<Tree>>,
     subscriber: Subscriber,
@@ -246,6 +252,7 @@ pub fn supervise(
         match connect(
             &server,
             &token,
+            tls.as_ref(),
             tx.clone(),
             tree.clone(),
             subscriber.clone(),

@@ -198,7 +198,17 @@ impl HubClient {
         backend: &str,
         device: &super::DeviceIdentity,
     ) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
+        Self::with_tls(server, token, ws_id, backend, device, None)
+    }
+    pub fn with_tls(
+        server: &str,
+        token: &str,
+        ws_id: &str,
+        backend: &str,
+        device: &super::DeviceIdentity,
+        identity: Option<&crate::tls::ClientIdentity>,
+    ) -> Result<Self> {
+        let http = crate::tls::http_builder(server, identity)?
             .connect_timeout(Duration::from_secs(15))
             // No overall timeout: object bodies can be huge. Small calls set
             // their own per request.

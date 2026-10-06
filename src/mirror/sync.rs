@@ -113,6 +113,7 @@ pub struct MirrorConfig {
     pub data_dir: PathBuf,
     pub server: String,
     pub token: String,
+    pub tls: Option<crate::tls::ClientIdentity>,
     pub workspace_id: String,
     pub backend: String,
     pub opts: MirrorOptions,
@@ -187,12 +188,13 @@ impl Mirror {
             store.clone(),
             cfg.opts.cache_budget_bytes,
         )?);
-        let hub = Arc::new(HubClient::new(
+        let hub = Arc::new(HubClient::with_tls(
             &cfg.server,
             &cfg.token,
             &cfg.workspace_id,
             &cfg.backend,
             &cfg.device,
+            cfg.tls.as_ref(),
         )?);
         // Pins given on the command line join the persisted set; `pin rm`
         // is how one leaves.

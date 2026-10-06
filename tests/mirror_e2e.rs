@@ -18,6 +18,7 @@ struct Rig {
 fn rig_with(url: &str, opts: MirrorOptions) -> (Arc<Mirror>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mirror = Mirror::open(MirrorConfig {
+        tls: None,
         data_dir: dir.path().join("data"),
         server: url.to_string(),
         token: "token".into(),
@@ -447,6 +448,7 @@ fn store_survives_a_restart_with_cursor_and_queue() {
     let dir = tempfile::tempdir().unwrap();
     let open = || {
         Mirror::open(MirrorConfig {
+            tls: None,
             data_dir: dir.path().join("data"),
             server: hub.url.clone(),
             token: "t".into(),

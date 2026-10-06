@@ -33,14 +33,22 @@ struct ConnectArgs {
     /// Named remote from ~/.canvas/config/remotes.json
     #[arg(long)]
     remote: Option<String>,
+    /// PEM client certificate chain (leaf first)
+    #[arg(long)]
+    tls_cert: Option<String>,
+    /// Protected unencrypted PEM private key
+    #[arg(long)]
+    tls_key: Option<String>,
 }
 
 impl ConnectArgs {
     fn endpoint(&self) -> Result<config::Endpoint> {
-        config::resolve(
+        config::resolve_with_tls(
             self.server.as_deref(),
             self.token.as_deref(),
             self.remote.as_deref(),
+            self.tls_cert.as_deref(),
+            self.tls_key.as_deref(),
         )
     }
 }
@@ -570,7 +578,7 @@ fn cmd_mount(
     }
 
     // Pre-flight while we can still report to the terminal
-    let api = ApiClient::new(&endpoint.server, &endpoint.token)?;
+    let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
     match api.ping() {
         Ok((payload, rtt)) => {
             let version = payload
@@ -602,6 +610,7 @@ fn cmd_mount(
     let handle = canvas_fuse::mount(MountOptions {
         server: endpoint.server.clone(),
         token: endpoint.token,
+        tls: endpoint.tls,
         mountpoint: mountpoint.clone(),
         data_dir,
         enable_ws: !no_ws,
@@ -958,7 +967,7 @@ fn status_word(alive: bool, mounted: bool) -> &'static str {
 
 fn cmd_ping(connect: ConnectArgs, as_json: bool) -> Result<()> {
     let endpoint = connect.endpoint()?;
-    let api = ApiClient::new(&endpoint.server, &endpoint.token)?;
+    let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
 
     let (payload, rtt) = api.ping()?;
     let auth_ok = api.list_contexts().map(|c| c.len());
@@ -1002,7 +1011,7 @@ fn cmd_ping(connect: ConnectArgs, as_json: bool) -> Result<()> {
 
 fn cmd_contexts(connect: ConnectArgs, as_json: bool) -> Result<()> {
     let endpoint = connect.endpoint()?;
-    let api = ApiClient::new(&endpoint.server, &endpoint.token)?;
+    let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
     let contexts = api.list_contexts()?;
 
     if as_json {

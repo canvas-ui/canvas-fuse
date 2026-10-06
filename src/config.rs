@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct Endpoint {
     pub server: String,
     pub token: String,
+    pub tls: Option<crate::tls::ClientIdentity>,
     /// Where the values came from, for status/error messages
     pub source: String,
 }
@@ -34,6 +35,32 @@ pub fn resolve(
     token_flag: Option<&str>,
     remote_flag: Option<&str>,
 ) -> Result<Endpoint> {
+    resolve_with_tls(server_flag, token_flag, remote_flag, None, None)
+}
+
+pub fn resolve_with_tls(
+    server_flag: Option<&str>,
+    token_flag: Option<&str>,
+    remote_flag: Option<&str>,
+    cert_flag: Option<&str>,
+    key_flag: Option<&str>,
+) -> Result<Endpoint> {
+    let env_cert = std::env::var("CANVAS_TLS_CERT")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let env_key = std::env::var("CANVAS_TLS_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let tls_override = if cert_flag.is_some() || key_flag.is_some() {
+        Some((cert_flag.map(str::to_string), key_flag.map(str::to_string)))
+    } else if env_cert.is_some() || env_key.is_some() {
+        Some((env_cert, env_key))
+    } else {
+        None
+    };
+    let tls_override = tls_override.map(|(cert, key)| -> Result<crate::tls::TlsFiles> {
+        Ok(crate::tls::TlsFiles { cert_file: cert.context("provide both --tls-cert and --tls-key / CANVAS_TLS_CERT and CANVAS_TLS_KEY")?.into(), key_file: key.context("provide both --tls-cert and --tls-key / CANVAS_TLS_CERT and CANVAS_TLS_KEY")?.into() })
+    }).transpose()?;
     let env_server = std::env::var("CANVAS_SERVER")
         .ok()
         .filter(|v| !v.is_empty());
@@ -44,10 +71,14 @@ pub fn resolve(
     let server = server_flag.map(str::to_string).or(env_server);
     let token = token_flag.map(str::to_string).or(env_token);
 
-    if let (Some(server), Some(token)) = (&server, &token) {
+    if let (Some(server), Some(token), None) = (&server, &token, remote_flag) {
         return Ok(Endpoint {
             server: server.clone(),
             token: token.clone(),
+            tls: tls_override
+                .as_ref()
+                .map(|files| files.load(server))
+                .transpose()?,
             source: "flags/env".to_string(),
         });
     }
@@ -109,7 +140,39 @@ pub fn resolve(
         })
         .with_context(|| format!("remote \"{remote_name}\" has no token"))?;
 
+    let files = match tls_override {
+        Some(files) => Some(files),
+        None => remote
+            .get("tls")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value::<crate::tls::TlsFiles>(v.clone()))
+            .transpose()
+            .context("invalid remote TLS configuration")?,
+    };
+    if files.is_some()
+        && (server_flag.is_some()
+            || !std::env::var("CANVAS_SERVER")
+                .unwrap_or_default()
+                .is_empty())
+    {
+        // URL overrides must not silently inherit an identity for a different host.
+        if cert_flag.is_none()
+            && key_flag.is_none()
+            && std::env::var("CANVAS_TLS_CERT")
+                .unwrap_or_default()
+                .is_empty()
+        {
+            if let Some(original) = remote.get("url").and_then(Value::as_str) {
+                anyhow::ensure!(reqwest::Url::parse(original)?.origin() == reqwest::Url::parse(&remote_server)?.origin(), "server override changes origin; provide explicit TLS files instead of inheriting the remote identity");
+            }
+        }
+    }
+    let tls = files
+        .as_ref()
+        .map(|files| files.load(&remote_server))
+        .transpose()?;
     Ok(Endpoint {
+        tls,
         server: remote_server,
         token: remote_token,
         source: format!("remote {remote_name}"),

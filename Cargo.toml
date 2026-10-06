@@ -1,6 +1,6 @@
 [package]
 name = "canvas-fuse"
-version = "0.9.2"
+version = "0.10.0"
 description = "Canvas context FUSE mount that materializes context views as folders"
 authors = ["Jozef Melich <me@idnc.sk>"]
 license = "AGPL-3.0-or-later"
@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 # insertion order; a BTreeMap would alphabetize every save).
 serde_json = { version = "1", features = ["preserve_order"] }
 rust_socketio = "0.6"
+native-tls = "0.2"
 # rust_socketio/rust_engineio hardcode native-tls (no rustls feature). Rather
 # than carry two TLS stacks, reqwest also uses native-tls (its default) and we
 # vendor OpenSSL — compiled statically from source per target — so cross/musl/

@@ -9,6 +9,7 @@ pub mod nudge;
 pub mod render;
 pub mod runtime;
 pub mod state;
+pub mod tls;
 pub mod worker;
 pub mod writes;
 
@@ -50,6 +51,7 @@ impl WorkspaceSelection {
 pub struct MountOptions {
     pub server: String,
     pub token: String,
+    pub tls: Option<tls::ClientIdentity>,
     pub mountpoint: PathBuf,
     pub data_dir: PathBuf,
     pub enable_ws: bool,
@@ -146,7 +148,11 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         .with_context(|| format!("creating mountpoint {}", opts.mountpoint.display()))?;
 
     let names = Arc::new(names::NameStore::open(&opts.data_dir.join("names.redb"))?);
-    let api = Arc::new(api::ApiClient::new(&opts.server, &opts.token)?);
+    let api = Arc::new(api::ApiClient::with_tls(
+        &opts.server,
+        &opts.token,
+        opts.tls.as_ref(),
+    )?);
 
     // Workspace mode roots the mount at a workspace's trees; resolve it up front
     // so the tree is built in the right mode. Live updates ride the
@@ -246,6 +252,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
                 data_dir: opts.data_dir.clone(),
                 server: opts.server.clone(),
                 token: opts.token.clone(),
+                tls: opts.tls.clone(),
                 workspace_id: ws_id,
                 backend: mirror::DEFAULT_BACKEND.to_string(),
                 opts: mopts.clone(),
@@ -374,12 +381,15 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     if enable_ws {
         let server = opts.server.clone();
         let token = opts.token.clone();
+        let tls = opts.tls.clone();
         let ws_tx = job_tx.clone();
         let ws_tree = tree.clone();
         let ws_stop = stop.clone();
         std::thread::Builder::new()
             .name("canvas-fuse-ws".into())
-            .spawn(move || events::supervise(server, token, ws_tx, ws_tree, subscriber, ws_stop))?;
+            .spawn(move || {
+                events::supervise(server, token, tls, ws_tx, ws_tree, subscriber, ws_stop)
+            })?;
     }
 
     // Periodic resync: belt and braces under ws, sole refresh path without it

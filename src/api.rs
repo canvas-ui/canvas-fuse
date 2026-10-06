@@ -84,7 +84,15 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(server: &str, token: &str) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
+        Self::with_tls(server, token, None)
+    }
+
+    pub fn with_tls(
+        server: &str,
+        token: &str,
+        identity: Option<&crate::tls::ClientIdentity>,
+    ) -> Result<Self> {
+        let http = crate::tls::http_builder(server, identity)?
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self {
