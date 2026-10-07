@@ -2,25 +2,31 @@
 //! `workspace:home` backend (Dropbox/iCloud style) instead of a live
 //! passthrough.
 //!
+//! The files are REAL: `Home/` is a plain folder on disk that the FUSE view
+//! merely covers while the daemon runs. Daemon down, hub unreachable, laptop
+//! on a plane — the folder is still there, editable with anything. The next
+//! mount scans it and reconciles with the hub.
+//!
 //! The pieces, each a file here:
 //!
-//! - `store`: the persistent Home tree, base ledger, job queue, pins, cache
-//!   index, conflicts and trash (one redb, `mirror.redb`).
-//! - `cache`: sha256-addressed content cache on disk with a byte budget.
+//! - `local`: the real folder — atomic writes, verified downloads, the
+//!   local trash for hub deletes, conflict snapshots, the scan.
+//! - `store`: the index over it — entries, base ledger, job queue,
+//!   conflicts, trash records (one redb, `mirror.redb`).
 //! - `hub`: the objects-protocol client (`docs/sync-protocol.md`).
 //! - `reconcile`: the pure three-way decision per key.
-//! - `sync`: the engine thread (change feed, push/pull, conflicts, pins,
-//!   eviction, status) plus the `Mirror` facade the FUSE layer talks to
-//!   (local writes, reads, renames, deletes).
+//! - `sync`: the engine thread (scan, change feed, push/pull, conflicts,
+//!   status) plus the `Mirror` facade the FUSE layer talks to (local
+//!   writes, reads, renames, deletes).
 //! - `control`: the unix-socket control channel the CLI subcommands use.
 //!
 //! Identity on the wire is the KEY (relative `/`-separated path, NFC) and the
 //! DIGEST of the bytes. Hub document ids are never stored — they are recycled
 //! and would silently re-bind to something else.
 
-pub mod cache;
 pub mod control;
 pub mod hub;
+pub mod local;
 pub mod reconcile;
 pub mod store;
 pub mod sync;
@@ -64,8 +70,6 @@ pub enum DeleteMode {
 
 #[derive(Debug, Clone)]
 pub struct MirrorOptions {
-    pub pins: Vec<String>,
-    pub cache_budget_bytes: u64,
     pub conflicts: ConflictMode,
     pub deletes: DeleteMode,
     pub ignore: Vec<String>,
@@ -75,8 +79,6 @@ pub struct MirrorOptions {
 impl Default for MirrorOptions {
     fn default() -> Self {
         Self {
-            pins: Vec::new(),
-            cache_budget_bytes: 4096 * 1024 * 1024,
             conflicts: ConflictMode::Prompt,
             deletes: DeleteMode::Propagate,
             ignore: Vec::new(),
@@ -196,44 +198,6 @@ impl IgnoreRules {
     }
 }
 
-/// Pin globs: a key is pinned when it or any ancestor directory matches.
-/// `Docs/` and `Docs` both pin the whole subtree; `*.md` pins every markdown
-/// file at the root; `**/*.pdf` every PDF anywhere.
-pub fn is_pinned(pins: &[String], key: &str) -> bool {
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: true,
-        require_literal_leading_dot: false,
-    };
-    for pin in pins {
-        let pin = pin.trim().trim_start_matches('/');
-        if pin.is_empty() {
-            continue;
-        }
-        let dir = pin.trim_end_matches('/');
-        if key == dir || key.starts_with(&format!("{dir}/")) {
-            return true;
-        }
-        if let Ok(pat) = glob::Pattern::new(dir) {
-            if pat.matches_with(key, opts) {
-                return true;
-            }
-            // A glob naming a directory pins everything under it.
-            let mut prefix = String::new();
-            for seg in key.split('/') {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(seg);
-                if prefix != key && pat.matches_with(&prefix, opts) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// `<stem> (conflict from <device> <YYYY-MM-DD HHmm>).<ext>` next to the
 /// original, the Dropbox spelling. The extension is the LAST one only —
 /// `notes.tar.gz` keeps `.gz`, since that is what apps key their handlers on.
@@ -287,7 +251,10 @@ pub fn store_path(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("mirror.redb")
 }
 
-pub fn cache_dir(data_dir: &std::path::Path) -> PathBuf {
+/// The content cache of the generation-1 mirror. Unused since 0.11.0; left
+/// for the user to delete, since it may hold bytes of an edit that never
+/// got pushed.
+pub fn legacy_cache_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("cache")
 }
 
@@ -340,21 +307,5 @@ mod tests {
         assert!(rules.is_ignored("proj/node_modules/x/y.js"));
         assert!(!rules.is_ignored("proj/src/y.js"));
         assert!(!rules.is_ignored("README.md"));
-    }
-
-    #[test]
-    fn pins_match_subtrees_and_globs() {
-        let pins = vec![
-            "Docs/".to_string(),
-            "*.md".to_string(),
-            "Photos/2026*".to_string(),
-        ];
-        assert!(is_pinned(&pins, "Docs/a/b.txt"));
-        assert!(is_pinned(&pins, "Docs"));
-        assert!(is_pinned(&pins, "notes.md"));
-        assert!(!is_pinned(&pins, "sub/notes.md"));
-        assert!(is_pinned(&pins, "Photos/2026-07/x.jpg"));
-        assert!(!is_pinned(&pins, "Photos/2025/x.jpg"));
-        assert!(!is_pinned(&pins, "Other/a.txt"));
     }
 }

@@ -76,7 +76,7 @@ pub struct MountOptions {
     /// Emit inotify nudges (create+unlink of the virtual `.canvas-tmp`) so
     /// directory watchers see remote-driven view changes. See nudge.rs.
     pub enable_nudge: bool,
-    /// `--mirror`: serve Home/ from a local mirror of the hub's
+    /// `--mirror`: Home/ is a real folder on disk mirrored with the hub's
     /// `workspace:home` backend (workspace mounts only). See mirror/mod.rs.
     pub mirror: Option<mirror::MirrorOptions>,
 }
@@ -240,16 +240,27 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         _ => None,
     };
 
-    // Mirror: open the store and build Home from it before the mount exists,
-    // so the first readdir is served locally whether or not the hub is up.
+    // Mirror: the real Home folder sits UNDER the mountpoint — the FUSE
+    // view covers it while the daemon runs and the files are simply there
+    // when it does not. Open it (and scan it) before the kernel mount
+    // exists: afterwards the path would resolve into the view. Build Home
+    // from the store so the first readdir is served locally whether or not
+    // the hub is up.
     // Bind the id first: a `tree.read()` inside the match scrutinee would
     // live for the whole match and deadlock the `tree.write()` below.
     let mirror_ws_id = tree.read().ws_id();
+    let home_at_root = tree.read().home_root_ino() == state::ROOT_INO;
     let mirror: Option<Arc<mirror::sync::Mirror>> = match (&opts.mirror, mirror_ws_id) {
         (Some(mopts), Some(ws_id)) => {
             let device = mirror::DeviceIdentity::resolve();
+            let home_dir = if home_at_root {
+                opts.mountpoint.clone()
+            } else {
+                opts.mountpoint.join("Home")
+            };
             let m = mirror::sync::Mirror::open(mirror::sync::MirrorConfig {
                 data_dir: opts.data_dir.clone(),
+                home_dir: home_dir.clone(),
                 server: opts.server.clone(),
                 token: opts.token.clone(),
                 tls: opts.tls.clone(),
@@ -266,8 +277,9 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
                 m.snapshot_into(&mut t);
             }
             log::info!(
-                "mirror: {} entries from the store, device {}",
+                "mirror: {} files in {}, device {}",
                 m.store.entry_count(),
+                home_dir.display(),
                 m.device.id
             );
             Some(m)

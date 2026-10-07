@@ -73,8 +73,8 @@ an agent switching the URL updates the folder in place within ~1s (socket.io
 `Home/` is a passthrough drive: real files, no document layer. Directories are
 listed the first time something looks into them (a home drive can be enormous),
 reads take a byte window, writes replace the whole file on close. With
-`--mirror` it becomes an offline-capable device mirror instead — see
-[Mirror mode](#mirror-mode---mirror) below.
+`--mirror` it is a real folder on disk instead, synced with the hub and still
+there when nothing is mounted — see [Mirror mode](#mirror-mode---mirror) below.
 
 Because context-bound browser tabs are just `.url` files, a file manager can
 drive them: `rm reddit.url` closes the tab, writing a `.url` opens one, editing
@@ -126,48 +126,57 @@ keep that outside the mount.
 ## Mirror mode (`--mirror`)
 
 `canvas-fuse mount -w <workspace> <mountpoint> --mirror` turns `Home/` from a
-live passthrough into an **offline-capable device mirror** of the hub's
+live passthrough into a **real folder on disk**, kept in sync with the hub's
 `workspace:home` backend — Dropbox/iCloud style. `Trees/`, `Trash/` and
 context mounts are unchanged. Wire contract: `docs/sync-protocol.md` in
 canvas-server; design: `docs/sync.md`.
 
-What changes under `Home/`:
+The folder is `<mountpoint>/<workspace>/Home` (the mountpoint itself for a
+`--backend workspace:home` mount). While the daemon runs, the FUSE view sits
+on top of it and serves the same files. When the daemon is down — or the
+mount is gone, or the hub is unreachable — **the folder is simply there**:
+every file at its path, editable with anything. That is the point: work
+from a plane with `~/Workspaces/mbag/Home`, then mount again and let it
+reconcile. The daemon reaches the real files through a directory handle it
+opens before mounting, so the two never disagree about where bytes live.
 
-- **The tree is local.** Listings come from a persistent store fed by the
-  hub's object listing and change feed, so `ls`, `stat` and `find` never
-  touch the network. Remote landings show up within a second on a socket
-  nudge (`backend.changed`), or on the poll (`--poll`, default 30 s).
-- **Bytes are cached by content.** Reads are served from an on-disk cache
-  keyed by sha256; a miss is fetched off the FUSE thread. The cache has a
-  byte budget (`--cache-budget-mb`, default 4096) and evicts least recently
-  used files — except **pins**: `--pin <glob>` (repeatable; `Docs/`, `*.md`,
-  `Photos/2026*`) keeps those files materialized and never evicted. Pins
-  persist; `canvas-fuse pin add|rm|list <mountpoint>` manages them later.
-- **Writes are write-back.** A save lands in the cache and the store at
-  once and is pushed by a background engine with `If-Match` on the version
-  it started from (`If-None-Match: *` for new files). `mv` and `rm` queue
-  the same way (`POST objects/rename`, `DELETE` with `If-Match`). The queue
-  is durable: a crash or an offline stretch never loses a write.
+What the daemon does:
+
+- **Every file is local.** The first mount lists the hub and downloads
+  everything (verified by digest, written atomically next to its target).
+  Remote changes land in the folder within a second on a socket nudge
+  (`backend.changed`), or on the poll (`--poll`, default 30 s), and carry the
+  hub's mtime.
+- **Writes are write-back.** A save goes to the folder and is pushed by a
+  background engine with `If-Match` on the version it started from
+  (`If-None-Match: *` for new files). `mv` and `rm` queue the same way
+  (`POST objects/rename`, `DELETE` with `If-Match`). The queue is durable:
+  a crash or an offline stretch never loses a write.
+- **The folder is scanned** at every mount, on `sync now`, and hourly.
+  Files edited, added or removed while no daemon was running are hashed
+  and become pushes and deletes under the same rules as live edits. A
+  touched-but-unchanged file costs one hash and nothing on the wire.
 - **Conflicts never overwrite.** If a file changed here *and* on the hub
   since the last sync, the hub's version keeps the name and yours goes to
   the hub's conflict inbox (`--conflicts prompt`, the default; resolve in
   *Workspace settings › Sync* or the CLI), or — with `--conflicts rename` —
   is saved next to it as `name (conflict from <device> <YYYY-MM-DD HHmm>).ext`.
-  `canvas-fuse conflicts <mountpoint>` lists what this device recorded.
-  Your bytes stay in the local cache either way.
-- **Hub deletes go to a local trash.** A file deleted on the hub disappears
-  from the mount but its bytes are kept for 30 days:
+  `canvas-fuse conflicts <mountpoint>` lists what this device recorded. A
+  copy of your bytes is kept under the data dir (`conflicts/<sha256>`)
+  until the conflict is resolved.
+- **Hub deletes go to a local trash.** A file deleted on the hub leaves the
+  folder but is kept for 30 days in `<data dir>/trash/<path>`:
   `canvas-fuse trash list|restore <mountpoint> [<key>]` (restore = push as a
   new file). An edit on one side beats a delete on the other, both ways.
   `--deletes keep` makes a local `rm` drop only the local copy.
 - **Never uploaded:** dotfiles and everything the hub excludes (its
   `effectiveExclusions`, e.g. `node_modules/`), plus your own `--ignore
-  <glob>`s. Such files stay local and count as `skipped` in the status.
+  <glob>`s. Such files stay in the folder and count as `skipped` in the
+  status.
 
 **Offline.** The mount stays up (it also *mounts* without the hub, once it
-has seen the workspace once). Cached and pinned files read normally;
-uncached ones return `EIO` (logged once per path); creates, edits, renames
-and deletes succeed and queue. Reconnect (socket re-auth, the poll, or
+has seen the workspace once), and every file reads and writes normally —
+there is no cache to miss. Reconnect (socket re-auth, the poll, or
 `canvas-fuse sync now <mountpoint>`) catches up on the change feed,
 reconciles, and drains the queue.
 
@@ -175,33 +184,42 @@ reconciles, and drains the queue.
 `~/.canvas/device.json` (canvas-cli) or a stable hash of hostname + user;
 it is sent as `X-Canvas-Origin` so the mirror recognizes its own echoes.
 State lives in the mount's data dir (`~/.canvas/<remote>/fuse/workspaces/<ws>/`
-or `--data-dir`): `mirror.redb` (tree, base ledger, cursor, jobs, pins,
-conflicts, trash) and `cache/<aa>/<sha256>`. Hub document ids are never
-stored — keys and digests are the identity.
+or `--data-dir`): `mirror.redb` (index, base ledger, cursor, jobs,
+conflicts, trash records), `trash/` and `conflicts/`. The bytes themselves
+are only ever in `Home/`. Hub document ids are never stored — keys and
+digests are the identity.
 
 **Status and control.** `canvas-fuse status [--json]` shows a `mirror`
-block per mirror mount (`state` idle|syncing|offline|paused, `cursor`/`head`,
-`pending`, `failed`, `conflicts`, `skipped`, `pinned`, `cacheUsed`,
-`cacheBudget`, `lastSync`, `lastError`), read from a status file the daemon
-writes next to its state file (`~/.local/state/canvas-fuse/mounts/*.status.json`).
-The `sync`, `pin`, `conflicts` and `trash` subcommands talk to the daemon
-over a unix socket in the same directory (`<hash>.sock`; one JSON request,
-one JSON reply). The daemon also reports to the hub
+block per mirror mount (`state` idle|syncing|offline|paused, `home`,
+`cursor`/`head`, `pending`, `failed`, `conflicts`, `skipped`, `entries`,
+`lastSync`, `lastError`), read from a status file the daemon writes next
+to its state file (`~/.local/state/canvas-fuse/mounts/*.status.json`).
+The `sync`, `conflicts` and `trash` subcommands talk to the daemon over a
+unix socket in the same directory (`<hash>.sock`; one JSON request, one
+JSON reply). The daemon also reports to the hub
 (`POST /workspaces/:id/mirrors/:deviceId/status`) so *Settings › Devices*
 shows its lag.
 
 ```sh
-canvas-fuse mount -w myws ~/Workspaces --mirror --pin Docs/ --pin '*.md' \
-  --conflicts rename --cache-budget-mb 8192
+canvas-fuse mount -w myws ~/Workspaces --mirror --conflicts rename
 canvas-fuse status --json
 canvas-fuse sync now ~/Workspaces/myws
-canvas-fuse pin add ~/Workspaces/myws Photos/2026
 canvas-fuse conflicts ~/Workspaces/myws
 canvas-fuse trash list ~/Workspaces/myws
+canvas-fuse unmount ~/Workspaces/myws      # ~/Workspaces/myws/Home stays, as files
 ```
 
+Upgrading from 0.10 (the content-cache mirror): the first mount of 0.11
+moves every cached file into `Home/` and carries the ledger over — a file
+the hub already has is neither downloaded nor uploaded again, an edit that
+never got pushed is pushed, and keys that were never fetched are pulled by
+the listing that follows. The old `cache/` under the data dir is then dead
+weight (a log line says so) and can be deleted. `--pin` and
+`--cache-budget-mb` are accepted and ignored — there is nothing to pin when
+everything is local.
+
 Without `--mirror`, `Home/` keeps its passthrough behaviour — with one
-addition: `mv` inside `Home/` now works (per file, via the hub's rename
+addition: `mv` inside `Home/` works (per file, via the hub's rename
 route) instead of failing with `EACCES`.
 
 ## Install
@@ -279,7 +297,7 @@ Use `--backend workspace:home` to mount just the home drive:
 
 ```sh
 canvas-fuse mount -w universe --backend workspace:home ~/CanvasHome
-# Optional persistent cache and offline writes:
+# As a real, offline-capable folder (~/CanvasHome itself holds the files):
 canvas-fuse mount -w universe --backend workspace:home ~/CanvasHome --mirror
 ```
 
@@ -308,7 +326,7 @@ mirror mounts defer tree loading until reconnect.
 Without source selectors, existing workspace and context layouts are unchanged.
 Selected mounts get separate state directories per workspace and mountpoint,
 so they can run alongside a full workspace mount. Use the exact supplied path
-for `unmount`, `sync`, and `pin` commands.
+for `unmount` and `sync` commands.
 
 ### mount flags
 
@@ -326,6 +344,11 @@ for `unmount`, `sync`, and `pin` commands.
 | `--resync <secs>` | 30 | Full resync interval in seconds. |
 | `--data-dir <path>` | `~/.canvas/<remote>/fuse/…` | Per-mount state directory (sticky filename map). Also `CANVAS_FUSE_DATA_DIR`. |
 | `--blob-cache-mb <n>` | 256 | In-memory cache budget for file content. |
+| `--mirror` | false | Keep `Home/` as a real folder mirrored with the hub (see [Mirror mode](#mirror-mode---mirror)). |
+| `--conflicts prompt\|rename` | prompt | Mirror: inbox (hub keeps the name) or Dropbox-style conflict copy. |
+| `--deletes propagate\|keep` | propagate | Mirror: whether a local `rm` deletes on the hub. |
+| `--ignore <glob>` | - | Mirror: never upload matching keys; repeatable. |
+| `--poll <secs>` | 30 | Mirror: change-feed poll interval (socket nudges arrive sooner). |
 
 ### Connection
 

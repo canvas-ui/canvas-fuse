@@ -9,36 +9,52 @@
 //! state from the hub rather than reading yesterday's shape.
 //!
 //! Keys are hub keys: NFC, `/`-separated, relative. Never document ids.
+//!
+//! Generation 2 (0.11.0): bytes moved from a content cache into the real
+//! Home folder. Every v1 table is retired on open, but not before its
+//! entries, bases, trash and conflict records are handed to the mirror
+//! (`take_legacy`), which moves the cached bytes into the folder and
+//! carries the ledger over — nothing re-downloads, nothing unpushed is lost.
 
 use anyhow::{Context as _, Result};
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// `key → Entry`: what the local Home tree contains and in what state.
-const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries_v1");
+const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries_v2");
 /// `key → Base`: the last version agreed with the hub (the "B" of the
 /// three-way decision). Written only after the byte op succeeded.
-const BASE: TableDefinition<&str, &[u8]> = TableDefinition::new("base_v1");
+const BASE: TableDefinition<&str, &[u8]> = TableDefinition::new("base_v2");
 /// Small named numbers: the change-feed cursor, the head we last saw.
-const CURSOR: TableDefinition<&str, u64> = TableDefinition::new("cursor_v1");
+const CURSOR: TableDefinition<&str, u64> = TableDefinition::new("cursor_v2");
 /// Small named strings: hub instance id, backend, exclusions snapshot.
-const META: TableDefinition<&str, &str> = TableDefinition::new("meta_v1");
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta_v2");
 /// `seq → Job`: the durable write-back queue, in submission order.
-const JOBS: TableDefinition<u64, &[u8]> = TableDefinition::new("jobs_v1");
-/// `glob → ""`: pinned globs (always materialized, never evicted).
-const PINS: TableDefinition<&str, &str> = TableDefinition::new("pins_v1");
-/// `sha256 → CacheMeta`: what the on-disk cache holds, for LRU + pins.
-const CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_v1");
+const JOBS: TableDefinition<u64, &[u8]> = TableDefinition::new("jobs_v2");
 /// `key → Conflict`: conflicts recorded on this device.
-const CONFLICTS: TableDefinition<&str, &[u8]> = TableDefinition::new("conflicts_v1");
-/// `key → Trashed`: local copies of keys the hub deleted (30 days).
-const TRASH: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_v1");
-/// `dir key → ""`: directories that exist explicitly (empty ones, mkdir'd
-/// ones) — everything else is implied by the keys under it.
-const DIRS: TableDefinition<&str, &str> = TableDefinition::new("dirs_v1");
+const CONFLICTS: TableDefinition<&str, &[u8]> = TableDefinition::new("conflicts_v2");
+/// `key → Trashed`: keys the hub deleted whose file sits in the local
+/// trash folder (30 days).
+const TRASH: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_v2");
+/// `dir key → ""`: directories known to exist on disk, including empty
+/// ones — what the scan found, what `mkdir` made, what a pull passed
+/// through.
+const DIRS: TableDefinition<&str, &str> = TableDefinition::new("dirs_v2");
 
-const RETIRED: [&str; 0] = [];
+const RETIRED: [&str; 10] = [
+    "entries_v1",
+    "base_v1",
+    "cursor_v1",
+    "meta_v1",
+    "jobs_v1",
+    "pins_v1",
+    "cache_v1",
+    "conflicts_v1",
+    "trash_v1",
+    "dirs_v1",
+];
 
 pub const CURSOR_KEY: &str = "cursor";
 pub const HEAD_KEY: &str = "head";
@@ -162,14 +178,6 @@ pub struct Job {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheMeta {
-    pub size: u64,
-    pub atime: u64,
-    #[serde(default)]
-    pub pin_refs: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
     pub key: String,
     pub local_sha256: String,
@@ -195,8 +203,45 @@ pub struct Trashed {
     pub ts: u64,
 }
 
+/// What a generation-1 store held, read once on open before the tables go.
+#[derive(Debug, Default)]
+pub struct Legacy {
+    pub entries: Vec<(String, Entry)>,
+    pub bases: Vec<(String, Base)>,
+    pub trash: Vec<(String, Trashed)>,
+    pub conflicts: Vec<Conflict>,
+}
+
+impl Legacy {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+            && self.bases.is_empty()
+            && self.trash.is_empty()
+            && self.conflicts.is_empty()
+    }
+}
+
 pub struct Store {
     db: Database,
+    legacy: parking_lot::Mutex<Option<Legacy>>,
+}
+
+fn read_legacy_table<T: DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    name: &str,
+) -> Vec<(String, T)> {
+    let mut out = Vec::new();
+    let Ok(t) = tx.open_table(TableDefinition::<&str, &[u8]>::new(name)) else {
+        return out;
+    };
+    if let Ok(iter) = t.iter() {
+        for item in iter.flatten() {
+            if let Some(v) = dec::<T>(item.1.value()) {
+                out.push((item.0.value().to_string(), v));
+            }
+        }
+    }
+    out
 }
 
 fn enc<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -214,21 +259,53 @@ impl Store {
         }
         let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
         let tx = db.begin_write()?;
+        // Generation 1 → 2: keep what the old tables said before they go.
+        // `open_table` would CREATE a missing table, so only ask for the
+        // ones the catalogue lists.
+        let existing: HashSet<String> = tx
+            .list_tables()
+            .map(|t| t.map(|d| d.name().to_string()).collect())
+            .unwrap_or_default();
+        let legacy = if existing.contains("entries_v1") {
+            let l = Legacy {
+                entries: read_legacy_table::<Entry>(&tx, "entries_v1"),
+                bases: read_legacy_table::<Base>(&tx, "base_v1"),
+                trash: read_legacy_table::<Trashed>(&tx, "trash_v1"),
+                conflicts: read_legacy_table::<Conflict>(&tx, "conflicts_v1")
+                    .into_iter()
+                    .map(|(_, c)| c)
+                    .collect(),
+            };
+            (!l.is_empty()).then_some(l)
+        } else {
+            None
+        };
         tx.open_table(ENTRIES)?;
         tx.open_table(BASE)?;
         tx.open_table(CURSOR)?;
         tx.open_table(META)?;
         tx.open_table(JOBS)?;
-        tx.open_table(PINS)?;
-        tx.open_table(CACHE)?;
         tx.open_table(CONFLICTS)?;
         tx.open_table(TRASH)?;
         tx.open_table(DIRS)?;
         for name in RETIRED {
+            // The value type does not matter for a drop; redb keys the
+            // catalogue by name.
             let _ = tx.delete_table(TableDefinition::<&str, &[u8]>::new(name));
+            let _ = tx.delete_table(TableDefinition::<u64, &[u8]>::new(name));
+            let _ = tx.delete_table(TableDefinition::<&str, u64>::new(name));
+            let _ = tx.delete_table(TableDefinition::<&str, &str>::new(name));
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            legacy: parking_lot::Mutex::new(legacy),
+        })
+    }
+
+    /// The generation-1 records found on this open, once.
+    pub fn take_legacy(&self) -> Option<Legacy> {
+        self.legacy.lock().take()
     }
 
     // ── generic helpers ──────────────────────────────────────────────────────
@@ -537,63 +614,6 @@ impl Store {
         Ok(dropped)
     }
 
-    // ── pins ─────────────────────────────────────────────────────────────────
-
-    pub fn pins(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let Ok(tx) = self.db.begin_read() else {
-            return out;
-        };
-        let Ok(t) = tx.open_table(PINS) else {
-            return out;
-        };
-        if let Ok(iter) = t.iter() {
-            for item in iter.flatten() {
-                out.push(item.0.value().to_string());
-            }
-        }
-        out
-    }
-
-    pub fn add_pin(&self, glob: &str) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut t = tx.open_table(PINS)?;
-            t.insert(glob, "")?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn remove_pin(&self, glob: &str) -> Result<bool> {
-        let tx = self.db.begin_write()?;
-        let had;
-        {
-            let mut t = tx.open_table(PINS)?;
-            had = t.remove(glob)?.is_some();
-        }
-        tx.commit()?;
-        Ok(had)
-    }
-
-    // ── cache index ──────────────────────────────────────────────────────────
-
-    pub fn cache_meta(&self, sha: &str) -> Option<CacheMeta> {
-        self.get_json(CACHE, sha)
-    }
-
-    pub fn put_cache_meta(&self, sha: &str, meta: &CacheMeta) -> Result<()> {
-        self.put_json(CACHE, sha, meta)
-    }
-
-    pub fn remove_cache_meta(&self, sha: &str) -> Result<()> {
-        self.remove_key(CACHE, sha)
-    }
-
-    pub fn cache_metas(&self) -> Vec<(String, CacheMeta)> {
-        self.list_json(CACHE, "")
-    }
-
     // ── conflicts ────────────────────────────────────────────────────────────
 
     pub fn conflict(&self, key: &str) -> Option<Conflict> {
@@ -792,7 +812,6 @@ mod tests {
             s.enqueue(JobKind::Delete { key: "b".into() }).unwrap();
             // Same (kind, key) replaces rather than duplicates.
             s.enqueue(JobKind::Push { key: "a".into() }).unwrap();
-            s.add_pin("Docs/").unwrap();
             s.add_dir("Empty").unwrap();
         }
         let s = Store::open(&path).unwrap();
@@ -802,7 +821,6 @@ mod tests {
         // The replaced push moved to the back of the queue.
         assert!(matches!(jobs[0].kind, JobKind::Delete { .. }));
         assert!(matches!(jobs[1].kind, JobKind::Push { .. }));
-        assert_eq!(s.pins(), vec!["Docs/".to_string()]);
         assert!(s.has_dir("Empty"));
         let dropped = s.remove_jobs_for("a").unwrap();
         assert_eq!(dropped.len(), 1);

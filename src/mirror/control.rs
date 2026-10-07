@@ -1,4 +1,4 @@
-//! Control channel for the CLI subcommands (`sync now`, `pin`, `conflicts`,
+//! Control channel for the CLI subcommands (`sync now`, `conflicts`,
 //! `trash`): a unix socket next to the mount's state file
 //! (`<state dir>/mounts/<name>.<hash>.sock`). One request per connection —
 //! a JSON object on one line — answered with one JSON object.
@@ -8,8 +8,7 @@
 //! none. The daemon owns its redb exclusively, so the CLI cannot read the
 //! store itself; it asks.
 //!
-//! Requests: `{"cmd":"sync"}`, `{"cmd":"pin","op":"add|rm|list","glob":…}`,
-//! `{"cmd":"conflicts"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
+//! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
 //! `{"cmd":"status"}`. Responses: `{"ok":true, …}` or
 //! `{"ok":false,"error":"…"}`.
 
@@ -111,28 +110,6 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
             let finished = mirror.sync_now(Duration::from_secs(600));
             json!({ "ok": true, "finished": finished, "mirror": mirror.status() })
         }
-        "pin" => match op {
-            "list" => json!({ "ok": true, "pins": mirror.pins() }),
-            "add" => {
-                let Some(glob) = req.get("glob").and_then(Value::as_str) else {
-                    return json!({ "ok": false, "error": "glob required" });
-                };
-                match mirror.add_pin(glob) {
-                    Ok(()) => json!({ "ok": true, "pins": mirror.pins() }),
-                    Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
-                }
-            }
-            "rm" => {
-                let Some(glob) = req.get("glob").and_then(Value::as_str) else {
-                    return json!({ "ok": false, "error": "glob required" });
-                };
-                match mirror.remove_pin(glob) {
-                    Ok(had) => json!({ "ok": true, "removed": had, "pins": mirror.pins() }),
-                    Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
-                }
-            }
-            _ => json!({ "ok": false, "error": "pin op must be add|rm|list" }),
-        },
         "conflicts" => json!({ "ok": true, "conflicts": mirror.conflicts() }),
         "trash" => match op {
             "list" => {
@@ -141,14 +118,14 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
                     .into_iter()
                     .map(|(key, t)| {
                         json!({
-                            "key": key,
+                            "key": key.clone(),
                             "sha256": t.sha256,
                             "size": t.size,
                             "ts": t.ts,
                             "deletedAt": chrono::DateTime::<chrono::Utc>::from(
                                 std::time::UNIX_EPOCH + Duration::from_millis(t.ts)
                             ).to_rfc3339(),
-                            "cached": mirror.cache.has(&t.sha256),
+                            "kept": mirror.local.trash_path(&key).is_file(),
                         })
                     })
                     .collect();

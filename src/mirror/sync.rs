@@ -1,29 +1,30 @@
 //! The sync engine and the `Mirror` facade.
 //!
-//! `Mirror` is what the rest of the mount holds: the store, the cache, the
-//! hub client, and the local operations the FUSE layer calls on the session
-//! thread (`commit_write`, `delete_local`, `rename_local`, reads). Those
-//! never touch the network — they update the store, the cache and the job
-//! queue, then wake the engine.
+//! `Mirror` is what the rest of the mount holds: the store, the real folder
+//! (`local`), the hub client, and the local operations the FUSE layer calls
+//! on the session thread (`commit_write`, `delete_local`, `rename_local`,
+//! reads). Those never touch the network — they change the folder and the
+//! store, queue a job, then wake the engine.
 //!
 //! The engine is one thread (`run`) that owns every network round-trip:
 //!
-//! 1. catch up on the hub's change feed (or rebuild from the listing when
+//! 1. on a full pass, scan the folder: what changed while the daemon was
+//!    down (or before it ever ran) becomes a push, a delete, a new entry;
+//! 2. catch up on the hub's change feed (or rebuild from the listing when
 //!    there is no cursor / the cursor is too old), reconciling every touched
 //!    key with the three-way table in `reconcile.rs`;
-//! 2. drain the durable job queue (pushes, deletes, renames, conflict
+//! 3. drain the durable job queue (pushes, deletes, renames, conflict
 //!    uploads) — in submission order, one job in flight per key, backoff
 //!    per job;
-//! 3. materialize pinned keys, evict the cache to budget, expire the trash;
-//! 4. write the status file and report to the hub.
+//! 4. expire the local trash, write the status file, report to the hub.
 //!
 //! It wakes on a nudge (`backend.changed` on the socket), on a local write,
 //! on `sync now`, and on the poll timer. Offline is a state, not an error:
-//! the engine notes it, the mount keeps serving the store and the cache, and
-//! the queue waits for the next wake that finds the hub back.
+//! the engine notes it, the mount keeps serving the folder, and the queue
+//! waits for the next wake that finds the hub back.
 
-use super::cache::Cache;
 use super::hub::{Change, ChangeOp, HubClient, HubError, PutBody, PutOptions, RemoteStat};
+use super::local::Local;
 use super::reconcile::{decide, Action};
 use super::store::{
     Base, Conflict, Entry, EntryState, Job, JobKind, Store, Trashed, HEAD_KEY, META_INSTANCE,
@@ -45,8 +46,8 @@ use std::time::{Duration, Instant, SystemTime};
 const LIST_PAGE: usize = 1000;
 const CHANGES_PAGE: usize = 1000;
 const TRASH_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
-/// A full listing pass this often even without `sync now`, so a change the
-/// feed lost (or an exclusion that changed) is bounded.
+/// A full pass (folder scan + hub listing) this often even without
+/// `sync now`, so a change the feed lost is bounded.
 const FULL_PASS_EVERY: Duration = Duration::from_secs(3600);
 const STATUS_THROTTLE: Duration = Duration::from_secs(1);
 const REPORT_THROTTLE: Duration = Duration::from_secs(5);
@@ -70,6 +71,9 @@ pub enum SyncState {
 pub struct MirrorStatus {
     pub workspace_id: String,
     pub backend: String,
+    /// The real folder the mirror keeps.
+    #[serde(default)]
+    pub home: String,
     pub state: SyncState,
     pub cursor: Option<u64>,
     pub head: Option<u64>,
@@ -77,9 +81,6 @@ pub struct MirrorStatus {
     pub failed: u64,
     pub conflicts: u64,
     pub skipped: u64,
-    pub pinned: Vec<String>,
-    pub cache_used: u64,
-    pub cache_budget: u64,
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
     #[serde(default)]
@@ -92,7 +93,7 @@ pub enum EngineMsg {
     /// Something changed on the hub (socket nudge) or locally (a write
     /// queued a job): run a cycle.
     Wake,
-    /// `sync now`: a full listing pass, then answer when done.
+    /// `sync now`: a full pass (scan + listing), then answer when done.
     SyncNow(Option<Sender<()>>),
     /// The socket re-authenticated: the hub is back.
     Reconnect,
@@ -111,6 +112,9 @@ pub struct ViewLink {
 
 pub struct MirrorConfig {
     pub data_dir: PathBuf,
+    /// The real folder: `<mountpoint>/Home` (or the mountpoint itself for a
+    /// home-only mount). Opened before the kernel mount covers it.
+    pub home_dir: PathBuf,
     pub server: String,
     pub token: String,
     pub tls: Option<crate::tls::ClientIdentity>,
@@ -136,36 +140,28 @@ struct Runtime {
     recheck: HashSet<String>,
 }
 
-struct PendingRead {
-    offset: i64,
-    size: u32,
-    reply: ReplyData,
-}
-
-struct FetchJob {
-    key: String,
-    sha: String,
+/// What a folder scan found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub added: u64,
+    pub changed: u64,
+    pub removed: u64,
 }
 
 pub struct Mirror {
     pub store: Arc<Store>,
-    pub cache: Arc<Cache>,
+    pub local: Arc<Local>,
     pub hub: Arc<HubClient>,
     pub device: DeviceIdentity,
     pub opts: MirrorOptions,
     pub mountpoint: PathBuf,
     status_path: Option<PathBuf>,
     ignore: RwLock<IgnoreRules>,
-    pins: RwLock<Vec<String>>,
     rt: Mutex<Runtime>,
     engine_tx: Mutex<Option<Sender<EngineMsg>>>,
     view: Mutex<Option<ViewLink>>,
     /// Keys with an open write handle: remote landings wait for the close.
     open_writes: Mutex<HashSet<String>>,
-    /// Paths whose offline read was already logged (once per path).
-    eio_logged: Mutex<HashSet<String>>,
-    in_flight: Mutex<HashMap<String, Vec<PendingRead>>>,
-    fetch_tx: Sender<FetchJob>,
 }
 
 fn ms_to_systime(ms: u64) -> SystemTime {
@@ -183,11 +179,7 @@ impl Mirror {
         std::fs::create_dir_all(&cfg.data_dir)
             .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
         let store = Arc::new(Store::open(&super::store_path(&cfg.data_dir))?);
-        let cache = Arc::new(Cache::open(
-            &super::cache_dir(&cfg.data_dir),
-            store.clone(),
-            cfg.opts.cache_budget_bytes,
-        )?);
+        let local = Arc::new(Local::open(&cfg.home_dir, &cfg.data_dir)?);
         let hub = Arc::new(HubClient::with_tls(
             &cfg.server,
             &cfg.token,
@@ -196,12 +188,22 @@ impl Mirror {
             &cfg.device,
             cfg.tls.as_ref(),
         )?);
-        // Pins given on the command line join the persisted set; `pin rm`
-        // is how one leaves.
-        for p in &cfg.opts.pins {
-            store.add_pin(p)?;
+        if let Some(legacy) = store.take_legacy() {
+            migrate_legacy(
+                &store,
+                &local,
+                &super::legacy_cache_dir(&cfg.data_dir),
+                legacy,
+            );
         }
-        let pins = store.pins();
+        let cache = super::legacy_cache_dir(&cfg.data_dir);
+        if cache.is_dir() {
+            log::warn!(
+                "{}: content cache of an older mirror, no longer read (its files were moved to {}); delete it",
+                cache.display(),
+                cfg.home_dir.display()
+            );
+        }
         // Hub exclusions from the last online run, so an offline mount
         // applies the same rules it did yesterday.
         let mut patterns: Vec<String> = super::MIRROR_IGNORE_DEFAULTS
@@ -213,17 +215,15 @@ impl Mirror {
         }
         patterns.extend(cfg.opts.ignore.iter().cloned());
 
-        let (fetch_tx, fetch_rx) = channel::<FetchJob>();
         let mirror = Arc::new(Self {
             store,
-            cache,
+            local,
             hub,
             device: cfg.device,
             opts: cfg.opts,
             mountpoint: cfg.mountpoint,
             status_path: cfg.status_path,
             ignore: RwLock::new(IgnoreRules::new(patterns)),
-            pins: RwLock::new(pins),
             rt: Mutex::new(Runtime {
                 state: SyncState::Idle,
                 last_sync: None,
@@ -237,11 +237,19 @@ impl Mirror {
             engine_tx: Mutex::new(None),
             view: Mutex::new(None),
             open_writes: Mutex::new(HashSet::new()),
-            eio_logged: Mutex::new(HashSet::new()),
-            in_flight: Mutex::new(HashMap::new()),
-            fetch_tx,
         });
-        mirror.spawn_fetch_pool(fetch_rx, 3);
+        // What happened to the folder while no daemon was looking is the
+        // first thing to know — before the view is built, before the hub
+        // is asked anything.
+        let report = mirror.scan_local();
+        if report != ScanReport::default() {
+            log::info!(
+                "mirror: folder scan found {} new, {} changed, {} removed since the last run",
+                report.added,
+                report.changed,
+                report.removed
+            );
+        }
         Ok(mirror)
     }
 
@@ -316,27 +324,6 @@ impl Mirror {
         self.ignore.read().is_ignored(key)
     }
 
-    pub fn pins(&self) -> Vec<String> {
-        self.pins.read().clone()
-    }
-
-    pub fn is_pinned(&self, key: &str) -> bool {
-        super::is_pinned(&self.pins.read(), key)
-    }
-
-    pub fn add_pin(&self, glob: &str) -> Result<()> {
-        self.store.add_pin(glob)?;
-        *self.pins.write() = self.store.pins();
-        self.wake();
-        Ok(())
-    }
-
-    pub fn remove_pin(&self, glob: &str) -> Result<bool> {
-        let had = self.store.remove_pin(glob)?;
-        *self.pins.write() = self.store.pins();
-        Ok(had)
-    }
-
     // ── view updates (engine → tree → kernel) ───────────────────────────────
 
     fn with_view<F: FnOnce(&mut Tree) -> Invalidation>(&self, f: F) {
@@ -367,6 +354,10 @@ impl Mirror {
 
     fn view_rename(&self, from: &str, to: &str) {
         self.with_view(|t| t.rename_home_key(from, to));
+    }
+
+    fn view_ensure_dir(&self, key: &str) {
+        self.with_view(|t| t.ensure_home_dir_key(key));
     }
 
     /// Build the whole Home tree from the store (mount time).
@@ -402,17 +393,34 @@ impl Mirror {
         self.open_writes.lock().contains(key)
     }
 
-    /// A flushed write: bytes into the cache, entry Dirty, push queued.
+    /// Every directory a key passes through exists on disk now; the store
+    /// (and so the view) says so too.
+    fn record_dirs_for(&self, key: &str) {
+        let mut p = super::parent_key(key);
+        while !p.is_empty() {
+            if self.store.has_dir(p) {
+                break;
+            }
+            let _ = self.store.add_dir(p);
+            p = super::parent_key(p);
+        }
+    }
+
+    /// A flushed write: bytes into the folder, entry Dirty, push queued.
     pub fn commit_write(&self, key: &str, bytes: &[u8]) -> Result<Entry> {
-        let sha = self.cache.insert_bytes(bytes)?;
+        let h = self.local.write_atomic(key, bytes)?;
         let entry = Entry {
-            sha256: sha,
-            size: bytes.len() as u64,
-            mtime: super::now_ms(),
+            sha256: h.sha256,
+            size: h.size,
+            mtime: h.mtime,
             state: EntryState::Dirty,
         };
         self.store.put_entry(key, &entry)?;
-        let _ = self.store.remove_trashed(key);
+        self.record_dirs_for(key);
+        if self.store.trashed(key).is_some() {
+            let _ = self.store.remove_trashed(key);
+            self.local.trash_remove(key);
+        }
         if self.is_ignored(key) {
             self.rt.lock().skipped.insert(
                 key.to_string(),
@@ -428,10 +436,23 @@ impl Mirror {
         Ok(entry)
     }
 
-    /// `rm`: tombstone + delete job (propagate), or forget (keep).
+    /// `rm`: the file goes, then tombstone + delete job (propagate), or
+    /// forget (keep).
     pub fn delete_local(&self, key: &str) -> Result<bool> {
-        let Some(entry) = self.store.entry(key) else {
+        if self.store.entry(key).is_none() {
             return Ok(false);
+        }
+        self.local.remove_file(key)?;
+        self.note_local_gone(key)?;
+        self.wake();
+        Ok(true)
+    }
+
+    /// The file is gone from the folder (an `rm`, or the scan found it
+    /// missing): tell the hub, or just forget it.
+    fn note_local_gone(&self, key: &str) -> Result<()> {
+        let Some(entry) = self.store.entry(key) else {
+            return Ok(());
         };
         self.store.remove_jobs_for(key)?;
         let base = self.store.base(key);
@@ -455,11 +476,12 @@ impl Mirror {
             }
         }
         self.rt.lock().skipped.remove(key);
-        self.wake();
-        Ok(true)
+        Ok(())
     }
 
     pub fn mkdir_local(&self, key: &str) -> Result<()> {
+        self.local.mkdir(key)?;
+        self.record_dirs_for(key);
         self.store.add_dir(key)?;
         if !self.is_ignored(key) {
             self.store.enqueue(JobKind::Mkdir {
@@ -475,6 +497,13 @@ impl Mirror {
         if self.store.dir_has_children(key) {
             return Ok(false);
         }
+        match self.local.rmdir(key) {
+            Ok(()) => {}
+            // Something on disk the store does not know (a dotfile written
+            // around the mount, a stray part file): still not empty.
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
         self.store.remove_dir(key)?;
         self.store.remove_jobs_for(key)?;
         if !self.is_ignored(key) {
@@ -486,17 +515,27 @@ impl Mirror {
         Ok(true)
     }
 
-    /// `mv` of a file: re-key the entry, the base and the pending jobs; a
-    /// rename job goes out only when the hub knows the source (has a base).
-    /// A file that was never pushed just gets pushed under its new name.
+    /// `mv` of a file: the file moves, then the entry, the base and the
+    /// pending jobs are re-keyed; a rename job goes out only when the hub
+    /// knows the source (has a base). A file that was never pushed just
+    /// gets pushed under its new name.
     pub fn rename_local(&self, from: &str, to: &str) -> Result<()> {
         if self.store.entry(to).is_some() {
             // Overwrite-rename: the destination goes first, in the queue
             // too, so the hub sees delete(to) then rename(from → to).
             self.delete_local(to)?;
         }
+        self.local.rename(from, to)?;
+        self.rekey_entry(from, to)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// The store side of a rename; the bytes already moved.
+    fn rekey_entry(&self, from: &str, to: &str) -> Result<()> {
         let dropped = self.store.remove_jobs_for(from)?;
         self.store.rekey(from, to)?;
+        self.record_dirs_for(to);
         if let Some(c) = self.store.conflict(from) {
             self.store.remove_conflict(from)?;
             self.store.put_conflict(&Conflict {
@@ -504,7 +543,10 @@ impl Mirror {
                 ..c
             })?;
         }
-        let _ = self.store.remove_trashed(to);
+        if self.store.trashed(to).is_some() {
+            let _ = self.store.remove_trashed(to);
+            self.local.trash_remove(to);
+        }
         let has_base = self.store.base(to).is_some();
         if has_base && !self.is_ignored(from) {
             if self.is_ignored(to) {
@@ -566,16 +608,17 @@ impl Mirror {
                 ow.insert(to.to_string());
             }
         }
-        self.wake();
         Ok(())
     }
 
-    /// `mv` of a directory: every file under it individually (the hub has
-    /// no directory rename), plus the explicit dir records.
+    /// `mv` of a directory: one rename on disk, then every file under it
+    /// individually in the store (the hub has no directory rename), plus
+    /// the dir records.
     pub fn rename_dir_local(&self, from: &str, to: &str) -> Result<()> {
         if self.store.dir_has_children(to) || self.store.entry(to).is_some() {
             anyhow::bail!("target exists");
         }
+        self.local.rename(from, to)?;
         let children: Vec<String> = self
             .store
             .entries_under(from)
@@ -584,10 +627,11 @@ impl Mirror {
             .collect();
         for key in children {
             let rest = &key[from.len() + 1..];
-            self.rename_local(&key, &format!("{to}/{rest}"))?;
+            self.rekey_entry(&key, &format!("{to}/{rest}"))?;
         }
         self.store.rekey_dirs(from, to)?;
-        if !self.store.has_dir(to) && !self.store.dir_has_children(to) {
+        self.record_dirs_for(to);
+        if !self.store.has_dir(to) {
             self.store.add_dir(to)?;
         }
         if !self.is_ignored(to) && !self.store.dir_has_children(to) {
@@ -605,176 +649,34 @@ impl Mirror {
         Ok(())
     }
 
-    /// The bytes an editor starts from. Cache hit → local; miss → fetch now
-    /// (blocking, this IS the open) when the hub is reachable.
+    /// The bytes an editor starts from: the file, as it is.
     pub fn bytes_for_edit(&self, key: &str) -> Result<Vec<u8>, i32> {
-        let Some(entry) = self.entry(key) else {
+        if self.entry(key).is_none() {
             return Err(libc::ENOENT);
-        };
-        if self.cache.has(&entry.sha256) {
-            self.cache.touch(&entry.sha256);
-            return self.cache.read_all(&entry.sha256).map_err(|_| libc::EIO);
         }
-        if self.is_offline() {
-            self.log_eio_once(key);
-            return Err(libc::EIO);
-        }
-        match self.cache.fetch(&self.hub, key, &entry.sha256) {
-            Ok(got) => {
-                if got != entry.sha256 {
-                    // The hub moved on while we were not looking; take what it
-                    // has — the entry follows via the feed.
-                    log::debug!("{key}: fetched {got} while entry says {}", entry.sha256);
-                }
-                self.cache.read_all(&got).map_err(|_| libc::EIO)
+        self.local.read_all(key).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                libc::ENOENT
+            } else {
+                log::warn!("{key}: read failed: {e}");
+                libc::EIO
             }
-            Err(HubError::NotFound) => Err(libc::ENOENT),
-            Err(e) => {
-                if e.is_offline() {
-                    self.set_state(SyncState::Offline);
-                }
-                log::warn!("{key}: fetch for edit failed: {e}");
-                Err(libc::EIO)
-            }
-        }
+        })
     }
 
-    fn log_eio_once(&self, key: &str) {
-        if self.eio_logged.lock().insert(key.to_string()) {
-            log::warn!("{key}: not cached and the hub is unreachable (EIO); logged once");
-        }
-    }
-
-    // ── reads (session thread; cache pread or non-blocking fetch) ───────────
+    // ── reads (session thread; local pread) ─────────────────────────────────
 
     pub fn read(&self, key: &str, offset: i64, size: u32, reply: ReplyData) {
-        let Some(entry) = self.entry(key) else {
+        if self.entry(key).is_none() {
             reply.error(libc::ENOENT);
             return;
-        };
-        let sha = entry.sha256.clone();
-        if self.cache.has(&sha) {
-            match self.cache.pread(&sha, offset.max(0) as u64, size as usize) {
-                Ok(bytes) => reply.data(&bytes),
-                Err(e) => {
-                    log::warn!("{key}: cache read failed: {e}");
-                    reply.error(libc::EIO);
-                }
-            }
-            return;
         }
-        if self.is_offline() {
-            self.log_eio_once(key);
-            reply.error(libc::EIO);
-            return;
-        }
-        let pending = PendingRead {
-            offset,
-            size,
-            reply,
-        };
-        let mut in_flight = self.in_flight.lock();
-        if let Some(waiters) = in_flight.get_mut(&sha) {
-            waiters.push(pending);
-            return;
-        }
-        in_flight.insert(sha.clone(), vec![pending]);
-        drop(in_flight);
-        let _ = self.fetch_tx.send(FetchJob {
-            key: key.to_string(),
-            sha,
-        });
-    }
-
-    fn spawn_fetch_pool(self: &Arc<Self>, rx: Receiver<FetchJob>, workers: usize) {
-        let pool: Vec<Sender<FetchJob>> = (0..workers.max(1))
-            .map(|i| {
-                let (tx, rx) = channel::<FetchJob>();
-                // Weak: the pool must not keep the mirror (and its redb lock)
-                // alive after the mount dropped it.
-                let me = Arc::downgrade(self);
-                std::thread::Builder::new()
-                    .name(format!("canvas-fuse-mirror-fetch-{i}"))
-                    .spawn(move || {
-                        while let Ok(job) = rx.recv() {
-                            let Some(m) = me.upgrade() else {
-                                break;
-                            };
-                            m.run_fetch(job);
-                        }
-                    })
-                    .expect("spawning mirror fetch worker");
-                tx
-            })
-            .collect();
-        std::thread::Builder::new()
-            .name("canvas-fuse-mirror-fetch-dispatch".into())
-            .spawn(move || {
-                let mut next = 0usize;
-                while let Ok(job) = rx.recv() {
-                    if pool[next % pool.len()].send(job).is_err() {
-                        break;
-                    }
-                    next += 1;
-                }
-            })
-            .expect("spawning mirror fetch dispatcher");
-    }
-
-    fn run_fetch(&self, job: FetchJob) {
-        let entry = self.entry(&job.key);
-        let oversized = entry
-            .as_ref()
-            .map(|e| e.size > self.cache.budget())
-            .unwrap_or(false);
-        // A file bigger than the whole cache is served by byte windows
-        // straight from the hub; caching it would evict everything else.
-        if oversized {
-            let waiters = self.in_flight.lock().remove(&job.sha).unwrap_or_default();
-            for w in waiters {
-                let start = w.offset.max(0) as u64;
-                let end = start + w.size as u64 - 1;
-                match self.hub.get_range(&job.key, start, end) {
-                    Ok(bytes) => w.reply.data(&bytes),
-                    Err(e) => {
-                        if e.is_offline() {
-                            self.set_state(SyncState::Offline);
-                        }
-                        w.reply.error(libc::EIO);
-                    }
-                }
-            }
-            return;
-        }
-        let result = self.cache.fetch(&self.hub, &job.key, &job.sha);
-        let waiters = self.in_flight.lock().remove(&job.sha).unwrap_or_default();
-        match result {
-            Ok(got) => {
-                for w in waiters {
-                    match self
-                        .cache
-                        .pread(&got, w.offset.max(0) as u64, w.size as usize)
-                    {
-                        Ok(bytes) => w.reply.data(&bytes),
-                        Err(_) => w.reply.error(libc::EIO),
-                    }
-                }
-                if got != job.sha {
-                    // Bytes changed under the entry; let the engine sort it
-                    // out rather than serving a mismatch silently forever.
-                    self.wake();
-                }
-            }
+        match self.local.pread(key, offset.max(0) as u64, size as usize) {
+            Ok(bytes) => reply.data(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => reply.error(libc::ENOENT),
             Err(e) => {
-                if e.is_offline() {
-                    self.set_state(SyncState::Offline);
-                    self.log_eio_once(&job.key);
-                } else {
-                    log::warn!("{}: fetch failed: {e}", job.key);
-                }
-                for w in waiters {
-                    w.reply.error(libc::EIO);
-                }
+                log::warn!("{key}: read failed: {e}");
+                reply.error(libc::EIO);
             }
         }
     }
@@ -785,26 +687,24 @@ impl Mirror {
         self.store.trash()
     }
 
-    /// Bring a hub-deleted key back from the local copy: a new push.
+    /// Bring a hub-deleted key back from the local trash: a new push.
     pub fn trash_restore(&self, key: &str) -> Result<()> {
-        let t = self
-            .store
+        self.store
             .trashed(key)
             .with_context(|| format!("{key} is not in the mirror trash"))?;
-        if !self.cache.has(&t.sha256) {
-            anyhow::bail!("{key}: the bytes are no longer cached");
-        }
         if self.store.entry(key).is_some() {
             anyhow::bail!("{key} exists again; restore to a different name first");
         }
+        let h = self.local.trash_restore(key)?;
         self.store.remove_base(key)?;
         let entry = Entry {
-            sha256: t.sha256.clone(),
-            size: t.size,
-            mtime: super::now_ms(),
+            sha256: h.sha256,
+            size: h.size,
+            mtime: h.mtime,
             state: EntryState::Dirty,
         };
         self.store.put_entry(key, &entry)?;
+        self.record_dirs_for(key);
         self.store.remove_trashed(key)?;
         self.store.enqueue(JobKind::Push {
             key: key.to_string(),
@@ -821,9 +721,9 @@ impl Mirror {
     /// The hub says a conflict was resolved: drop our record; the outcome
     /// arrives as ordinary changes on the feed.
     pub fn conflict_resolved(&self, key: &str) {
-        if let Some(mut c) = self.store.conflict(key) {
-            c.resolved = true;
+        if let Some(c) = self.store.conflict(key) {
             let _ = self.store.remove_conflict(key);
+            self.local.conflict_remove(&c.local_sha256);
             log::info!("{key}: conflict resolved on the hub");
         }
         self.wake();
@@ -837,6 +737,7 @@ impl Mirror {
         MirrorStatus {
             workspace_id: self.hub.workspace_id().to_string(),
             backend: self.hub.backend().to_string(),
+            home: self.local.display_path().to_string_lossy().to_string(),
             state: rt.state,
             cursor: self.store.cursor(),
             head: self.store.number(HEAD_KEY),
@@ -849,9 +750,6 @@ impl Mirror {
                 .filter(|c| !c.resolved)
                 .count() as u64,
             skipped: rt.skipped.len() as u64,
-            pinned: self.pins.read().clone(),
-            cache_used: self.cache.used(),
-            cache_budget: self.cache.budget(),
             last_sync: rt.last_sync.clone(),
             last_error: rt.last_error.clone(),
             entries: self.store.entry_count(),
@@ -904,14 +802,15 @@ impl Mirror {
         let body = serde_json::json!({
             "backend": s.backend,
             "client": "fuse",
-            "path": self.mountpoint.to_string_lossy(),
-            "prefixes": s.pinned,
+            "path": s.home,
+            "prefixes": Vec::<String>::new(),
             "cursor": s.cursor.unwrap_or(0),
             "pending": s.pending,
             "failed": s.failed,
             "conflicts": s.conflicts,
             "skipped": s.skipped,
             "state": s.state,
+            "direction": "bi",
             "lastSync": s.last_sync.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
             "lastError": s.last_error,
             "version": env!("CARGO_PKG_VERSION"),
@@ -923,6 +822,122 @@ impl Mirror {
             }
             Err(e) => log::debug!("mirror status report failed: {e}"),
         }
+    }
+
+    // ── the folder scan ──────────────────────────────────────────────────────
+
+    /// Reconcile the store with what is in the folder: files edited, added
+    /// or removed while no daemon was running become pushes and deletes;
+    /// directories that appeared or vanished are recorded. Pure local work,
+    /// so it runs offline too. Keys with an open write handle are left to
+    /// their close.
+    pub fn scan_local(&self) -> ScanReport {
+        let mut report = ScanReport::default();
+        let mut seen_files: HashSet<String> = HashSet::new();
+        let mut seen_dirs: HashSet<String> = HashSet::new();
+        let mut new_dirs: Vec<String> = Vec::new();
+        for (key, st) in self.local.walk() {
+            if st.is_dir {
+                seen_dirs.insert(key.clone());
+                if !self.store.has_dir(&key) {
+                    let _ = self.store.add_dir(&key);
+                    self.view_ensure_dir(&key);
+                    new_dirs.push(key);
+                }
+                continue;
+            }
+            seen_files.insert(key.clone());
+            if self.is_open_for_write(&key) {
+                continue;
+            }
+            let entry = self.store.entry(&key);
+            let live = entry.as_ref().filter(|e| e.state != EntryState::Tombstone);
+            if live.is_some_and(|e| e.size == st.size && e.mtime == st.mtime) {
+                continue;
+            }
+            let Ok(h) = self.local.hash(&key) else {
+                continue;
+            };
+            if let Some(e) = live {
+                if e.sha256 == h.sha256 {
+                    // Touched, not changed: remember the new stamp so the
+                    // next scan is cheap again.
+                    let _ = self.store.put_entry(
+                        &key,
+                        &Entry {
+                            size: h.size,
+                            mtime: h.mtime,
+                            ..e.clone()
+                        },
+                    );
+                    continue;
+                }
+                report.changed += 1;
+            } else {
+                report.added += 1;
+            }
+            let new = Entry {
+                sha256: h.sha256,
+                size: h.size,
+                mtime: h.mtime,
+                state: EntryState::Dirty,
+            };
+            let _ = self.store.put_entry(&key, &new);
+            if self.store.trashed(&key).is_some() {
+                let _ = self.store.remove_trashed(&key);
+                self.local.trash_remove(&key);
+            }
+            if self.is_ignored(&key) {
+                self.rt.lock().skipped.insert(
+                    key.clone(),
+                    "matches an exclusion rule; kept local only".into(),
+                );
+            } else {
+                self.rt.lock().skipped.remove(&key);
+                // `enqueue`, not `ensure_job`: the user did something new,
+                // so a push in backoff starts over.
+                let _ = self.store.enqueue(JobKind::Push { key: key.clone() });
+            }
+            self.view_upsert(&key, new.size, new.mtime);
+        }
+        for (key, e) in self.store.entries("") {
+            if e.state == EntryState::Tombstone
+                || seen_files.contains(&key)
+                || self.is_open_for_write(&key)
+            {
+                continue;
+            }
+            report.removed += 1;
+            let _ = self.note_local_gone(&key);
+            self.view_remove(&key);
+        }
+        // A new directory with something in it is created on the hub by
+        // the puts below it; an empty one has nothing to carry its name.
+        // Decided once the walk is complete, not when the directory was
+        // met (its files come after it).
+        for d in new_dirs {
+            let prefix = format!("{d}/");
+            let has_children = seen_files.iter().any(|k| k.starts_with(&prefix))
+                || seen_dirs.iter().any(|k| k.starts_with(&prefix));
+            if !has_children && !self.is_ignored(&d) {
+                self.ensure_job(JobKind::Mkdir { key: d });
+            }
+        }
+        for d in self.store.dirs() {
+            if seen_dirs.contains(&d) {
+                continue;
+            }
+            let _ = self.store.remove_dir(&d);
+            let _ = self.store.remove_jobs_for(&d);
+            if !self.is_ignored(&d) {
+                self.ensure_job(JobKind::Rmdir { key: d.clone() });
+            }
+            self.view_remove(&d);
+        }
+        if report != ScanReport::default() {
+            self.wake();
+        }
+        report
     }
 
     // ── the engine ───────────────────────────────────────────────────────────
@@ -982,7 +997,7 @@ impl Mirror {
         log::debug!("mirror engine exiting");
     }
 
-    /// One pass: catch up, reconcile, drain, materialize, evict, report.
+    /// One pass: scan (full only), catch up, reconcile, drain, report.
     /// Public so tests drive it without a thread.
     pub fn cycle(&self, full: bool) {
         let before = self.rt.lock().state;
@@ -1030,6 +1045,19 @@ impl Mirror {
     }
 
     fn cycle_inner(&self, full: bool) -> Result<(), HubError> {
+        if full {
+            // Local first: what the folder says is true whether or not the
+            // hub answers.
+            let report = self.scan_local();
+            if report != ScanReport::default() {
+                log::info!(
+                    "mirror: folder scan found {} new, {} changed, {} removed",
+                    report.added,
+                    report.changed,
+                    report.removed
+                );
+            }
+        }
         self.refresh_hub_rules()?;
         if full || self.store.cursor().is_none() || self.store.meta(META_LISTED).is_none() {
             self.rebuild_from_listing()?;
@@ -1040,7 +1068,6 @@ impl Mirror {
         self.recheck_deferred()?;
         self.recover_jobs();
         self.drain_jobs()?;
-        self.materialize_pins()?;
         Ok(())
     }
 
@@ -1164,9 +1191,9 @@ impl Mirror {
         self.reconcile_key(&key, stat.as_ref(), change.seq)
     }
 
-    /// A hub-side rename: re-key locally when our copy is clean; a dirty
-    /// source is a new file under the old name (delete + add semantics), so
-    /// it stays put and pushes as new.
+    /// A hub-side rename: move the file and re-key locally when our copy is
+    /// clean; a dirty source is a new file under the old name (delete + add
+    /// semantics), so it stays put and pushes as new.
     fn apply_remote_rename(&self, from: &str, to: &str, seq: u64) -> Result<(), HubError> {
         let Some(entry) = self.store.entry(from) else {
             return Ok(());
@@ -1189,12 +1216,23 @@ impl Mirror {
         if self.store.entry(to).is_some() {
             // Something already sits at the target locally; treat the source
             // as deleted and let the target reconcile on its own.
+            let _ = self.local.remove_file(from);
+            let _ = self.store.remove_entry(from);
+            let _ = self.store.remove_base(from);
+            self.view_remove(from);
+            return Ok(());
+        }
+        if let Err(e) = self.local.rename(from, to) {
+            // The file is not where the store says; the next full pass
+            // sorts the folder out, and `to` pulls on its own.
+            log::warn!("{from} → {to}: local move failed ({e:#}); pulling instead");
             let _ = self.store.remove_entry(from);
             let _ = self.store.remove_base(from);
             self.view_remove(from);
             return Ok(());
         }
         let _ = self.store.rekey(from, to);
+        self.record_dirs_for(to);
         if let Some(mut b) = self.store.base(to) {
             b.remote_seq = seq;
             let _ = self.store.put_base(to, &b);
@@ -1268,25 +1306,32 @@ impl Mirror {
             }
             Action::Pull { .. } => {
                 if let Some(r) = remote {
-                    self.pull_key(key, r, seq, entry.as_ref())?;
+                    self.pull_key(key, r, seq)?;
                 }
             }
             Action::TrashLocal => {
                 if let Some(e) = entry {
-                    let _ = self.store.put_trashed(
-                        key,
-                        &Trashed {
-                            sha256: e.sha256.clone(),
-                            size: e.size,
-                            ts: super::now_ms(),
-                        },
-                    );
+                    match self.local.trash_put(key) {
+                        Ok(()) => {
+                            let _ = self.store.put_trashed(
+                                key,
+                                &Trashed {
+                                    sha256: e.sha256.clone(),
+                                    size: e.size,
+                                    ts: super::now_ms(),
+                                },
+                            );
+                            log::info!(
+                                "{key}: deleted on the hub; local copy kept in the mirror trash"
+                            );
+                        }
+                        Err(err) => log::warn!("{key}: deleted on the hub; could not move the local copy to the trash: {err:#}"),
+                    }
                 }
                 let _ = self.store.remove_jobs_for(key);
                 let _ = self.store.remove_entry(key);
                 let _ = self.store.remove_base(key);
                 self.view_remove(key);
-                log::info!("{key}: deleted on the hub; local copy kept in the mirror trash");
             }
             Action::Adopt => match entry {
                 Some(mut e) => {
@@ -1319,67 +1364,83 @@ impl Mirror {
         Ok(())
     }
 
-    /// Take the hub's version of a key: bytes now when the key is pinned or
-    /// its previous bytes were cached (the user evidently reads it), else a
-    /// placeholder fetched on first read.
-    fn pull_key(
-        &self,
-        key: &str,
-        r: &RemoteStat,
-        seq: u64,
-        entry: Option<&Entry>,
-    ) -> Result<(), HubError> {
-        let want_bytes =
-            self.is_pinned(key) || entry.map(|e| self.cache.has(&e.sha256)).unwrap_or(false);
-        let mut sha = r.sha256.clone();
-        if want_bytes && !self.cache.has(&sha) {
-            match self.cache.fetch(&self.hub, key, &sha) {
-                Ok(got) => sha = got,
-                Err(HubError::NotFound) => {
-                    // Gone between the feed and now; the next change says so.
-                    return Ok(());
-                }
-                Err(e) if e.is_offline() => return Err(e),
-                Err(e) => log::warn!("{key}: pull failed ({e}); serving on demand"),
+    /// Take the hub's version of a key: the bytes land in the folder (an
+    /// atomic replace), and entry + base follow.
+    fn pull_key(&self, key: &str, r: &RemoteStat, seq: u64) -> Result<(), HubError> {
+        let h = match self.local.fetch(&self.hub, key, &r.sha256, r.mtime) {
+            Ok(h) => h,
+            Err(HubError::NotFound) => {
+                // Gone between the feed and now; the next change says so.
+                return Ok(());
             }
-        }
-        let size = if sha == r.sha256 {
-            r.size
-        } else {
-            self.store
-                .cache_meta(&sha)
-                .map(|m| m.size)
-                .unwrap_or(r.size)
+            Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
+            Err(e) => {
+                // A digest mismatch or a local disk error: the key stays as
+                // it was and the next pass tries again.
+                log::warn!("{key}: pull failed ({e}); will retry");
+                return Ok(());
+            }
         };
         let new_entry = Entry {
-            sha256: sha.clone(),
-            size,
-            mtime: r.mtime,
+            sha256: h.sha256.clone(),
+            size: h.size,
+            mtime: h.mtime,
             state: EntryState::Clean,
         };
         let _ = self.store.put_entry(key, &new_entry);
         let _ = self.store.put_base(
             key,
             &Base {
-                sha256: sha,
-                size,
+                sha256: h.sha256,
+                size: h.size,
                 mtime: r.mtime,
                 remote_seq: seq,
             },
         );
-        let _ = self.store.remove_trashed(key);
+        self.record_dirs_for(key);
+        if self.store.trashed(key).is_some() {
+            let _ = self.store.remove_trashed(key);
+            self.local.trash_remove(key);
+        }
         let _ = self.store.remove_jobs_for(key);
-        self.view_upsert(key, size, r.mtime);
+        self.view_upsert(key, h.size, h.mtime);
         Ok(())
     }
 
+    /// Both sides changed: keep a copy of OUR bytes (the hub's will take the
+    /// name once the conflict upload went through) and queue the upload.
     fn record_conflict(&self, key: &str, entry: &Entry, base: Option<&Base>, remote_sha: &str) {
+        let local_sha = match self.local.conflict_snapshot(key) {
+            Ok(sha) => {
+                if sha != entry.sha256 {
+                    // The file moved on since the entry was written (an
+                    // edit the scan has not seen): the snapshot is what the
+                    // user has now, so that is what the conflict is about.
+                    if let Ok(h) = self.local.hash(key) {
+                        let _ = self.store.put_entry(
+                            key,
+                            &Entry {
+                                sha256: h.sha256,
+                                size: h.size,
+                                mtime: h.mtime,
+                                state: EntryState::Dirty,
+                            },
+                        );
+                    }
+                }
+                sha
+            }
+            Err(e) => {
+                log::warn!("{key}: cannot snapshot the local version for the conflict: {e:#}");
+                return;
+            }
+        };
         if let Some(existing) = self.store.conflict(key) {
-            if existing.local_sha256 == entry.sha256 && !existing.uploaded {
+            if existing.local_sha256 == local_sha && !existing.uploaded {
                 // Already queued.
                 self.ensure_job(JobKind::Conflict {
                     key: key.to_string(),
-                    local_sha256: entry.sha256.clone(),
+                    local_sha256: local_sha,
                     base_sha256: base.map(|b| b.sha256.clone()),
                 });
                 return;
@@ -1388,7 +1449,7 @@ impl Mirror {
         log::warn!("{key}: changed here and on the hub; uploading ours as a conflict");
         let _ = self.store.put_conflict(&Conflict {
             key: key.to_string(),
-            local_sha256: entry.sha256.clone(),
+            local_sha256: local_sha.clone(),
             hub_sha256: Some(remote_sha.to_string()),
             base_sha256: base.map(|b| b.sha256.clone()),
             ts: super::now_ms(),
@@ -1402,7 +1463,7 @@ impl Mirror {
         let _ = self.store.remove_jobs_for(key);
         self.ensure_job(JobKind::Conflict {
             key: key.to_string(),
-            local_sha256: entry.sha256.clone(),
+            local_sha256: local_sha,
             base_sha256: base.map(|b| b.sha256.clone()),
         });
     }
@@ -1496,36 +1557,34 @@ impl Mirror {
     }
 
     fn run_one(&self, job: &Job, blocked: &mut HashSet<String>) -> Result<(), HubError> {
-        {
-            match self.run_job(job) {
-                Ok(()) => {
-                    let _ = self.store.remove_job(job.seq);
-                    self.write_status(false);
-                }
-                Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
-                Err(e) if e.is_permanent() => {
-                    log::warn!("job {:?} refused by the hub: {e}", job.kind);
-                    self.rt
-                        .lock()
-                        .skipped
-                        .insert(job.kind.key().to_string(), e.to_string());
-                    let _ = self.store.remove_job(job.seq);
-                }
-                Err(e) => {
-                    let mut j = job.clone();
-                    j.attempts += 1;
-                    j.not_before = super::now_ms() + backoff_ms(j.attempts);
-                    j.last_error = Some(e.to_string());
-                    log::warn!(
-                        "job {:?} failed (attempt {}): {e}; retry in {}s",
-                        j.kind,
-                        j.attempts,
-                        backoff_ms(j.attempts) / 1000
-                    );
-                    let _ = self.store.update_job(&j);
-                    for k in job.kind.keys() {
-                        blocked.insert(k.to_string());
-                    }
+        match self.run_job(job) {
+            Ok(()) => {
+                let _ = self.store.remove_job(job.seq);
+                self.write_status(false);
+            }
+            Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
+            Err(e) if e.is_permanent() => {
+                log::warn!("job {:?} refused by the hub: {e}", job.kind);
+                self.rt
+                    .lock()
+                    .skipped
+                    .insert(job.kind.key().to_string(), e.to_string());
+                let _ = self.store.remove_job(job.seq);
+            }
+            Err(e) => {
+                let mut j = job.clone();
+                j.attempts += 1;
+                j.not_before = super::now_ms() + backoff_ms(j.attempts);
+                j.last_error = Some(e.to_string());
+                log::warn!(
+                    "job {:?} failed (attempt {}): {e}; retry in {}s",
+                    j.kind,
+                    j.attempts,
+                    backoff_ms(j.attempts) / 1000
+                );
+                let _ = self.store.update_job(&j);
+                for k in job.kind.keys() {
+                    blocked.insert(k.to_string());
                 }
             }
         }
@@ -1554,23 +1613,33 @@ impl Mirror {
     }
 
     fn run_push(&self, key: &str) -> Result<(), HubError> {
-        let Some(entry) = self.store.entry(key) else {
+        let Some(mut entry) = self.store.entry(key) else {
             return Ok(());
         };
         if entry.state != EntryState::Dirty {
             return Ok(());
         }
-        let path = self.cache.path_for(&entry.sha256);
-        if !path.is_file() {
-            log::error!(
-                "{key}: dirty but its bytes ({}) are not in the cache",
-                entry.sha256
-            );
-            return Err(HubError::Refused {
-                status: 0,
-                code: Some("BYTES_MISSING".into()),
-                message: "local bytes missing from the cache".into(),
-            });
+        // The entry says what the bytes were when it was written; the file
+        // is what gets uploaded. A stamp that moved means an edit the store
+        // has not seen yet (the folder was touched around the daemon): hash
+        // again so the digest header matches the body.
+        let Some(st) = self.local.stat(key) else {
+            log::info!("{key}: dirty but gone from the folder");
+            let _ = self.note_local_gone(key);
+            return Ok(());
+        };
+        if st.size != entry.size || st.mtime != entry.mtime {
+            match self.local.hash(key) {
+                Ok(h) => {
+                    entry.sha256 = h.sha256;
+                    entry.size = h.size;
+                    entry.mtime = h.mtime;
+                    let _ = self.store.put_entry(key, &entry);
+                }
+                Err(e) => {
+                    return Err(HubError::Other(format!("{key}: reading for push: {e}")));
+                }
+            }
         }
         let base = self.store.base(key);
         let opts = PutOptions {
@@ -1580,7 +1649,10 @@ impl Mirror {
             mtime: Some(entry.mtime),
             ..Default::default()
         };
-        match self.hub.put_object(key, &PutBody::File(path), &opts) {
+        match self
+            .hub
+            .put_object(key, &PutBody::File(self.local.path(key)), &opts)
+        {
             Ok(res) => {
                 let sha = if res.sha256.is_empty() {
                     entry.sha256.clone()
@@ -1606,7 +1678,6 @@ impl Mirror {
                 if let Some(mut now) = self.store.entry(key) {
                     if now.sha256 == sha && now.state == EntryState::Dirty {
                         now.state = EntryState::Clean;
-                        now.mtime = mtime;
                         let _ = self.store.put_entry(key, &now);
                     }
                 }
@@ -1660,16 +1731,14 @@ impl Mirror {
                 // file there.
                 let _ = self.store.remove_base(to);
                 if let Some(mut e) = self.store.entry(to) {
-                    if self.cache.has(&e.sha256) {
+                    if self.local.is_file(to) {
                         e.state = EntryState::Dirty;
                         let _ = self.store.put_entry(to, &e);
                         self.ensure_job(JobKind::Push {
                             key: to.to_string(),
                         });
                     } else {
-                        log::warn!(
-                            "{to}: source vanished on the hub and bytes are not cached; dropping"
-                        );
+                        log::warn!("{to}: source vanished on the hub and the file is not in the folder; dropping");
                         let _ = self.store.remove_entry(to);
                         self.view_remove(to);
                     }
@@ -1708,11 +1777,18 @@ impl Mirror {
         local_sha: &str,
         base_sha: Option<&str>,
     ) -> Result<(), HubError> {
-        let path = self.cache.path_for(local_sha);
-        if !path.is_file() {
-            log::error!("{key}: conflict bytes {local_sha} missing from the cache");
-            return Ok(());
+        if !self.local.has_conflict_bytes(local_sha) {
+            // The snapshot is missing (a crash between record and copy):
+            // take one now if the file still has those bytes.
+            match self.local.conflict_snapshot(key) {
+                Ok(sha) if sha == local_sha => {}
+                _ => {
+                    log::error!("{key}: conflict bytes {local_sha} are gone; nothing to upload");
+                    return Ok(());
+                }
+            }
         }
+        let path = self.local.conflict_path(local_sha);
         let mut record = self.store.conflict(key).unwrap_or(Conflict {
             key: key.to_string(),
             local_sha256: local_sha.to_string(),
@@ -1749,40 +1825,11 @@ impl Mirror {
         let _ = self.store.put_conflict(&record);
         log::info!("{key}: conflict copy uploaded ({target})");
 
-        // Now the hub version keeps the name: adopt it. Ask the hub rather
+        // Now the hub version keeps the name: take it. Ask the hub rather
         // than trusting the stat that raised the conflict — it may have
         // moved again.
         match self.hub.head_object(key)? {
-            Some(stat) => {
-                let entry = self.store.entry(key);
-                let force_bytes = entry
-                    .as_ref()
-                    .map(|e| self.cache.has(&e.sha256))
-                    .unwrap_or(false);
-                let mut sha = stat.sha256.clone();
-                if (force_bytes || self.is_pinned(key)) && !self.cache.has(&sha) {
-                    if let Ok(got) = self.cache.fetch(&self.hub, key, &sha) {
-                        sha = got;
-                    }
-                }
-                let new_entry = Entry {
-                    sha256: sha.clone(),
-                    size: stat.size,
-                    mtime: stat.mtime,
-                    state: EntryState::Clean,
-                };
-                let _ = self.store.put_entry(key, &new_entry);
-                let _ = self.store.put_base(
-                    key,
-                    &Base {
-                        sha256: sha,
-                        size: stat.size,
-                        mtime: stat.mtime,
-                        remote_seq: 0,
-                    },
-                );
-                self.view_upsert(key, stat.size, stat.mtime);
-            }
+            Some(stat) => self.pull_key(key, &stat, 0),
             None => {
                 // Hub deleted it after all: ours is the only version, push it
                 // as new.
@@ -1794,72 +1841,152 @@ impl Mirror {
                 self.ensure_job(JobKind::Push {
                     key: key.to_string(),
                 });
+                Ok(())
             }
         }
-        Ok(())
     }
 
-    /// Pinned keys get their bytes; everything pinned is marked so the
-    /// cache never evicts it.
-    fn materialize_pins(&self) -> Result<(), HubError> {
-        let pins = self.pins();
-        if pins.is_empty() {
-            return Ok(());
-        }
-        for (key, e) in self.store.entries("") {
-            if e.state == EntryState::Tombstone || !super::is_pinned(&pins, &key) {
-                continue;
-            }
-            if self.cache.has(&e.sha256) {
-                self.cache.set_pinned(&e.sha256, true);
-                continue;
-            }
-            if e.size > self.cache.budget() {
-                continue;
-            }
-            match self.cache.fetch(&self.hub, &key, &e.sha256) {
-                Ok(got) => {
-                    self.cache.set_pinned(&got, true);
-                    if got != e.sha256 {
-                        self.rt.lock().recheck.insert(key.clone());
-                    }
-                }
-                Err(e) if e.is_offline() => return Err(e),
-                Err(err) => log::warn!("{key}: pin fetch failed: {err}"),
-            }
-        }
-        Ok(())
-    }
-
-    /// Cache eviction, trash expiry. Runs even offline.
+    /// Trash expiry and orphaned conflict snapshots. Runs even offline.
     fn housekeeping(&self) {
         let now = super::now_ms();
         for (key, t) in self.store.trash() {
             if now.saturating_sub(t.ts) > TRASH_TTL_MS {
                 let _ = self.store.remove_trashed(&key);
+                self.local.trash_remove(&key);
             }
         }
-        let pins = self.pins();
-        let mut protected: HashSet<String> = HashSet::new();
-        for (key, e) in self.store.entries("") {
-            let keep = e.state != EntryState::Clean
-                || super::is_pinned(&pins, &key)
-                || self.is_open_for_write(&key);
-            if keep {
-                protected.insert(e.sha256.clone());
-            } else {
-                self.cache.set_pinned(&e.sha256, false);
+        let referenced: HashSet<String> = self
+            .store
+            .conflicts()
+            .into_iter()
+            .map(|c| c.local_sha256)
+            .collect();
+        if let Ok(rd) = std::fs::read_dir(self.local.conflict_path("")) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".part") || referenced.contains(&name) {
+                    continue;
+                }
+                // A record that is gone (resolved, or renamed away) leaves
+                // its snapshot; keep it the trash TTL, then let it go.
+                let old = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        SystemTime::now()
+                            .duration_since(t)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                if old > TRASH_TTL_MS {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
-        }
-        for (_, t) in self.store.trash() {
-            protected.insert(t.sha256);
-        }
-        for c in self.store.conflicts() {
-            protected.insert(c.local_sha256);
-        }
-        let freed = self.cache.evict(&protected);
-        if freed > 0 {
-            log::debug!("cache: evicted {freed} bytes");
         }
     }
+}
+
+/// Generation 1 → 2: the old mirror kept bytes in a content cache keyed by
+/// digest and an index naming them. Move every cached file to its place in
+/// the folder (unless the folder already has that name — the folder wins,
+/// the scan decides), and carry the records over so a clean file stays
+/// clean (no re-download, no re-upload) and a dirty one stays dirty (its
+/// push is recovered). Keys without cached bytes were never fetched; the
+/// listing pulls them like any other remote file.
+fn migrate_legacy(
+    store: &Store,
+    local: &Local,
+    cache_dir: &std::path::Path,
+    legacy: super::store::Legacy,
+) {
+    let cache_path = |sha: &str| {
+        let fan = if sha.len() >= 2 { &sha[..2] } else { "xx" };
+        cache_dir.join(fan).join(sha)
+    };
+    let bases: HashMap<String, Base> = legacy.bases.into_iter().collect();
+    let mut moved = 0u64;
+    let mut dirty = 0u64;
+    let mut skipped = 0u64;
+    for (key, e) in legacy.entries {
+        if e.state == EntryState::Tombstone {
+            // A delete that never reached the hub: say so again.
+            if bases.contains_key(&key) {
+                let _ = store.put_entry(&key, &e);
+                if let Some(b) = bases.get(&key) {
+                    let _ = store.put_base(&key, b);
+                }
+                let _ = store.enqueue(JobKind::Delete { key: key.clone() });
+            }
+            continue;
+        }
+        let src = cache_path(&e.sha256);
+        if local.exists(&key) {
+            // Something is already there (a half-done migration, or files
+            // the user put in place by hand): the scan compares it to the
+            // hub; the cached copy is not needed.
+            skipped += 1;
+            continue;
+        }
+        if !src.is_file() {
+            continue;
+        }
+        let placed = (|| -> Result<()> {
+            let parent = super::parent_key(&key);
+            if !parent.is_empty() {
+                local.mkdir(parent)?;
+            }
+            std::fs::copy(&src, local.path(&key))?;
+            let f = std::fs::File::options()
+                .write(true)
+                .open(local.path(&key))?;
+            f.set_modified(ms_to_systime(e.mtime))?;
+            Ok(())
+        })();
+        if let Err(err) = placed {
+            log::warn!("{key}: could not move the cached bytes into the folder: {err:#}");
+            continue;
+        }
+        let Some(st) = local.stat(&key) else {
+            continue;
+        };
+        let entry = Entry {
+            sha256: e.sha256.clone(),
+            size: st.size,
+            mtime: st.mtime,
+            state: e.state,
+        };
+        let _ = store.put_entry(&key, &entry);
+        if let Some(b) = bases.get(&key) {
+            let _ = store.put_base(&key, b);
+        }
+        if e.state == EntryState::Dirty {
+            dirty += 1;
+            let _ = store.enqueue(JobKind::Push { key: key.clone() });
+        }
+        moved += 1;
+    }
+    for (key, t) in legacy.trash {
+        let src = cache_path(&t.sha256);
+        if !src.is_file() {
+            continue;
+        }
+        let dest = local.trash_path(&key);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::copy(&src, &dest).is_ok() {
+            let _ = store.put_trashed(&key, &t);
+        }
+    }
+    for c in legacy.conflicts {
+        let src = cache_path(&c.local_sha256);
+        if src.is_file() && std::fs::copy(&src, local.conflict_path(&c.local_sha256)).is_ok() {
+            let _ = store.put_conflict(&c);
+        }
+    }
+    log::info!(
+        "mirror: migrated the content cache into {}: {moved} files placed ({dirty} with a pending push), {skipped} already there",
+        local.display_path().display()
+    );
 }

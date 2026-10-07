@@ -1,5 +1,6 @@
 //! End-to-end mirror engine tests against an in-memory hub (`fake_hub`):
-//! no FUSE mount, no real server. Each test owns a data dir and a hub.
+//! no FUSE mount, no real server. Each test owns a data dir, a real Home
+//! folder and a hub.
 
 mod fake_hub;
 
@@ -15,11 +16,24 @@ struct Rig {
     _dir: tempfile::TempDir,
 }
 
+impl Rig {
+    /// The real file, read the way a user would (no mirror in between).
+    fn home_read(&self, key: &str) -> Option<Vec<u8>> {
+        std::fs::read(self._dir.path().join("Home").join(key)).ok()
+    }
+}
+
 fn rig_with(url: &str, opts: MirrorOptions) -> (Arc<Mirror>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mirror = Mirror::open(MirrorConfig {
+    let mirror = open_mirror(&dir, url, opts);
+    (mirror, dir)
+}
+
+fn open_mirror(dir: &tempfile::TempDir, url: &str, opts: MirrorOptions) -> Arc<Mirror> {
+    Mirror::open(MirrorConfig {
         tls: None,
         data_dir: dir.path().join("data"),
+        home_dir: dir.path().join("Home"),
         server: url.to_string(),
         token: "token".into(),
         workspace_id: "ws1".into(),
@@ -32,8 +46,7 @@ fn rig_with(url: &str, opts: MirrorOptions) -> (Arc<Mirror>, tempfile::TempDir) 
         mountpoint: dir.path().join("mnt"),
         status_path: Some(dir.path().join("status.json")),
     })
-    .unwrap();
-    (mirror, dir)
+    .unwrap()
 }
 
 fn rig(opts: MirrorOptions) -> Rig {
@@ -48,18 +61,14 @@ fn rig(opts: MirrorOptions) -> Rig {
 
 fn opts() -> MirrorOptions {
     MirrorOptions {
-        cache_budget_bytes: 10 * 1024 * 1024,
         poll_secs: 30,
         ..Default::default()
     }
 }
 
 #[test]
-fn initial_listing_builds_the_tree_and_materializes_pins() {
-    let r = rig(MirrorOptions {
-        pins: vec!["Docs/".into()],
-        ..opts()
-    });
+fn initial_listing_pulls_every_file_into_the_folder() {
+    let r = rig(opts());
     let sha_a = r.hub.lock().put("Docs/a.md", b"hello a");
     let sha_b = r.hub.lock().put("b.txt", b"hello b");
     r.mirror.cycle(true);
@@ -72,10 +81,10 @@ fn initial_listing_builds_the_tree_and_materializes_pins() {
     let b = r.mirror.entry("b.txt").expect("b.txt listed");
     assert_eq!(b.sha256, sha_b);
 
-    // Pinned bytes are on disk; unpinned ones wait for a read.
-    assert!(r.mirror.cache.has(&sha_a));
-    assert!(!r.mirror.cache.has(&sha_b));
-    assert!(r.mirror.store.cache_meta(&sha_a).unwrap().pin_refs > 0);
+    // Every file is a real file in the folder, nothing waits for a read.
+    assert_eq!(r.home_read("Docs/a.md").unwrap(), b"hello a");
+    assert_eq!(r.home_read("b.txt").unwrap(), b"hello b");
+    assert!(r.mirror.store.has_dir("Docs"));
 
     let st = r.mirror.status();
     assert_eq!(st.state, SyncState::Idle);
@@ -87,6 +96,7 @@ fn initial_listing_builds_the_tree_and_materializes_pins() {
     assert!(!reports.is_empty());
     assert_eq!(reports[0]["client"], "fuse");
     assert_eq!(reports[0]["cursor"], 2);
+    assert_eq!(reports[0]["direction"], "bi");
     // And the status file is there for `canvas-fuse status`.
     let raw = std::fs::read_to_string(r._dir.path().join("status.json")).unwrap();
     assert!(raw.contains("\"workspaceId\": \"ws1\""));
@@ -167,8 +177,9 @@ fn precondition_failure_goes_to_the_inbox_and_adopts_the_hub_version() {
     assert_eq!(e.sha256, hub_sha);
     assert_eq!(e.state, EntryState::Clean);
     assert_eq!(r.mirror.store.base("shared.txt").unwrap().sha256, hub_sha);
-    // Our bytes are still in the cache, by digest, and the record says so.
-    assert!(r.mirror.cache.has(&sha_hex(b"ours")));
+    assert_eq!(r.home_read("shared.txt").unwrap(), b"theirs");
+    // Our bytes are kept as a conflict snapshot, and the record says so.
+    assert!(r.mirror.local.has_conflict_bytes(&sha_hex(b"ours")));
     let conflicts = r.mirror.conflicts();
     assert_eq!(conflicts.len(), 1);
     assert!(conflicts[0].uploaded);
@@ -176,9 +187,10 @@ fn precondition_failure_goes_to_the_inbox_and_adopts_the_hub_version() {
     assert_eq!(r.mirror.status().conflicts, 1);
     assert_eq!(r.mirror.status().pending, 0);
 
-    // Resolution on the hub clears the record.
+    // Resolution on the hub clears the record and the snapshot.
     r.mirror.conflict_resolved("shared.txt");
     assert_eq!(r.mirror.status().conflicts, 0);
+    assert!(!r.mirror.local.has_conflict_bytes(&sha_hex(b"ours")));
 }
 
 #[test]
@@ -204,9 +216,11 @@ fn conflict_via_the_feed_in_rename_mode_writes_a_conflict_copy() {
     assert_eq!(r.hub.lock().bytes_of("doc.md").unwrap(), b"theirs");
     assert_eq!(r.hub.lock().inbox[0].mode, "rename");
     assert_eq!(r.mirror.entry("doc.md").unwrap().sha256, sha_hex(b"theirs"));
-    // The copy comes back to us through the feed as an ordinary object.
+    assert_eq!(r.home_read("doc.md").unwrap(), b"theirs");
+    // The copy comes back to us through the feed as an ordinary file.
     r.mirror.cycle(false);
     assert!(r.mirror.entry(copy).is_some());
+    assert_eq!(r.home_read(copy).unwrap(), b"mine");
     assert_eq!(
         r.mirror.conflicts()[0].copy_key.as_deref(),
         Some(copy.as_str())
@@ -214,29 +228,33 @@ fn conflict_via_the_feed_in_rename_mode_writes_a_conflict_copy() {
 }
 
 #[test]
-fn pull_on_change_and_refetch_when_previously_cached() {
+fn pull_lands_in_the_folder_with_the_hub_mtime() {
     let r = rig(opts());
     r.mirror.cycle(true);
     r.hub.lock().put("c.txt", b"one");
     r.mirror.cycle(false);
-    let e = r.mirror.entry("c.txt").expect("pulled as a placeholder");
+    let e = r.mirror.entry("c.txt").expect("pulled");
     assert_eq!(e.sha256, sha_hex(b"one"));
-    assert!(!r.mirror.cache.has(&e.sha256), "unpinned: bytes on demand");
-
-    // First read fetches.
+    assert_eq!(r.home_read("c.txt").unwrap(), b"one");
     assert_eq!(r.mirror.bytes_for_edit("c.txt").unwrap(), b"one");
-    assert!(r.mirror.cache.has(&sha_hex(b"one")));
+    // The file carries the hub's mtime, and the entry the file's stamp.
+    let hub_mtime = r.hub.lock().objects["c.txt"].mtime;
+    let st = r.mirror.local.stat("c.txt").unwrap();
+    assert_eq!(st.mtime, hub_mtime);
+    assert_eq!(e.mtime, st.mtime);
 
-    // A hub change to a file we had cached is fetched eagerly.
+    // A hub change replaces the file in place.
     r.hub.lock().put("c.txt", b"two");
     r.mirror.cycle(false);
     let e = r.mirror.entry("c.txt").unwrap();
     assert_eq!(e.sha256, sha_hex(b"two"));
-    assert!(r.mirror.cache.has(&sha_hex(b"two")));
+    assert_eq!(r.home_read("c.txt").unwrap(), b"two");
     assert_eq!(
         r.mirror.store.base("c.txt").unwrap().sha256,
         sha_hex(b"two")
     );
+    // No part file left behind.
+    assert!(!r._dir.path().join("Home/.c.txt.canvas-part").exists());
 }
 
 #[test]
@@ -285,13 +303,10 @@ fn rename_both_ways() {
 
 #[test]
 fn hub_delete_goes_to_trash_and_restore_pushes_as_new() {
-    let r = rig(MirrorOptions {
-        pins: vec!["keep.txt".into()],
-        ..opts()
-    });
+    let r = rig(opts());
     r.hub.lock().put("keep.txt", b"precious");
     r.mirror.cycle(true);
-    assert!(r.mirror.cache.has(&sha_hex(b"precious")));
+    assert_eq!(r.home_read("keep.txt").unwrap(), b"precious");
 
     r.hub.lock().delete("keep.txt");
     r.mirror.cycle(false);
@@ -300,9 +315,15 @@ fn hub_delete_goes_to_trash_and_restore_pushes_as_new() {
     let trash = r.mirror.trash_list();
     assert_eq!(trash.len(), 1);
     assert_eq!(trash[0].0, "keep.txt");
-    assert!(r.mirror.cache.has(&sha_hex(b"precious")), "bytes survive");
+    assert!(r.home_read("keep.txt").is_none(), "gone from the folder");
+    assert_eq!(
+        std::fs::read(r._dir.path().join("data/trash/keep.txt")).unwrap(),
+        b"precious",
+        "bytes survive in the local trash"
+    );
 
     r.mirror.trash_restore("keep.txt").unwrap();
+    assert_eq!(r.home_read("keep.txt").unwrap(), b"precious");
     r.mirror.cycle(false);
     assert_eq!(r.hub.lock().bytes_of("keep.txt").unwrap(), b"precious");
     let puts = r.hub.lock().entries("put");
@@ -392,11 +413,16 @@ fn offline_queue_drains_when_the_hub_comes_back() {
         mirror.entry("offline/a.txt").unwrap().state,
         EntryState::Dirty
     );
-    // Cached bytes are readable, uncached ones are not.
+    // Everything written is a real file, readable with or without a hub.
     assert_eq!(
         mirror.bytes_for_edit("offline/a.txt").unwrap(),
         b"written offline"
     );
+    assert_eq!(
+        std::fs::read(_dir.path().join("Home/offline/a.txt")).unwrap(),
+        b"written offline"
+    );
+    assert!(_dir.path().join("Home/offline/empty").is_dir());
     mirror
         .rename_local("offline/a.txt", "offline/b.txt")
         .unwrap();
@@ -416,6 +442,8 @@ fn offline_queue_drains_when_the_hub_comes_back() {
         b"written offline"
     );
     assert!(hub.lock().bytes_of("offline/a.txt").is_none());
+    assert!(_dir.path().join("Home/offline/b.txt").is_file());
+    assert!(!_dir.path().join("Home/offline/a.txt").exists());
     assert_eq!(hub.lock().mkdirs, vec!["offline/empty".to_string()]);
     assert_eq!(
         mirror.entry("offline/b.txt").unwrap().state,
@@ -446,24 +474,7 @@ fn excluded_keys_are_never_pushed() {
 fn store_survives_a_restart_with_cursor_and_queue() {
     let hub = FakeHub::start();
     let dir = tempfile::tempdir().unwrap();
-    let open = || {
-        Mirror::open(MirrorConfig {
-            tls: None,
-            data_dir: dir.path().join("data"),
-            server: hub.url.clone(),
-            token: "t".into(),
-            workspace_id: "ws1".into(),
-            backend: "workspace:home".into(),
-            opts: opts(),
-            device: DeviceIdentity {
-                id: "dev-a".into(),
-                name: "laptop".into(),
-            },
-            mountpoint: dir.path().join("mnt"),
-            status_path: None,
-        })
-        .unwrap()
-    };
+    let open = || open_mirror(&dir, &hub.url, opts());
     hub.lock().put("seed.txt", b"seed");
     {
         let m = open();
@@ -547,4 +558,276 @@ fn delayed_rename_does_not_move_a_recreated_source() {
     );
     assert!(r.mirror.conflicts().is_empty());
     assert_eq!(r.mirror.status().pending, 0);
+}
+
+// ── the folder while no daemon runs ──────────────────────────────────────────
+
+/// Files put in the folder before the first mount are the user's: pushed.
+#[test]
+fn a_folder_that_existed_before_the_first_mount_is_pushed() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Home/Docs")).unwrap();
+    std::fs::write(dir.path().join("Home/Docs/plan.md"), b"local plan").unwrap();
+    std::fs::write(dir.path().join("Home/README"), b"readme").unwrap();
+    std::fs::create_dir_all(dir.path().join("Home/Empty")).unwrap();
+    hub.lock().put("remote.txt", b"from the hub");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    // The scan ran at open: both files are entries, dirty, with pushes
+    // queued; the empty dir is known and wants a mkdir on the hub.
+    assert_eq!(m.entry("Docs/plan.md").unwrap().state, EntryState::Dirty);
+    assert_eq!(m.entry("README").unwrap().state, EntryState::Dirty);
+    assert!(m.store.has_dir("Docs"));
+    assert!(m.store.has_dir("Empty"));
+    assert_eq!(m.status().pending, 3);
+
+    m.cycle(true);
+    assert_eq!(hub.lock().bytes_of("Docs/plan.md").unwrap(), b"local plan");
+    assert_eq!(hub.lock().bytes_of("README").unwrap(), b"readme");
+    assert_eq!(hub.lock().mkdirs, vec!["Empty".to_string()]);
+    assert_eq!(
+        std::fs::read(dir.path().join("Home/remote.txt")).unwrap(),
+        b"from the hub"
+    );
+    assert_eq!(m.entry("Docs/plan.md").unwrap().state, EntryState::Clean);
+    assert_eq!(m.status().pending, 0);
+}
+
+/// The point of the exercise: edit, add and delete in the folder with the
+/// daemon down (a plane), then start it again — everything reconciles.
+#[test]
+fn offline_edits_are_reconciled_when_the_daemon_comes_back() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    let base_sha = hub.lock().put("notes.md", b"v1");
+    hub.lock().put("old.txt", b"to be deleted");
+    hub.lock().put("same.txt", b"untouched");
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+        assert_eq!(m.status().pending, 0);
+    }
+    // No daemon. The folder is just a folder.
+    let home = dir.path().join("Home");
+    assert_eq!(std::fs::read(home.join("notes.md")).unwrap(), b"v1");
+    std::fs::write(home.join("notes.md"), b"v2 written on the plane").unwrap();
+    std::fs::remove_file(home.join("old.txt")).unwrap();
+    std::fs::create_dir_all(home.join("trip")).unwrap();
+    std::fs::write(home.join("trip/new.md"), b"brand new").unwrap();
+    // Touch without a change: same bytes, new stamp.
+    let f = std::fs::File::options()
+        .write(true)
+        .open(home.join("same.txt"))
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    drop(f);
+    // Meanwhile the hub moved too, on a file we did not touch.
+    hub.lock().put("remote-only.txt", b"landed while away");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    assert_eq!(m.entry("notes.md").unwrap().state, EntryState::Dirty);
+    assert_eq!(m.entry("trip/new.md").unwrap().state, EntryState::Dirty);
+    assert_eq!(m.entry("same.txt").unwrap().state, EntryState::Clean);
+    assert!(m.entry("old.txt").is_none(), "tombstoned");
+    // push notes, push new, delete old — nothing for same.txt.
+    assert_eq!(m.status().pending, 3);
+
+    m.cycle(false);
+    assert_eq!(
+        hub.lock().bytes_of("notes.md").unwrap(),
+        b"v2 written on the plane"
+    );
+    let puts = hub.lock().entries("put");
+    let notes_put = puts.iter().rev().find(|p| p.key == "notes.md").unwrap();
+    assert_eq!(notes_put.if_match.as_deref(), Some(base_sha.as_str()));
+    assert_eq!(hub.lock().bytes_of("trip/new.md").unwrap(), b"brand new");
+    assert!(hub.lock().bytes_of("old.txt").is_none());
+    assert_eq!(hub.lock().bytes_of("same.txt").unwrap(), b"untouched");
+    assert_eq!(
+        std::fs::read(home.join("remote-only.txt")).unwrap(),
+        b"landed while away"
+    );
+    assert_eq!(m.status().pending, 0);
+    assert!(m.conflicts().is_empty());
+}
+
+/// Edited on the plane AND on the hub: a conflict, not an overwrite. Our
+/// bytes go to the inbox, the hub's take the name, nothing is lost.
+#[test]
+fn offline_edit_that_collides_with_a_hub_edit_is_a_conflict() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    hub.lock().put("shared.md", b"base");
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+    }
+    std::fs::write(dir.path().join("Home/shared.md"), b"ours, offline").unwrap();
+    hub.lock().put("shared.md", b"theirs, online");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(false);
+    let inbox = hub.lock().inbox.clone();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].bytes, b"ours, offline");
+    assert_eq!(
+        std::fs::read(dir.path().join("Home/shared.md")).unwrap(),
+        b"theirs, online"
+    );
+    assert!(m.local.has_conflict_bytes(&sha_hex(b"ours, offline")));
+    assert_eq!(m.status().conflicts, 1);
+}
+
+/// A file removed from the folder while the hub changed it comes back:
+/// edit beats delete.
+#[test]
+fn offline_delete_of_a_hub_edited_file_brings_the_edit_back() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    hub.lock().put("keep.md", b"v1");
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+    }
+    std::fs::remove_file(dir.path().join("Home/keep.md")).unwrap();
+    hub.lock().put_silent("keep.md", b"v2");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(false);
+    assert_eq!(
+        std::fs::read(dir.path().join("Home/keep.md")).unwrap(),
+        b"v2"
+    );
+    assert_eq!(m.entry("keep.md").unwrap().state, EntryState::Clean);
+}
+
+/// A hub-side rename moves the real file; a local rename of a directory
+/// moves the real directory.
+#[test]
+fn renames_move_real_files_and_directories() {
+    let r = rig(opts());
+    r.hub.lock().put("a/one.txt", b"1");
+    r.hub.lock().put("a/two.txt", b"2");
+    r.mirror.cycle(true);
+
+    r.hub.lock().rename("a/one.txt", "b/uno.txt");
+    r.mirror.cycle(false);
+    assert!(r.home_read("a/one.txt").is_none());
+    assert_eq!(r.home_read("b/uno.txt").unwrap(), b"1");
+    assert!(r.mirror.store.has_dir("b"));
+
+    r.mirror.rename_dir_local("a", "c").unwrap();
+    assert_eq!(r.home_read("c/two.txt").unwrap(), b"2");
+    assert!(!r._dir.path().join("Home/a").exists());
+    r.mirror.cycle(false);
+    assert_eq!(r.hub.lock().bytes_of("c/two.txt").unwrap(), b"2");
+    assert!(r.hub.lock().bytes_of("a/two.txt").is_none());
+    assert_eq!(r.hub.lock().rmdirs, vec!["a".to_string()]);
+}
+
+/// Upgrading from the content-cache mirror (0.10): cached bytes move into
+/// the folder, clean files stay clean (no download, no upload), an edit
+/// that never got pushed is pushed, never-fetched keys are pulled.
+#[test]
+fn a_generation_1_cache_is_moved_into_the_folder() {
+    use redb::{Database, TableDefinition};
+    use serde_json::json;
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cache = data.join("cache");
+    let clean_sha = hub.lock().put("Docs/clean.txt", b"clean");
+    let old_sha = hub.lock().put("edited.txt", b"old");
+    let never_sha = hub.lock().put("never.txt", b"never fetched");
+    let put_cache = |bytes: &[u8]| -> String {
+        let sha = sha_hex(bytes);
+        let p = cache.join(&sha[..2]).join(&sha);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        sha
+    };
+    put_cache(b"clean");
+    let mine = put_cache(b"mine, unpushed");
+    {
+        std::fs::create_dir_all(&data).unwrap();
+        let db = Database::create(data.join("mirror.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let t = TableDefinition::<&str, &[u8]>::new("entries_v1");
+            let mut e = tx.open_table(t).unwrap();
+            let entry = |sha: &str, state: &str| {
+                json!({ "sha256": sha, "size": 5, "mtime": 1_700_000_000_000u64, "state": state })
+                    .to_string()
+            };
+            e.insert("Docs/clean.txt", entry(&clean_sha, "clean").as_bytes())
+                .unwrap();
+            e.insert("edited.txt", entry(&mine, "dirty").as_bytes())
+                .unwrap();
+            e.insert("never.txt", entry(&never_sha, "clean").as_bytes())
+                .unwrap();
+            let t = TableDefinition::<&str, &[u8]>::new("base_v1");
+            let mut b = tx.open_table(t).unwrap();
+            let base = |sha: &str| {
+                json!({ "sha256": sha, "size": 5, "mtime": 1_700_000_000_000u64, "remote_seq": 1 })
+                    .to_string()
+            };
+            b.insert("Docs/clean.txt", base(&clean_sha).as_bytes())
+                .unwrap();
+            b.insert("edited.txt", base(&old_sha).as_bytes()).unwrap();
+            b.insert("never.txt", base(&never_sha).as_bytes()).unwrap();
+            // The old cursor and listing marker, which the new store retires.
+            let t = TableDefinition::<&str, u64>::new("cursor_v1");
+            tx.open_table(t).unwrap().insert("cursor", 3u64).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    let home = dir.path().join("Home");
+    assert_eq!(
+        std::fs::read(home.join("Docs/clean.txt")).unwrap(),
+        b"clean"
+    );
+    assert_eq!(
+        std::fs::read(home.join("edited.txt")).unwrap(),
+        b"mine, unpushed"
+    );
+    assert!(!home.join("never.txt").exists(), "was never fetched");
+    assert_eq!(m.entry("Docs/clean.txt").unwrap().state, EntryState::Clean);
+    assert_eq!(m.entry("edited.txt").unwrap().state, EntryState::Dirty);
+    assert_eq!(m.store.base("edited.txt").unwrap().sha256, old_sha);
+    assert_eq!(m.status().pending, 1);
+    assert_eq!(m.status().cursor, None, "old cursor retired: full listing");
+
+    m.cycle(true);
+    assert_eq!(
+        hub.lock().bytes_of("edited.txt").unwrap(),
+        b"mine, unpushed"
+    );
+    let puts = hub.lock().entries("put");
+    assert_eq!(
+        puts.last().unwrap().if_match.as_deref(),
+        Some(old_sha.as_str()),
+        "pushed against the carried-over base"
+    );
+    assert_eq!(
+        std::fs::read(home.join("never.txt")).unwrap(),
+        b"never fetched"
+    );
+    let requests = hub.lock().requests.clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.starts_with("GET ") && r.contains("Docs/clean.txt")),
+        "a clean cached file is not downloaded again: {requests:?}"
+    );
+    assert_eq!(m.entry("Docs/clean.txt").unwrap().state, EntryState::Clean);
+    assert_eq!(m.status().pending, 0);
+    assert!(m.conflicts().is_empty());
+    // The migration is one-shot: a second open finds nothing to move.
+    drop(m);
+    let m = open_mirror(&dir, &hub.url, opts());
+    assert_eq!(m.status().entries, 3);
 }

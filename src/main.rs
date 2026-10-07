@@ -141,21 +141,22 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         blob_cache_mb: usize,
 
-        /// Serve Home/ as an offline-capable device mirror of the workspace
-        /// drive (persistent tree, on-disk content cache, write-back with
-        /// preconditions, conflict handling). Workspace mounts only.
+        /// Keep Home/ as a real folder on disk, mirrored with the workspace
+        /// drive (Dropbox style): every file is local, edits are pushed in
+        /// the background with preconditions, conflicts never overwrite.
+        /// The folder stays usable when the hub or this daemon is down.
+        /// Workspace mounts only.
         #[arg(long)]
         mirror: bool,
 
-        /// Mirror: always keep these paths/globs materialized locally
-        /// (repeatable; persisted — `canvas-fuse pin` manages them later)
-        #[arg(long = "pin", value_name = "GLOB", requires = "mirror")]
+        /// Accepted for older configs; the mirror keeps every file, so
+        /// there is nothing to pin.
+        #[arg(long = "pin", value_name = "GLOB", requires = "mirror", hide = true)]
         pins: Vec<String>,
 
-        /// Mirror: on-disk content cache budget in MB (pinned files never
-        /// count against eviction)
-        #[arg(long, default_value_t = 4096, requires = "mirror")]
-        cache_budget_mb: u64,
+        /// Accepted for older configs; the mirror has no byte budget.
+        #[arg(long, requires = "mirror", hide = true)]
+        cache_budget_mb: Option<u64>,
 
         /// Mirror: what to do when a file changed here AND on the hub
         #[arg(long, value_enum, default_value_t = ConflictsArg::Prompt, requires = "mirror")]
@@ -180,12 +181,6 @@ enum Command {
     Sync {
         #[command(subcommand)]
         what: SyncCommand,
-    },
-
-    /// Mirror: manage pinned paths (always materialized, never evicted)
-    Pin {
-        #[command(subcommand)]
-        what: PinCommand,
     },
 
     /// Mirror: list conflicts recorded on this device
@@ -246,16 +241,6 @@ enum SyncCommand {
         /// Mountpoint of a --mirror mount
         mountpoint: PathBuf,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum PinCommand {
-    /// Pin a path or glob (`Docs/`, `*.md`, `Photos/2026*`)
-    Add { mountpoint: PathBuf, glob: String },
-    /// Unpin
-    Rm { mountpoint: PathBuf, glob: String },
-    /// Show the pinned globs
-    List { mountpoint: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -332,9 +317,12 @@ fn main() -> Result<()> {
             let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
             let selection =
                 resolve_selection(trees, backends, workspace.as_deref(), &contexts, mirror)?;
-            let mirror_opts = mirror.then(|| MirrorOptions {
-                pins,
-                cache_budget_bytes: cache_budget_mb * 1024 * 1024,
+            if !pins.is_empty() || cache_budget_mb.is_some() {
+                eprintln!(
+                    "note: --pin/--cache-budget-mb are no longer needed; a mirror keeps every file in Home/"
+                );
+            }
+            let mirror_opts = mirror.then_some(MirrorOptions {
                 conflicts: match conflicts {
                     ConflictsArg::Prompt => ConflictMode::Prompt,
                     ConflictsArg::Rename => ConflictMode::Rename,
@@ -366,11 +354,6 @@ fn main() -> Result<()> {
         Command::Sync {
             what: SyncCommand::Now { mountpoint },
         } => cmd_sync_now(&mountpoint),
-        Command::Pin { what } => match what {
-            PinCommand::Add { mountpoint, glob } => cmd_pin(&mountpoint, "add", Some(&glob)),
-            PinCommand::Rm { mountpoint, glob } => cmd_pin(&mountpoint, "rm", Some(&glob)),
-            PinCommand::List { mountpoint } => cmd_pin(&mountpoint, "list", None),
-        },
         Command::Conflicts { mountpoint, json } => cmd_conflicts(&mountpoint, json),
         Command::Trash { what } => match what {
             TrashCommand::List { mountpoint, json } => cmd_trash_list(&mountpoint, json),
@@ -776,7 +759,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
         if s.mirror {
             match runtime::read_mirror_status(&s.mountpoint) {
                 Some(m) => println!(
-                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  cache {}/{} MB  pins {}{}",
+                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}{}",
                     m.state,
                     m.cursor.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     m.head.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
@@ -784,9 +767,8 @@ fn cmd_status(as_json: bool) -> Result<()> {
                     m.failed,
                     m.conflicts,
                     m.skipped,
-                    m.cache_used / (1024 * 1024),
-                    m.cache_budget / (1024 * 1024),
-                    if m.pinned.is_empty() { "-".to_string() } else { m.pinned.join(",") },
+                    m.entries,
+                    m.home,
                     m.last_error.as_ref().map(|e| format!("  error: {e}")).unwrap_or_default(),
                 ),
                 None => println!("          mirror: (no status yet)"),
@@ -843,26 +825,6 @@ fn cmd_sync_now(mountpoint: &Path) -> Result<()> {
             .map(|e| format!(" (last error: {e})"))
             .unwrap_or_default()
     );
-    Ok(())
-}
-
-fn cmd_pin(mountpoint: &Path, op: &str, glob: Option<&str>) -> Result<()> {
-    let sock = mirror_socket(mountpoint)?;
-    let resp = control::request(&sock, &json!({ "cmd": "pin", "op": op, "glob": glob }))?;
-    let pins = resp
-        .get("pins")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if op == "rm" && resp.get("removed").and_then(Value::as_bool) == Some(false) {
-        eprintln!("{} was not pinned", glob.unwrap_or(""));
-    }
-    if pins.is_empty() {
-        println!("no pins");
-    }
-    for p in pins {
-        println!("{}", p.as_str().unwrap_or(""));
-    }
     Ok(())
 }
 
@@ -936,10 +898,10 @@ fn cmd_trash_list(mountpoint: &Path, as_json: bool) -> Result<()> {
             t.get("deletedAt").and_then(Value::as_str).unwrap_or("?"),
             t.get("key").and_then(Value::as_str).unwrap_or("?"),
             t.get("size").and_then(Value::as_u64).unwrap_or(0),
-            if t.get("cached").and_then(Value::as_bool).unwrap_or(false) {
+            if t.get("kept").and_then(Value::as_bool).unwrap_or(false) {
                 ""
             } else {
-                "  (bytes evicted; cannot restore)"
+                "  (bytes gone from the trash; cannot restore)"
             }
         );
     }
