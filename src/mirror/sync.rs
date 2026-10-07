@@ -188,14 +188,6 @@ impl Mirror {
             &cfg.device,
             cfg.tls.as_ref(),
         )?);
-        if let Some(legacy) = store.take_legacy() {
-            migrate_legacy(
-                &store,
-                &local,
-                &super::legacy_cache_dir(&cfg.data_dir),
-                legacy,
-            );
-        }
         let cache = super::legacy_cache_dir(&cfg.data_dir);
         if cache.is_dir() {
             log::warn!(
@@ -214,6 +206,15 @@ impl Mirror {
             patterns.extend(saved.split('\n').map(str::to_string));
         }
         patterns.extend(cfg.opts.ignore.iter().cloned());
+        if let Some(legacy) = store.take_legacy() {
+            migrate_legacy(
+                &store,
+                &local,
+                &super::legacy_cache_dir(&cfg.data_dir),
+                legacy,
+                &IgnoreRules::new(&patterns),
+            );
+        }
 
         let mirror = Arc::new(Self {
             store,
@@ -1899,6 +1900,7 @@ fn migrate_legacy(
     local: &Local,
     cache_dir: &std::path::Path,
     legacy: super::store::Legacy,
+    ignore: &IgnoreRules,
 ) {
     let cache_path = |sha: &str| {
         let fan = if sha.len() >= 2 { &sha[..2] } else { "xx" };
@@ -1960,7 +1962,9 @@ fn migrate_legacy(
         if let Some(b) = bases.get(&key) {
             let _ = store.put_base(&key, b);
         }
-        if e.state == EntryState::Dirty {
+        // The hub refuses excluded keys (dotfiles, editor lock files …);
+        // they stay local, as they did before.
+        if e.state == EntryState::Dirty && !ignore.is_ignored(&key) {
             dirty += 1;
             let _ = store.enqueue(JobKind::Push { key: key.clone() });
         }

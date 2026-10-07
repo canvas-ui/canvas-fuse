@@ -750,6 +750,7 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
     };
     put_cache(b"clean");
     let mine = put_cache(b"mine, unpushed");
+    let lock = put_cache(b"lock");
     {
         std::fs::create_dir_all(&data).unwrap();
         let db = Database::create(data.join("mirror.redb")).unwrap();
@@ -766,6 +767,9 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
             e.insert("edited.txt", entry(&mine, "dirty").as_bytes())
                 .unwrap();
             e.insert("never.txt", entry(&never_sha, "clean").as_bytes())
+                .unwrap();
+            // An editor lock file the old mirror held dirty-but-skipped.
+            e.insert("Docs/.~lock.plan.xlsx#", entry(&lock, "dirty").as_bytes())
                 .unwrap();
             let t = TableDefinition::<&str, &[u8]>::new("base_v1");
             let mut b = tx.open_table(t).unwrap();
@@ -798,7 +802,16 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
     assert_eq!(m.entry("Docs/clean.txt").unwrap().state, EntryState::Clean);
     assert_eq!(m.entry("edited.txt").unwrap().state, EntryState::Dirty);
     assert_eq!(m.store.base("edited.txt").unwrap().sha256, old_sha);
-    assert_eq!(m.status().pending, 1);
+    assert_eq!(
+        std::fs::read(home.join("Docs/.~lock.plan.xlsx#")).unwrap(),
+        b"lock",
+        "placed locally"
+    );
+    assert_eq!(
+        m.status().pending,
+        1,
+        "the excluded lock file is not pushed"
+    );
     assert_eq!(m.status().cursor, None, "old cursor retired: full listing");
 
     m.cycle(true);
@@ -829,5 +842,6 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
     // The migration is one-shot: a second open finds nothing to move.
     drop(m);
     let m = open_mirror(&dir, &hub.url, opts());
-    assert_eq!(m.status().entries, 3);
+    assert_eq!(m.status().entries, 4);
+    assert!(hub.lock().bytes_of("Docs/.~lock.plan.xlsx#").is_none());
 }
