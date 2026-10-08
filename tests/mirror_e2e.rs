@@ -152,7 +152,10 @@ fn push_new_then_edit_with_if_match() {
 
 #[test]
 fn precondition_failure_goes_to_the_inbox_and_adopts_the_hub_version() {
-    let r = rig(opts());
+    let r = rig(MirrorOptions {
+        conflicts: ConflictMode::Prompt,
+        ..opts()
+    });
     let base_sha = r.hub.lock().put("shared.txt", b"base");
     r.mirror.cycle(true);
 
@@ -194,11 +197,8 @@ fn precondition_failure_goes_to_the_inbox_and_adopts_the_hub_version() {
 }
 
 #[test]
-fn conflict_via_the_feed_in_rename_mode_writes_a_conflict_copy() {
-    let r = rig(MirrorOptions {
-        conflicts: ConflictMode::Rename,
-        ..opts()
-    });
+fn conflict_via_the_feed_writes_a_conflict_copy_by_default() {
+    let r = rig(opts());
     r.hub.lock().put("doc.md", b"v1");
     r.mirror.cycle(true);
     r.mirror.commit_write("doc.md", b"mine").unwrap();
@@ -654,7 +654,7 @@ fn offline_edits_are_reconciled_when_the_daemon_comes_back() {
 }
 
 /// Edited on the plane AND on the hub: a conflict, not an overwrite. Our
-/// bytes go to the inbox, the hub's take the name, nothing is lost.
+/// bytes get a conflict-copy name, the hub's take the name, nothing is lost.
 #[test]
 fn offline_edit_that_collides_with_a_hub_edit_is_a_conflict() {
     let hub = FakeHub::start();
@@ -672,12 +672,23 @@ fn offline_edit_that_collides_with_a_hub_edit_is_a_conflict() {
     let inbox = hub.lock().inbox.clone();
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].bytes, b"ours, offline");
+    assert_eq!(inbox[0].mode, "rename");
+    assert_ne!(inbox[0].key, "shared.md");
+    assert_eq!(
+        hub.lock().bytes_of(&inbox[0].key).unwrap(),
+        b"ours, offline"
+    );
     assert_eq!(
         std::fs::read(dir.path().join("Home/shared.md")).unwrap(),
         b"theirs, online"
     );
     assert!(m.local.has_conflict_bytes(&sha_hex(b"ours, offline")));
     assert_eq!(m.status().conflicts, 1);
+    m.cycle(false);
+    assert_eq!(
+        std::fs::read(dir.path().join("Home").join(&inbox[0].key)).unwrap(),
+        b"ours, offline"
+    );
 }
 
 /// A file removed from the folder while the hub changed it comes back:

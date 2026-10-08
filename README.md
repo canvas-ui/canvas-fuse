@@ -32,6 +32,19 @@ itself does not link libfuse.
     └── document.md
 ```
 
+The `backends` tree is excluded by default: its connector and storage listings
+(such as IMAP mailboxes) can be large. It is neither mounted nor fetched during
+startup or refresh. `Home/` and `--mirror` still use the workspace home drive.
+To include `Trees/backends/` in a full workspace mount:
+
+```sh
+canvas-fuse mount universe ~/MyWorkspace --include-backends
+```
+
+Use `--no-backends` to make exclusion explicit (also compatible with `--mirror`
+and `--backend workspace:home`). It conflicts with `--include-backends` and
+`--tree backends`.
+
 A single context (`<workspace>/Contexts/<id>`, or `-c`) roots the mount at that
 view. A context is **flat**: its documents are its files. `.by-schema/` is a
 derived, read-only grouping — dropping a file into a schema folder does not
@@ -131,6 +144,13 @@ live passthrough into a **real folder on disk**, kept in sync with the hub's
 context mounts are unchanged. Wire contract: `docs/sync-protocol.md` in
 canvas-server; design: `docs/sync.md`.
 
+Only Home is mirrored onto disk; backend trees are virtual views and are excluded
+by default. To make this explicit when mirroring:
+
+```sh
+canvas-fuse mount -w universe ~/Workspaces --mirror --no-backends
+```
+
 The folder is `<mountpoint>/<workspace>/Home` (the mountpoint itself for a
 `--backend workspace:home` mount). While the daemon runs, the FUSE view sits
 on top of it and serves the same files. When the daemon is down — or the
@@ -157,10 +177,12 @@ What the daemon does:
   and become pushes and deletes under the same rules as live edits. A
   touched-but-unchanged file costs one hash and nothing on the wire.
 - **Conflicts never overwrite.** If a file changed here *and* on the hub
-  since the last sync, the hub's version keeps the name and yours goes to
-  the hub's conflict inbox (`--conflicts prompt`, the default; resolve in
-  *Workspace settings › Sync* or the CLI), or — with `--conflicts rename` —
-  is saved next to it as `name (conflict from <device> <YYYY-MM-DD HHmm>).ext`.
+  since the last sync, the hub's version keeps the name and yours is saved
+  next to it as `name (conflict from <device> <YYYY-MM-DD HHmm>).ext`
+  (`--conflicts rename`, the default). Use `--conflicts prompt` to send yours
+  to the hub's conflict inbox and resolve in *Workspace settings › Sync* or
+  the CLI instead. Existing configurations that explicitly select `prompt`
+  keep that policy; change them to `rename` to use conflict copies.
   `canvas-fuse conflicts <mountpoint>` lists what this device recorded. A
   copy of your bytes is kept under the data dir (`conflicts/<sha256>`)
   until the conflict is resolved.
@@ -312,6 +334,8 @@ it with `--backend` when needed:
 canvas-fuse mount universe ~/Directory --tree directory
 canvas-fuse mount universe ~/Selected --tree context --tree directory
 canvas-fuse mount universe ~/Selected --tree directory --backend workspace:home
+# Explicitly opt in to just the backend mirror tree:
+canvas-fuse mount universe ~/Backends --tree backends
 ```
 
 One distinct source mounts its contents directly at the supplied mountpoint.
@@ -323,7 +347,10 @@ Home to be included. Source selectors cannot be combined with `--context`.
 Unknown tree names fail before mounting when the hub is available. Offline
 mirror mounts defer tree loading until reconnect.
 
-Without source selectors, existing workspace and context layouts are unchanged.
+Without source selectors, workspace mounts expose Home, Trash, and all trees
+except `backends`. Use `--include-backends` to include it in that layout; this
+flag cannot be combined with source selectors or context mounts. For selected
+sources, add `--tree backends` instead. Context layouts are unchanged.
 Selected mounts get separate state directories per workspace and mountpoint,
 so they can run alongside a full workspace mount. Use the exact supplied path
 for `unmount` and `sync` commands.
@@ -337,6 +364,8 @@ for `unmount` and `sync` commands.
 | `-w/--workspace <name>` | - | The workspace to mount, at `<mountpoint>/<name>/`. With `-c` it scopes the context mount instead. |
 | `--tree <name>` | - | Include this virtual tree; repeatable. |
 | `--backend workspace:home` | - | Include the home drive; repeatable. |
+| `--include-backends` | false | Include `Trees/backends/` in a full workspace mount. With source selectors, use `--tree backends` instead. |
+| `--no-backends` | false | Explicitly exclude the backend tree (already the default); Home and mirroring remain enabled. |
 | `--root <selector>` | - | The selector as a flag, for when it comes from config or a script. |
 | `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only). |
@@ -345,7 +374,7 @@ for `unmount` and `sync` commands.
 | `--data-dir <path>` | `~/.canvas/<remote>/fuse/…` | Per-mount state directory (sticky filename map). Also `CANVAS_FUSE_DATA_DIR`. |
 | `--blob-cache-mb <n>` | 256 | In-memory cache budget for file content. |
 | `--mirror` | false | Keep `Home/` as a real folder mirrored with the hub (see [Mirror mode](#mirror-mode---mirror)). |
-| `--conflicts prompt\|rename` | prompt | Mirror: inbox (hub keeps the name) or Dropbox-style conflict copy. |
+| `--conflicts prompt\|rename` | rename | Mirror: inbox (hub keeps the name) or Dropbox-style conflict copy. |
 | `--deletes propagate\|keep` | propagate | Mirror: whether a local `rm` deletes on the hub. |
 | `--ignore <glob>` | - | Mirror: never upload matching keys; repeatable. |
 | `--poll <secs>` | 30 | Mirror: change-feed poll interval (socket nudges arrive sooner). |
@@ -372,11 +401,18 @@ CANVAS_SERVER=https://canvas.example CANVAS_API_TOKEN=canvas-... \
 `canvas_fuse::mount(MountOptions) -> MountHandle` — dropping the handle (or
 calling `unmount()`) tears down the ws client, threads, and the kernel mount.
 `MountOptions.contexts` filters which contexts are materialized.
-`MountOptions.selection` accepts a `WorkspaceSelection { trees, home }`;
-`WorkspaceSelection::default()` preserves the full workspace layout. Set
+`MountOptions.selection` accepts a `WorkspaceSelection { trees, home, include_backends }`;
+`WorkspaceSelection::default()` includes Home, Trash, and non-backend trees.
+Set `include_backends: true` to include the backend tree in that layout, or
+explicitly name `backends` in `trees` when selecting sources. Set
 `workspace` for source selection and leave context options unset.
 
 ## Internals
+
+Document requests negotiate gzip, which reduces transfer size for large email
+listings while preserving the full message content. Older servers can still
+return uncompressed responses. Body-transfer failures are reported separately
+from malformed JSON; requests retain their 30-second timeout.
 
 - **Blobs are real files.** Name from the location URL basename, size from
   `metadata.size` (or the blob, lazily, on first `stat`). Bytes come from

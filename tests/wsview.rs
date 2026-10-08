@@ -65,6 +65,7 @@ fn workspace_mount_builds_tree_dirs() {
     tree.apply_trees(&[
         ti("t-ctx", "tree", "context"),
         ti("t-dir", "directory", "directory"),
+        ti("t-back", "backends", "directory"),
     ]);
     // One mount, the same roots the WebDAV view exposes.
     assert_eq!(names_in(&tree, ROOT_INO), vec!["Home", "Trash", "Trees"]);
@@ -73,10 +74,51 @@ fn workspace_mount_builds_tree_dirs() {
         vec!["directory", "tree"]
     );
     assert_eq!(tree.ws_id().as_deref(), Some("ws-1"));
+    assert!(tree.ws_tree_meta("backends").is_none());
     assert_eq!(
         tree.ws_tree_meta("tree"),
         Some(("t-ctx".to_string(), "context".to_string()))
     );
+}
+
+#[test]
+fn backend_tree_opt_in_preserves_workspace_roots() {
+    let mut tree = Tree::workspace_selected(
+        "ws1".into(),
+        "ws1".into(),
+        canvas_fuse::WorkspaceSelection {
+            include_backends: true,
+            ..Default::default()
+        },
+    );
+    tree.apply_trees(&[
+        ti("t-ctx", "context", "context"),
+        ti("t-back", "backends", "directory"),
+    ]);
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["Home", "Trash", "Trees"]);
+    assert_eq!(
+        names_in(&tree, ino_at(&tree, &["Trees"])),
+        vec!["backends", "context"]
+    );
+}
+
+#[test]
+fn explicitly_selected_backend_tree_is_rooted() {
+    let mut tree = Tree::workspace_selected(
+        "ws1".into(),
+        "ws1".into(),
+        canvas_fuse::WorkspaceSelection {
+            trees: vec!["backends".into()],
+            ..Default::default()
+        },
+    );
+    tree.apply_trees(&[
+        ti("t-ctx", "context", "context"),
+        ti("t-back", "backends", "directory"),
+    ]);
+    tree.apply_tree_paths("backends", &["/imap".into()]);
+    assert_eq!(names_in(&tree, ROOT_INO), vec!["imap"]);
+    assert_eq!(tree.locate_tree_dir(ROOT_INO).unwrap().0, "backends");
 }
 
 #[test]
@@ -427,6 +469,7 @@ fn selected_tree_is_rooted_and_survives_removal_and_reappearance() {
         canvas_fuse::WorkspaceSelection {
             trees: vec!["directory".into()],
             home: false,
+            ..Default::default()
         },
     );
     let available = [
@@ -456,6 +499,7 @@ fn multiple_sources_keep_wrappers_and_exclude_unselected_trees_and_trash() {
         canvas_fuse::WorkspaceSelection {
             trees: vec!["context".into(), "directory".into()],
             home: true,
+            ..Default::default()
         },
     );
     tree.apply_trees(&[

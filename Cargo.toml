@@ -1,6 +1,6 @@
 [package]
 name = "canvas-fuse"
-version = "0.11.1"
+version = "0.11.2"
 description = "Canvas context FUSE mount that materializes context views as folders"
 authors = ["Jozef Melich <me@idnc.sk>"]
 license = "AGPL-3.0-or-later"
@@ -19,7 +19,8 @@ path = "src/main.rs"
 # default-features off: skip libfuse linkage, mount via fusermount3 directly
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Large document lists (including cached email bodies) are gzip-compressed by the hub.
+reqwest = { version = "0.12", features = ["blocking", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: JSON bodies keep the document's own field order, so a
 # `.todo.json` reads the same here as it does over WebDAV (JS objects preserve
@@ -46,5 +47,6 @@ unicode-normalization = "0.1"
 glob = "0.3"
 
 [dev-dependencies]
+flate2 = "1"
 tempfile = "3.27.0"
 tiny_http = "0.12"

@@ -119,8 +119,10 @@ impl ApiClient {
             .send()
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let body: Value = resp
-            .json()
+        let bytes = resp
+            .bytes()
+            .with_context(|| format!("GET {url}: reading response body failed (HTTP {status})"))?;
+        let body: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("GET {url}: invalid JSON (HTTP {status})"))?;
         if !status.is_success() {
             anyhow::bail!(

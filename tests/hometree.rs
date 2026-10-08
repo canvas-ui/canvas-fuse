@@ -134,6 +134,7 @@ fn home_only_mount_supports_lazy_listing_and_mirror_operations_at_root() {
         canvas_fuse::WorkspaceSelection {
             trees: vec![],
             home: true,
+            ..Default::default()
         },
     );
     assert_eq!(t.home_root_ino(), ROOT_INO);

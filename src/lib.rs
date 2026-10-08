@@ -22,12 +22,15 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Explicit workspace sources. Empty selects the traditional full workspace.
+/// Explicit workspace sources. Empty selects the workspace without backends.
 /// One source is rooted directly; multiple sources retain Home/ and Trees/.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceSelection {
     pub trees: Vec<String>,
     pub home: bool,
+    /// Include the backend mirror tree in a default workspace mount. Explicit
+    /// selections opt in by naming `backends` in `trees` instead.
+    pub include_backends: bool,
 }
 
 impl WorkspaceSelection {
@@ -40,7 +43,11 @@ impl WorkspaceSelection {
     }
 
     pub fn includes_tree(&self, name: &str) -> bool {
-        !self.is_explicit() || self.trees.iter().any(|t| t == name)
+        if self.is_explicit() {
+            self.trees.iter().any(|t| t == name)
+        } else {
+            name != "backends" || self.include_backends
+        }
     }
 
     pub fn single_tree(&self) -> bool {
@@ -66,7 +73,7 @@ pub struct MountOptions {
     /// When set, mount a workspace's trees (context + directory) read/write,
     /// mirroring each tree's path hierarchy. Mutually exclusive with contexts.
     pub workspace: Option<String>,
-    /// Sources to expose; default preserves the full workspace layout.
+    /// Sources to expose; default includes Home, Trash and non-backend trees.
     pub selection: WorkspaceSelection,
     /// The workspace a CONTEXT mount is scoped to. A mount is always one
     /// workspace; contexts belonging to any other are not materialized.
@@ -131,7 +138,7 @@ impl Drop for MountHandle {
 }
 
 pub fn mount(opts: MountOptions) -> Result<MountHandle> {
-    if opts.selection.is_explicit()
+    if (opts.selection.is_explicit() || opts.selection.include_backends)
         && (opts.workspace.is_none() || opts.context_root.is_some() || opts.contexts.is_some())
     {
         anyhow::bail!("tree/backend selection requires a workspace mount without context views");

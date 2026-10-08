@@ -50,10 +50,10 @@ pub const MIRROR_IGNORE_DEFAULTS: &[&str] = &["**/.*", "**/.*/**", ".workspace",
 pub enum ConflictMode {
     /// Upload our version to the hub's conflict inbox and adopt the hub's
     /// version at the key. The user resolves in the web UI / CLI.
-    #[default]
     Prompt,
     /// Dropbox style: our version is written next to the hub's under
     /// `<stem> (conflict from <device> <date>).<ext>`.
+    #[default]
     Rename,
 }
 
@@ -79,7 +79,7 @@ pub struct MirrorOptions {
 impl Default for MirrorOptions {
     fn default() -> Self {
         Self {
-            conflicts: ConflictMode::Prompt,
+            conflicts: ConflictMode::default(),
             deletes: DeleteMode::Propagate,
             ignore: Vec::new(),
             poll_secs: 30,

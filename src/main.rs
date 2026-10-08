@@ -109,6 +109,15 @@ enum Command {
         #[arg(long = "backend", value_name = "BACKEND", value_parser = ["workspace:home"], conflicts_with = "contexts")]
         backends: Vec<String>,
 
+        /// Include the backends tree in a full workspace mount (may fetch large listings).
+        /// For selected sources, use --tree backends instead.
+        #[arg(long, conflicts_with_all = ["contexts", "contexts_only", "trees", "backends"])]
+        include_backends: bool,
+
+        /// Exclude the backends tree (the default); Home and --mirror remain enabled.
+        #[arg(long, conflicts_with_all = ["include_backends", "contexts", "contexts_only"])]
+        no_backends: bool,
+
         /// Run in the background (logs to the state dir)
         #[arg(short = 'd', long)]
         detach: bool,
@@ -159,7 +168,7 @@ enum Command {
         cache_budget_mb: Option<u64>,
 
         /// Mirror: what to do when a file changed here AND on the hub
-        #[arg(long, value_enum, default_value_t = ConflictsArg::Prompt, requires = "mirror")]
+        #[arg(long, value_enum, default_value_t = ConflictsArg::Rename, requires = "mirror")]
         conflicts: ConflictsArg,
 
         /// Mirror: whether `rm` in the mount deletes on the hub
@@ -285,6 +294,8 @@ fn main() -> Result<()> {
             workspace,
             trees,
             backends,
+            include_backends,
+            no_backends,
             contexts_only,
             detach,
             no_ws,
@@ -315,8 +326,15 @@ fn main() -> Result<()> {
                 anyhow::bail!("use either a positional selector or --root/-w/-c");
             }
             let (workspace, contexts) = resolve_root(selector.or(root), workspace, contexts)?;
-            let selection =
-                resolve_selection(trees, backends, workspace.as_deref(), &contexts, mirror)?;
+            let selection = resolve_selection(
+                trees,
+                backends,
+                include_backends,
+                no_backends,
+                workspace.as_deref(),
+                &contexts,
+                mirror,
+            )?;
             if !pins.is_empty() || cache_budget_mb.is_some() {
                 eprintln!(
                     "note: --pin/--cache-budget-mb are no longer needed; a mirror keeps every file in Home/"
@@ -438,6 +456,8 @@ fn resolve_root(
 fn resolve_selection(
     mut trees: Vec<String>,
     backends: Vec<String>,
+    include_backends: bool,
+    no_backends: bool,
     workspace: Option<&str>,
     contexts: &[String],
     mirror: bool,
@@ -455,11 +475,18 @@ fn resolve_selection(
     let selection = WorkspaceSelection {
         trees,
         home: !backends.is_empty(),
+        include_backends,
     };
-    if selection.is_explicit() {
+    if no_backends {
+        anyhow::ensure!(
+            !include_backends && !selection.trees.iter().any(|t| t == "backends"),
+            "--no-backends cannot be combined with --include-backends or --tree backends"
+        );
+    }
+    if selection.is_explicit() || include_backends || no_backends {
         anyhow::ensure!(
             workspace.is_some() && contexts.is_empty(),
-            "--tree/--backend require a workspace and cannot select context views"
+            "--tree/--backend/--include-backends/--no-backends require a workspace and cannot select context views"
         );
     }
     if mirror {
@@ -1007,7 +1034,7 @@ mod root_selector_tests {
 
     #[test]
     fn source_flags_parse_and_validate_before_connecting() {
-        use super::{resolve_selection, Cli, Command};
+        use super::{resolve_selection, Cli, Command, ConflictsArg};
         use clap::Parser;
         let cli = Cli::try_parse_from([
             "canvas-fuse",
@@ -1020,12 +1047,34 @@ mod root_selector_tests {
         ])
         .unwrap();
         let Command::Mount {
-            backends, trees, ..
+            backends,
+            trees,
+            conflicts,
+            ..
         } = cli.command
         else {
             panic!("mount expected")
         };
-        let selection = resolve_selection(trees, backends, Some("myws"), &[], true).unwrap();
+        assert!(matches!(conflicts, ConflictsArg::Rename));
+        let explicit_prompt = Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "myws",
+            "/tmp/home",
+            "--mirror",
+            "--conflicts",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            explicit_prompt.command,
+            Command::Mount {
+                conflicts: ConflictsArg::Prompt,
+                ..
+            }
+        ));
+        let selection =
+            resolve_selection(trees, backends, false, false, Some("myws"), &[], true).unwrap();
         assert!(selection.home);
         assert!(selection.trees.is_empty());
         assert!(Cli::try_parse_from([
@@ -1037,21 +1086,41 @@ mod root_selector_tests {
             "unknown"
         ])
         .is_err());
-        assert!(
-            resolve_selection(vec![], vec!["workspace:home".into()], None, &[], false).is_err()
-        );
+        assert!(resolve_selection(
+            vec![],
+            vec!["workspace:home".into()],
+            false,
+            false,
+            None,
+            &[],
+            false
+        )
+        .is_err());
         assert!(resolve_selection(
             vec!["context".into()],
             vec![],
+            false,
+            false,
             Some("ws"),
             &["id".into()],
             false
         )
         .is_err());
-        assert!(resolve_selection(vec!["context".into()], vec![], Some("ws"), &[], true).is_err());
+        assert!(resolve_selection(
+            vec!["context".into()],
+            vec![],
+            false,
+            false,
+            Some("ws"),
+            &[],
+            true
+        )
+        .is_err());
         let selection = resolve_selection(
             vec!["context".into(), "directory".into(), "context".into()],
             vec![],
+            false,
+            false,
             Some("ws"),
             &[],
             false,
@@ -1059,6 +1128,164 @@ mod root_selector_tests {
         .unwrap();
         assert_eq!(selection.trees, vec!["context", "directory"]);
         assert!(!selection.includes_home());
+    }
+
+    #[test]
+    fn backend_tree_opt_in_keeps_the_full_workspace_layout() {
+        use super::{resolve_selection, Command};
+        let cli = Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "myws",
+            "/tmp/workspace",
+            "--include-backends",
+            "--mirror",
+        ])
+        .unwrap();
+        let Command::Mount {
+            trees,
+            backends,
+            include_backends,
+            ..
+        } = cli.command
+        else {
+            panic!("mount expected")
+        };
+        assert!(include_backends);
+        let selection = resolve_selection(
+            trees,
+            backends,
+            include_backends,
+            false,
+            Some("myws"),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(!selection.is_explicit());
+        assert!(selection.includes_home());
+        assert!(selection.includes_tree("backends"));
+        assert!(selection.includes_tree("context"));
+        assert!(resolve_selection(vec![], vec![], true, false, None, &[], false).is_err());
+        assert!(resolve_selection(
+            vec![],
+            vec![],
+            true,
+            false,
+            Some("ws"),
+            &["ctx".into()],
+            false
+        )
+        .is_err());
+
+        for flags in [
+            vec!["--context", "ctx"],
+            vec!["--contexts-only"],
+            vec!["--tree", "context"],
+            vec!["--backend", "workspace:home"],
+        ] {
+            let mut args = vec![
+                "canvas-fuse",
+                "mount",
+                "/tmp/workspace",
+                "-w",
+                "ws",
+                "--include-backends",
+            ];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn no_backends_keeps_home_and_mirror_enabled() {
+        use super::{resolve_selection, Command};
+        let cli = Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "ws",
+            "/tmp/workspace",
+            "--mirror",
+            "--no-backends",
+        ])
+        .unwrap();
+        let Command::Mount {
+            trees,
+            backends,
+            include_backends,
+            no_backends,
+            mirror,
+            ..
+        } = cli.command
+        else {
+            panic!("mount expected")
+        };
+        assert!(no_backends);
+        assert!(mirror);
+        let selection = resolve_selection(
+            trees,
+            backends,
+            include_backends,
+            no_backends,
+            Some("ws"),
+            &[],
+            mirror,
+        )
+        .unwrap();
+        assert!(!selection.is_explicit());
+        assert!(selection.includes_home());
+        assert!(selection.includes_tree("context"));
+        assert!(!selection.includes_tree("backends"));
+        let home_only = resolve_selection(
+            vec![],
+            vec!["workspace:home".into()],
+            false,
+            true,
+            Some("ws"),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(home_only.home);
+        assert!(home_only.trees.is_empty());
+
+        assert!(resolve_selection(vec![], vec![], false, true, None, &[], false).is_err());
+        assert!(resolve_selection(
+            vec![],
+            vec![],
+            false,
+            true,
+            Some("ws"),
+            &["ctx".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_selection(
+            vec!["backends".into()],
+            vec![],
+            false,
+            true,
+            Some("ws"),
+            &[],
+            false
+        )
+        .is_err());
+        for flags in [
+            vec!["--include-backends"],
+            vec!["--context", "ctx"],
+            vec!["--contexts-only"],
+        ] {
+            let mut args = vec![
+                "canvas-fuse",
+                "mount",
+                "/tmp/workspace",
+                "-w",
+                "ws",
+                "--no-backends",
+            ];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
