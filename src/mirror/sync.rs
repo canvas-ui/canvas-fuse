@@ -34,7 +34,7 @@ use super::{ConflictMode, DeleteMode, DeviceIdentity, IgnoreRules, MirrorOptions
 use crate::state::{Invalidation, Tree};
 use anyhow::{Context as _, Result};
 use fuser::ReplyData;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -162,6 +162,7 @@ pub struct Mirror {
     view: Mutex<Option<ViewLink>>,
     /// Keys with an open write handle: remote landings wait for the close.
     open_writes: Mutex<HashSet<String>>,
+    directory_moves: ReentrantMutex<()>,
 }
 
 fn ms_to_systime(ms: u64) -> SystemTime {
@@ -238,6 +239,7 @@ impl Mirror {
             engine_tx: Mutex::new(None),
             view: Mutex::new(None),
             open_writes: Mutex::new(HashSet::new()),
+            directory_moves: ReentrantMutex::new(()),
         });
         // What happened to the folder while no daemon was looking is the
         // first thing to know — before the view is built, before the hub
@@ -521,6 +523,10 @@ impl Mirror {
     /// knows the source (has a base). A file that was never pushed just
     /// gets pushed under its new name.
     pub fn rename_local(&self, from: &str, to: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.pending_directory_move(from) && !self.pending_directory_move(to),
+            "directory rename is still pending; retry after sync"
+        );
         if self.store.entry(to).is_some() {
             // Overwrite-rename: the destination goes first, in the queue
             // too, so the hub sees delete(to) then rename(from → to).
@@ -612,41 +618,138 @@ impl Mirror {
         Ok(())
     }
 
-    /// `mv` of a directory: one rename on disk, then every file under it
-    /// individually in the store (the hub has no directory rename), plus
-    /// the dir records.
+    /// A directory move is one durable operation, never a batch of file moves.
     pub fn rename_dir_local(&self, from: &str, to: &str) -> Result<()> {
-        if self.store.dir_has_children(to) || self.store.entry(to).is_some() {
-            anyhow::bail!("target exists");
+        use std::os::unix::fs::MetadataExt;
+        let _guard = self.directory_moves.lock();
+        anyhow::ensure!(
+            !super::store::overlaps(from, to),
+            "cannot move a directory into itself"
+        );
+        anyhow::ensure!(
+            !self.store.dir_has_children(to) && self.store.entry(to).is_none(),
+            "target exists"
+        );
+        anyhow::ensure!(
+            !self.pending_move_overlap(from, to),
+            "an overlapping rename is still pending; retry after sync"
+        );
+        let local_only = self.is_ignored(from) && self.is_ignored(to)
+            || (self.store.bases(&format!("{from}/")).is_empty()
+                && self
+                    .store
+                    .jobs()
+                    .iter()
+                    .any(|j| matches!(&j.kind, JobKind::Mkdir { key } if key == from)));
+        anyhow::ensure!(
+            local_only || (!self.is_ignored(from) && !self.is_ignored(to)),
+            "cannot move a synced directory across an exclusion boundary"
+        );
+        for (key, _) in self.store.bases(&format!("{from}/")) {
+            anyhow::ensure!(
+                !self.is_ignored(&format!("{to}{}", &key[from.len()..])),
+                "destination excludes a synced file"
+            );
         }
-        self.local.rename(from, to)?;
-        let children: Vec<String> = self
+        let st = std::fs::metadata(self.local.path(from))?;
+        let seq = self.store.enqueue(JobKind::RenameDir {
+            from: from.to_string(),
+            to: to.to_string(),
+            operation_id: super::operation_id()?,
+            dev: st.dev(),
+            ino: st.ino(),
+            local_applied: false,
+            remote: !local_only,
+        })?;
+        let job = self
             .store
-            .entries_under(from)
+            .jobs()
             .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        for key in children {
-            let rest = &key[from.len() + 1..];
-            self.rekey_entry(&key, &format!("{to}/{rest}"))?;
-        }
-        self.store.rekey_dirs(from, to)?;
-        self.record_dirs_for(to);
-        if !self.store.has_dir(to) {
-            self.store.add_dir(to)?;
-        }
-        if !self.is_ignored(to) && !self.store.dir_has_children(to) {
-            // An empty directory has no files to carry its name over.
-            self.store.enqueue(JobKind::Mkdir {
-                key: to.to_string(),
-            })?;
-        }
-        if !self.is_ignored(from) {
-            self.store.enqueue(JobKind::Rmdir {
-                key: from.to_string(),
-            })?;
+            .find(|j| j.seq == seq)
+            .expect("queued directory move");
+        if let Err(error) = self.finish_directory_move(&job) {
+            // Cancel only if the syscall did not move the source. Otherwise
+            // retain the intent so a restart can finish the ledger commit.
+            if self.local.is_dir(from) {
+                let _ = self.store.remove_job(seq);
+            }
+            return Err(error);
         }
         self.wake();
+        Ok(())
+    }
+
+    /// Take this before the write-store refresh lock. Engine landings take
+    /// the same locks in this order so a folder cannot move under an upload,
+    /// download or scan. Reentrant for engine helpers and the FUSE facade.
+    pub fn lock_directory_moves(&self) -> ReentrantMutexGuard<'_, ()> {
+        self.directory_moves.lock()
+    }
+
+    fn pending_move_overlap(&self, from: &str, to: &str) -> bool {
+        self.store.jobs().iter().any(|job| {
+            matches!(job.kind, JobKind::Rename { .. } | JobKind::RenameDir { .. })
+                && job
+                    .kind
+                    .keys()
+                    .iter()
+                    .any(|key| super::store::overlaps(key, from) || super::store::overlaps(key, to))
+        })
+    }
+
+    fn pending_directory_move(&self, key: &str) -> bool {
+        self.store.jobs().iter().any(|job| {
+            matches!(&job.kind, JobKind::RenameDir { from, to, .. }
+            if super::store::under(key, from) || super::store::under(key, to))
+        })
+    }
+
+    fn finish_directory_move(&self, job: &Job) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let JobKind::RenameDir {
+            from,
+            to,
+            dev,
+            ino,
+            local_applied: false,
+            ..
+        } = &job.kind
+        else {
+            return Ok(());
+        };
+        let is_original = |key: &str| {
+            std::fs::metadata(self.local.path(key))
+                .is_ok_and(|st| st.is_dir() && st.dev() == *dev && st.ino() == *ino)
+        };
+        if is_original(from) {
+            self.local.rename(from, to)?;
+        }
+        anyhow::ensure!(
+            is_original(to),
+            "directory move intent no longer matches its local inode"
+        );
+        self.store.apply_directory_rename(job)?;
+        self.record_dirs_for(to);
+        let mut writes = self.open_writes.lock();
+        *writes = writes
+            .iter()
+            .map(|key| {
+                if super::store::under(key, from) {
+                    format!("{to}{}", &key[from.len()..])
+                } else {
+                    key.clone()
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn recover_directory_moves(&self) -> Result<(), HubError> {
+        let _guard = self.directory_moves.lock();
+        for job in self.store.jobs() {
+            self.finish_directory_move(&job)
+                .map_err(|e| HubError::Other(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -833,6 +936,7 @@ impl Mirror {
     /// so it runs offline too. Keys with an open write handle are left to
     /// their close.
     pub fn scan_local(&self) -> ScanReport {
+        let _guard = self.directory_moves.lock();
         let mut report = ScanReport::default();
         let mut seen_files: HashSet<String> = HashSet::new();
         let mut seen_dirs: HashSet<String> = HashSet::new();
@@ -848,6 +952,9 @@ impl Mirror {
                 continue;
             }
             seen_files.insert(key.clone());
+            if self.pending_directory_move(&key) {
+                continue;
+            }
             if self.is_open_for_write(&key) {
                 continue;
             }
@@ -904,6 +1011,8 @@ impl Mirror {
         for (key, e) in self.store.entries("") {
             if e.state == EntryState::Tombstone
                 || seen_files.contains(&key)
+                || self.pending_directory_move(&key)
+                || self.local.is_file(&key)
                 || self.is_open_for_write(&key)
             {
                 continue;
@@ -925,7 +1034,7 @@ impl Mirror {
             }
         }
         for d in self.store.dirs() {
-            if seen_dirs.contains(&d) {
+            if seen_dirs.contains(&d) || self.pending_directory_move(&d) {
                 continue;
             }
             let _ = self.store.remove_dir(&d);
@@ -1046,6 +1155,7 @@ impl Mirror {
     }
 
     fn cycle_inner(&self, full: bool) -> Result<(), HubError> {
+        self.recover_directory_moves()?;
         if full {
             // Local first: what the folder says is true whether or not the
             // hub answers.
@@ -1060,7 +1170,11 @@ impl Mirror {
             }
         }
         self.refresh_hub_rules()?;
-        if full || self.store.cursor().is_none() || self.store.meta(META_LISTED).is_none() {
+        if full
+            || self.store.meta("directory-refresh").as_deref() == Some("1")
+            || self.store.cursor().is_none()
+            || self.store.meta(META_LISTED).is_none()
+        {
             self.rebuild_from_listing()?;
             self.rt.lock().last_full = Some(Instant::now());
         } else {
@@ -1069,6 +1183,11 @@ impl Mirror {
         self.recheck_deferred()?;
         self.recover_jobs();
         self.drain_jobs()?;
+        if self.store.meta("directory-refresh").as_deref() == Some("1") {
+            // Include edits made outside FUSE while the move was pending.
+            self.scan_local();
+            self.rebuild_from_listing()?;
+        }
         Ok(())
     }
 
@@ -1137,6 +1256,7 @@ impl Mirror {
         let _ = self.store.set_cursor(head);
         let _ = self.store.set_number(HEAD_KEY, head);
         let _ = self.store.set_meta(META_LISTED, "1");
+        let _ = self.store.set_meta("directory-refresh", "0");
         Ok(())
     }
 
@@ -1169,7 +1289,16 @@ impl Mirror {
     }
 
     fn apply_change(&self, change: &Change) -> Result<(), HubError> {
+        let _guard = self.directory_moves.lock();
         let key = super::normalize_key(&change.key);
+        if self.pending_directory_move(&key)
+            || change
+                .from
+                .as_deref()
+                .is_some_and(|from| self.pending_directory_move(from))
+        {
+            return Ok(()); // completion refreshes the subtree in a bulk listing
+        }
         // Feed entries are notifications, not snapshots. An old put (including
         // our own echo) must never roll the base back or invent a conflict.
         let stat = self.hub.head_object(&key)?;
@@ -1251,7 +1380,11 @@ impl Mirror {
         remote: Option<&RemoteStat>,
         seq: u64,
     ) -> Result<(), HubError> {
+        let _guard = self.directory_moves.lock();
         if key.is_empty() || self.is_ignored(key) {
+            return Ok(());
+        }
+        if self.pending_directory_move(key) {
             return Ok(());
         }
         let pending_rename = self.store.jobs().iter().any(
@@ -1480,8 +1613,12 @@ impl Mirror {
     /// Keys whose remote change we skipped because a handle was open:
     /// ask the hub what is there now and decide again.
     fn recheck_deferred(&self) -> Result<(), HubError> {
+        let _guard = self.directory_moves.lock();
         let keys: Vec<String> = self.rt.lock().recheck.drain().collect();
         for key in keys {
+            if self.pending_directory_move(&key) {
+                continue;
+            }
             if self.is_open_for_write(&key) {
                 self.rt.lock().recheck.insert(key);
                 continue;
@@ -1538,7 +1675,12 @@ impl Mirror {
                 break;
             }
             for job in jobs {
-                if job.kind.keys().iter().any(|k| blocked.contains(*k)) {
+                if job
+                    .kind
+                    .keys()
+                    .iter()
+                    .any(|k| blocked.iter().any(|held| super::store::overlaps(k, held)))
+                {
                     continue;
                 }
                 if job.not_before > now {
@@ -1558,13 +1700,28 @@ impl Mirror {
     }
 
     fn run_one(&self, job: &Job, blocked: &mut HashSet<String>) -> Result<(), HubError> {
+        // Wait for the local syscall and ledger commit before loading a move
+        // intent. Otherwise a worker could persist a stale, unapplied intent.
+        let _move_guard = self.directory_moves.lock();
+        // A local directory move can re-key/re-sequence jobs after the drain
+        // pass took its snapshot. Never execute one of those stale jobs.
+        let Some(current) = self.store.jobs().into_iter().find(|j| j.seq == job.seq) else {
+            return Ok(());
+        };
+        let job = &current;
+        if !matches!(job.kind, JobKind::RenameDir { .. }) && self.store.jobs().iter().any(|pending| {
+            pending.seq < job.seq && matches!(&pending.kind, JobKind::RenameDir { from, to, .. }
+                if job.kind.keys().iter().any(|key| super::store::under(key, from) || super::store::under(key, to)))
+        }) {
+            return Ok(());
+        }
         match self.run_job(job) {
             Ok(()) => {
                 let _ = self.store.remove_job(job.seq);
                 self.write_status(false);
             }
             Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
-            Err(e) if e.is_permanent() => {
+            Err(e) if e.is_permanent() && !matches!(job.kind, JobKind::RenameDir { .. }) => {
                 log::warn!("job {:?} refused by the hub: {e}", job.kind);
                 self.rt
                     .lock()
@@ -1597,6 +1754,37 @@ impl Mirror {
             JobKind::Push { key } => self.run_push(key),
             JobKind::Delete { key } => self.run_delete(key),
             JobKind::Rename { from, to } => self.run_rename(from, to),
+            JobKind::RenameDir {
+                from,
+                to,
+                operation_id,
+                local_applied,
+                remote,
+                ..
+            } => {
+                if !local_applied {
+                    return Err(HubError::Other(
+                        "directory move is not applied locally yet".into(),
+                    ));
+                }
+                if *remote {
+                    match self.hub.rename_directory(from, to, operation_id) {
+                        // A folder discovered offline can contain only new,
+                        // unpushed files. There is no server folder to move.
+                        Err(HubError::NotFound)
+                            if self.store.bases(&format!("{to}/")).is_empty() =>
+                        {
+                            self.hub.mkdir(to)?;
+                        }
+                        result => result?,
+                    }
+                    log::info!("{from} → {to}: directory renamed on the hub");
+                }
+                self.store
+                    .set_meta("directory-refresh", "1")
+                    .map_err(|e| HubError::Other(e.to_string()))?;
+                Ok(())
+            }
             JobKind::Conflict {
                 key,
                 local_sha256,

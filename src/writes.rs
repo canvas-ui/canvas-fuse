@@ -964,9 +964,8 @@ impl WriteStore {
     /// through to the document paths); `EXDEV` when only one is — `mv` then
     /// composes copy + unlink from primitives that exist on both sides.
     ///
-    /// Live mode talks to the hub per file (`POST objects/rename`, file-only
-    /// on the hub, so a folder move is one call per file below it). Mirror
-    /// mode re-keys the store and queues the same calls for the engine.
+    /// Files and whole directories use the hub's rename operation. Mirror
+    /// mode re-keys the store and queues the operation for the engine.
     fn rename_home(
         &self,
         src_dir: u64,
@@ -1000,6 +999,7 @@ impl WriteStore {
         dst_name: &str,
         dst_dir_path: &str,
     ) -> WResult<()> {
+        let _mirror_moves = self.mirror.as_ref().map(|m| m.lock_directory_moves());
         let _sync = self.sync.lock();
         let src_path = crate::state::join_home_path(src_dir_path, src_name);
         let dst_path = crate::state::join_home_path(dst_dir_path, dst_name);
@@ -1146,6 +1146,15 @@ impl WriteStore {
         }
         // An open handle on the source keeps writing — to the new name.
         let mut inner = self.inner.lock();
+        if src_is_dir {
+            for state in inner.states.values_mut() {
+                if let FlushTarget::HomeFile { path, .. } = &mut state.target {
+                    if let Some(rest) = path.strip_prefix(&format!("{src_path}/")) {
+                        *path = format!("{dst_path}/{rest}");
+                    }
+                }
+            }
+        }
         if let Some(state) = inner.states.get_mut(&src_ino) {
             if let FlushTarget::HomeFile {
                 path,
@@ -1161,70 +1170,22 @@ impl WriteStore {
         Ok(())
     }
 
-    /// Live-mode folder move: the hub renames files, not folders, so every
-    /// file below the folder moves on its own. Unlisted subfolders are
-    /// listed first — the tree only holds what something has looked at.
+    /// Live mounts use the same single directory operation as the mirror.
     fn rename_home_dir_live(
         &self,
         ws: &str,
-        dir_ino: u64,
+        _dir_ino: u64,
         src_path: &str,
         dst_path: &str,
     ) -> WResult<()> {
-        let mut stack: Vec<(u64, String, String)> =
-            vec![(dir_ino, src_path.to_string(), dst_path.to_string())];
-        let mut empty_dirs: Vec<String> = Vec::new();
-        while let Some((ino, from, to)) = stack.pop() {
-            let loaded = self
-                .tree
-                .read()
-                .home_path(ino)
-                .map(|(_, l)| l)
-                .unwrap_or(true);
-            if !loaded {
-                let entries = self
-                    .api
-                    .list_home(ws, &from)
-                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
-                self.tree.write().apply_home_entries(ino, &entries);
-            }
-            let children: Vec<(u64, String, bool)> = self
-                .tree
-                .read()
-                .list(ino)
-                .map(|c| {
-                    c.iter()
-                        .map(|n| (n.ino, n.name.clone(), n.is_dir()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if children.is_empty() {
-                empty_dirs.push(to.clone());
-            }
-            for (child, name, is_dir) in children {
-                let cf = crate::state::join_home_path(&from, &name);
-                let ct = crate::state::join_home_path(&to, &name);
-                if is_dir {
-                    stack.push((child, cf, ct));
-                } else {
-                    self.api
-                        .rename_object(
-                            ws,
-                            crate::mirror::DEFAULT_BACKEND,
-                            home_key(&cf),
-                            home_key(&ct),
-                            None,
-                        )
-                        .map_err(|e| WriteError::Io(format!("{e:#}")))?;
-                }
-            }
-        }
-        for d in empty_dirs {
-            let _ = self.api.mkdir_home(ws, &d);
-        }
-        // The old folder is empty now (or holds only what the hub hides).
-        let _ = self.api.remove_home(ws, src_path);
-        Ok(())
+        self.api
+            .rename_directory(
+                ws,
+                crate::mirror::DEFAULT_BACKEND,
+                home_key(src_path),
+                home_key(dst_path),
+            )
+            .map_err(|e| WriteError::Io(format!("{e:#}")))
     }
 
     fn unlink_ws(&self, dir_ino: u64, name: &str) -> WResult<()> {

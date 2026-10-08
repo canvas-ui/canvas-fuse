@@ -68,6 +68,13 @@ pub enum DeleteMode {
     Keep,
 }
 
+/// Stable per-operation token, persisted with a queued directory rename.
+pub fn operation_id() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    openssl::rand::rand_bytes(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[derive(Debug, Clone)]
 pub struct MirrorOptions {
     pub conflicts: ConflictMode,

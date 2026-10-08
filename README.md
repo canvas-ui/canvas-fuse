@@ -172,6 +172,16 @@ What the daemon does:
   (`If-None-Match: *` for new files). `mv` and `rm` queue the same way
   (`POST objects/rename`, `DELETE` with `If-Match`). The queue is durable:
   a crash or an offline stretch never loses a write.
+- **Folder moves are one operation.** Renaming a synced folder sends one
+  directory rename request. The local folder and the hub folder each use a
+  native filesystem rename; file contents and inodes stay in place. The
+  mirror re-keys its ledger and queued edits together, then refreshes metadata
+  through a paged listing rather than querying every child. A persistent
+  operation ID makes retries safe after a lost response or restart. Pending
+  moves protect both paths from reconciliation; a refused move stays queued
+  with its dependent writes. Another overlapping rename must wait for sync.
+  This requires canvas-server 2.15.7 (or runtime-core 0.1.3) with canvas-stored
+  1.9.5 or newer; older hubs leave the directory operation pending.
 - **The folder is scanned** at every mount, on `sync now`, and hourly.
   Files edited, added or removed while no daemon was running are hashed
   and become pushes and deletes under the same rules as live edits. A
@@ -240,9 +250,8 @@ weight (a log line says so) and can be deleted. `--pin` and
 `--cache-budget-mb` are accepted and ignored — there is nothing to pin when
 everything is local.
 
-Without `--mirror`, `Home/` keeps its passthrough behaviour — with one
-addition: `mv` inside `Home/` works (per file, via the hub's rename
-route) instead of failing with `EACCES`.
+Without `--mirror`, `Home/` keeps its passthrough behaviour. `mv` inside
+`Home/` uses the hub's rename route for either a file or a whole directory.
 
 ## Install
 

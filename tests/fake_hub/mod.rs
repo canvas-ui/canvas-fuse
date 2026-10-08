@@ -62,6 +62,8 @@ pub struct HubState {
     pub mkdirs: Vec<String>,
     pub rmdirs: Vec<String>,
     pub requests: Vec<String>,
+    pub directory_renames: Vec<(String, String)>,
+    pub directory_receipts: BTreeMap<String, (String, String)>,
 }
 
 pub fn sha_hex(bytes: &[u8]) -> String {
@@ -452,19 +454,74 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
             .map(str::to_string)
             .or_else(|| header(&req, "X-Canvas-Origin"));
         let mut st = state.lock().unwrap();
-        match st.objects.get(&from).cloned() {
-            None => envelope(404, Value::Null, "not found", Some("NOT_FOUND")),
-            Some(o) => {
-                if let Some(m) = &if_match {
-                    if *m != o.sha {
-                        let cur =
-                            json!({ "sha256": o.sha, "size": o.bytes.len(), "mtime": o.mtime });
-                        envelope(
-                            412,
-                            json!({ "current": cur }),
-                            "precondition failed",
-                            Some("PRECONDITION_FAILED"),
-                        )
+        if b["directory"].as_bool() == Some(true) {
+            let op = b["operationId"].as_str().unwrap_or("").to_string();
+            if st.directory_receipts.get(&op) == Some(&(from.clone(), to.clone())) {
+                envelope(
+                    200,
+                    json!({ "directory": true, "from": from, "to": to }),
+                    "OK",
+                    None,
+                )
+            } else if st
+                .objects
+                .keys()
+                .any(|key| key == &to || key.starts_with(&format!("{to}/")))
+            {
+                envelope(409, Value::Null, "target exists", Some("TARGET_EXISTS"))
+            } else {
+                let keys: Vec<_> = st
+                    .objects
+                    .keys()
+                    .filter(|key| key.starts_with(&format!("{from}/")))
+                    .cloned()
+                    .collect();
+                if keys.is_empty() && !st.mkdirs.contains(&from) {
+                    envelope(404, Value::Null, "not found", Some("NOT_FOUND"))
+                } else {
+                    for key in keys {
+                        let dest = format!("{to}{}", &key[from.len()..]);
+                        do_rename(&mut st, &key, &dest, origin.clone(), None);
+                    }
+                    for dir in &mut st.mkdirs {
+                        if dir == &from || dir.starts_with(&format!("{from}/")) {
+                            *dir = format!("{to}{}", &dir[from.len()..]);
+                        }
+                    }
+                    st.directory_renames.push((from.clone(), to.clone()));
+                    st.directory_receipts.insert(op, (from.clone(), to.clone()));
+                    envelope(
+                        200,
+                        json!({ "directory": true, "from": from, "to": to }),
+                        "OK",
+                        None,
+                    )
+                }
+            }
+        } else {
+            match st.objects.get(&from).cloned() {
+                None => envelope(404, Value::Null, "not found", Some("NOT_FOUND")),
+                Some(o) => {
+                    if let Some(m) = &if_match {
+                        if *m != o.sha {
+                            let cur =
+                                json!({ "sha256": o.sha, "size": o.bytes.len(), "mtime": o.mtime });
+                            envelope(
+                                412,
+                                json!({ "current": cur }),
+                                "precondition failed",
+                                Some("PRECONDITION_FAILED"),
+                            )
+                        } else if st.objects.contains_key(&to) {
+                            envelope(
+                                409,
+                                json!({ "key": to }),
+                                "target exists",
+                                Some("TARGET_EXISTS"),
+                            )
+                        } else {
+                            do_rename(&mut st, &from, &to, origin, if_match)
+                        }
                     } else if st.objects.contains_key(&to) {
                         envelope(
                             409,
@@ -475,15 +532,6 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
                     } else {
                         do_rename(&mut st, &from, &to, origin, if_match)
                     }
-                } else if st.objects.contains_key(&to) {
-                    envelope(
-                        409,
-                        json!({ "key": to }),
-                        "target exists",
-                        Some("TARGET_EXISTS"),
-                    )
-                } else {
-                    do_rename(&mut st, &from, &to, origin, if_match)
                 }
             }
         }

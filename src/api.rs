@@ -593,9 +593,31 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Rename a file on a path-addressed backend (`POST …/objects/rename`,
-    /// the sync protocol's route): same bytes, same document, new key. The
-    /// hub renames files only; a folder move is one call per file.
+    /// Rename a whole directory in one server operation, preserving its files.
+    pub fn rename_directory(&self, ws: &str, backend: &str, from: &str, to: &str) -> Result<()> {
+        let payload = self.send_json(
+            reqwest::Method::POST,
+            &format!(
+                "/rest/v2/workspaces/{}/backends/file/{}/objects/rename",
+                encode_segment(ws),
+                encode_segment(backend)
+            ),
+            &serde_json::json!({ "from": from, "to": to, "directory": true,
+                "operationId": crate::mirror::operation_id()? }),
+        )?;
+        anyhow::ensure!(
+            payload
+                .get("payload")
+                .unwrap_or(&payload)
+                .get("directory")
+                .and_then(Value::as_bool)
+                == Some(true),
+            "hub did not acknowledge a directory rename; update the server"
+        );
+        Ok(())
+    }
+
+    /// Rename one file: same bytes and document, new key.
     pub fn rename_object(
         &self,
         ws: &str,

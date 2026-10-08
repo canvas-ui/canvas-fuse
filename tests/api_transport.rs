@@ -6,6 +6,41 @@ use std::time::Duration;
 use tiny_http::{Header, Response, Server};
 
 #[test]
+fn live_directory_move_is_one_request_with_a_retry_id() {
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let api = ApiClient::new(&format!("http://{}", server.server_addr()), "test").unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut req = server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.method().as_str(), "POST");
+        assert!(req.url().ends_with("/objects/rename"));
+        let body: serde_json::Value = serde_json::from_reader(req.as_reader()).unwrap();
+        assert_eq!(body["from"], "Architektúra/Domček");
+        assert_eq!(body["to"], "Architektúra/Fotky");
+        assert_eq!(body["directory"], true);
+        assert_eq!(body["operationId"].as_str().unwrap().len(), 32);
+        req.respond(Response::from_string(
+            r#"{"payload":{"directory":true,"state":"complete"}}"#,
+        ))
+        .unwrap();
+        assert!(server
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+    });
+    api.rename_directory(
+        "ws",
+        "workspace:home",
+        "Architektúra/Domček",
+        "Architektúra/Fotky",
+    )
+    .unwrap();
+    thread.join().unwrap();
+}
+
+#[test]
 fn gzip_email_listing_preserves_full_documents_across_pages() {
     let server = Server::http("127.0.0.1:0").unwrap();
     let api = ApiClient::new(&format!("http://{}", server.server_addr()), "test").unwrap();

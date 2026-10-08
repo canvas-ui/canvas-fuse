@@ -644,7 +644,33 @@ impl HubClient {
         Self::json_ok(resp).map(|_| ())
     }
 
-    // ── directories (older home routes) ──────────────────────────────────────
+    // ── directories ─────────────────────────────────────────────────────────
+
+    pub fn rename_directory(
+        &self,
+        from: &str,
+        to: &str,
+        operation_id: &str,
+    ) -> Result<(), HubError> {
+        let url = format!("{}/objects/rename", self.backend_url());
+        let body = serde_json::json!({ "from": from, "to": to, "directory": true,
+            "operationId": operation_id, "origin": self.device_id });
+        let resp =
+            self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(&body)))?;
+        let payload = Self::json_ok(resp)?;
+        if payload
+            .get("payload")
+            .unwrap_or(&payload)
+            .get("directory")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(HubError::Other(
+                "hub did not acknowledge a directory rename; update the server".into(),
+            ));
+        }
+        Ok(())
+    }
 
     pub fn mkdir(&self, key: &str) -> Result<(), HubError> {
         let url = format!(

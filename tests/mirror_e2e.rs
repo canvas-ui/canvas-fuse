@@ -735,7 +735,11 @@ fn renames_move_real_files_and_directories() {
     r.mirror.cycle(false);
     assert_eq!(r.hub.lock().bytes_of("c/two.txt").unwrap(), b"2");
     assert!(r.hub.lock().bytes_of("a/two.txt").is_none());
-    assert_eq!(r.hub.lock().rmdirs, vec!["a".to_string()]);
+    assert!(r.hub.lock().rmdirs.is_empty());
+    assert_eq!(
+        r.hub.lock().directory_renames,
+        vec![("a".into(), "c".into())]
+    );
 }
 
 /// Upgrading from the content-cache mirror (0.10): cached bytes move into
@@ -855,4 +859,203 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
     let m = open_mirror(&dir, &hub.url, opts());
     assert_eq!(m.status().entries, 4);
     assert!(hub.lock().bytes_of("Docs/.~lock.plan.xlsx#").is_none());
+}
+
+#[test]
+fn a_thousand_photos_move_with_one_request_and_no_file_transfers() {
+    use std::os::unix::fs::MetadataExt;
+    let r = rig(opts());
+    for n in 0..1000 {
+        r.hub.lock().put(
+            &format!("Architektúra/Domček/{n}.jpg"),
+            format!("photo-{n}").as_bytes(),
+        );
+    }
+    r.mirror.cycle(true);
+    let before = std::fs::metadata(r._dir.path().join("Home/Architektúra/Domček/0.jpg"))
+        .unwrap()
+        .ino();
+    r.hub.lock().requests.clear();
+    r.mirror
+        .rename_dir_local("Architektúra/Domček", "Architektúra/Fotky")
+        .unwrap();
+    assert_eq!(r.mirror.store.jobs().len(), 1);
+    // A full reconcile must not resurrect the old server paths before the move.
+    r.mirror.cycle(true);
+    r.mirror.cycle(false);
+    let st = r.hub.lock();
+    assert_eq!(st.directory_renames.len(), 1);
+    assert_eq!(
+        st.requests
+            .iter()
+            .filter(|q| q.ends_with("/objects/rename"))
+            .count(),
+        1
+    );
+    assert!(
+        !st.requests.iter().any(|q| q.starts_with("HEAD ")
+            || q.starts_with("PUT ")
+            || q.starts_with("DELETE ")
+            || (q.starts_with("GET ") && q.contains("/objects/"))),
+        "{:?}",
+        st.requests
+    );
+    assert_eq!(st.objects.len(), 1000);
+    assert!(st
+        .objects
+        .keys()
+        .all(|k| k.starts_with("Architektúra/Fotky/")));
+    assert_eq!(
+        std::fs::metadata(r._dir.path().join("Home/Architektúra/Fotky/0.jpg"))
+            .unwrap()
+            .ino(),
+        before
+    );
+    assert!(!r._dir.path().join("Home/Architektúra/Domček").exists());
+}
+
+#[test]
+fn directory_move_orders_dirty_children_after_the_move() {
+    let r = rig(opts());
+    r.hub.lock().put("old/edited.txt", b"base");
+    r.hub.lock().put("old/deleted.txt", b"remove");
+    r.mirror.cycle(true);
+    r.mirror.commit_write("old/edited.txt", b"edited").unwrap();
+    r.mirror.commit_write("old/new.txt", b"new").unwrap();
+    r.mirror.delete_local("old/deleted.txt").unwrap();
+    r.mirror.rename_dir_local("old", "new").unwrap();
+    r.hub.lock().requests.clear();
+    r.mirror.cycle(false);
+    let st = r.hub.lock();
+    assert_eq!(st.bytes_of("new/edited.txt").unwrap(), b"edited");
+    assert_eq!(st.bytes_of("new/new.txt").unwrap(), b"new");
+    assert!(st.bytes_of("new/deleted.txt").is_none());
+    let mutation = st
+        .requests
+        .iter()
+        .find(|q| q.starts_with("POST ") || q.starts_with("PUT ") || q.starts_with("DELETE "))
+        .unwrap();
+    assert!(mutation.ends_with("/objects/rename"));
+}
+
+#[test]
+fn lost_directory_rename_reply_can_be_retried_after_restart() {
+    use canvas_fuse::mirror::store::JobKind;
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    hub.lock().put("old/a.jpg", b"photo");
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+        m.rename_dir_local("old", "new").unwrap();
+        let job = m.store.jobs().pop().unwrap();
+        let JobKind::RenameDir {
+            from,
+            to,
+            operation_id,
+            ..
+        } = job.kind
+        else {
+            panic!("directory operation expected");
+        };
+        // Server committed; client never recorded the successful response.
+        m.hub.rename_directory(&from, &to, &operation_id).unwrap();
+    }
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert!(m.store.jobs().is_empty());
+    assert_eq!(hub.lock().directory_renames.len(), 1);
+    assert_eq!(
+        std::fs::read(dir.path().join("Home/new/a.jpg")).unwrap(),
+        b"photo"
+    );
+    assert!(!dir.path().join("Home/old").exists());
+}
+
+#[test]
+fn refused_directory_move_keeps_children_blocked_and_both_trees_intact() {
+    let r = rig(opts());
+    r.hub.lock().put("old/a.txt", b"base");
+    r.mirror.cycle(true);
+    r.mirror.rename_dir_local("old", "new").unwrap();
+    r.mirror.commit_write("new/a.txt", b"ours").unwrap();
+    r.hub.lock().put("new/a.txt", b"theirs");
+    r.mirror.cycle(true);
+    assert_eq!(r.home_read("new/a.txt").unwrap(), b"ours");
+    assert!(!r._dir.path().join("Home/old").exists());
+    assert_eq!(r.hub.lock().bytes_of("old/a.txt").unwrap(), b"base");
+    assert_eq!(r.hub.lock().bytes_of("new/a.txt").unwrap(), b"theirs");
+    assert!(r.mirror.status().failed > 0);
+    assert!(r.mirror.status().pending >= 2);
+}
+
+#[test]
+fn interrupted_local_directory_move_recovers_its_ledger_after_restart() {
+    use canvas_fuse::mirror::store::JobKind;
+    use std::os::unix::fs::MetadataExt;
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    hub.lock().put("old/a.jpg", b"photo");
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+        let st = std::fs::metadata(dir.path().join("Home/old")).unwrap();
+        m.store
+            .enqueue(JobKind::RenameDir {
+                from: "old".into(),
+                to: "new".into(),
+                operation_id: "local-recovery".into(),
+                dev: st.dev(),
+                ino: st.ino(),
+                local_applied: false,
+                remote: true,
+            })
+            .unwrap();
+        m.local.rename("old", "new").unwrap();
+        // Crash before applying the ledger transaction.
+    }
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert!(m.store.jobs().is_empty());
+    assert!(m.store.entry("old/a.jpg").is_none());
+    assert_eq!(
+        m.store.entry("new/a.jpg").unwrap().sha256,
+        sha_hex(b"photo")
+    );
+    assert_eq!(hub.lock().bytes_of("new/a.jpg").unwrap(), b"photo");
+}
+
+#[test]
+fn unpushed_and_empty_directories_keep_working() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    r.mirror.mkdir_local("empty").unwrap();
+    r.mirror.rename_dir_local("empty", "empty-new").unwrap();
+    r.mirror.cycle(false);
+    assert!(r.hub.lock().mkdirs.contains(&"empty-new".to_string()));
+    // Implicit parent from a newly created file has no pending Mkdir.
+    r.mirror.commit_write("old/a.txt", b"new photo").unwrap();
+    r.mirror.rename_dir_local("old", "new").unwrap();
+    r.mirror.cycle(false);
+    assert_eq!(r.hub.lock().bytes_of("new/a.txt").unwrap(), b"new photo");
+    assert!(r.mirror.store.jobs().is_empty());
+}
+
+#[test]
+fn edit_outside_fuse_during_a_pending_move_is_preserved_on_reconcile() {
+    let r = rig(opts());
+    r.hub.lock().put("old/a.txt", b"base");
+    r.mirror.cycle(true);
+    r.mirror.rename_dir_local("old", "new").unwrap();
+    std::fs::write(r._dir.path().join("Home/new/a.txt"), b"our outside edit").unwrap();
+    r.hub.lock().put("old/a.txt", b"their edit");
+    r.mirror.cycle(true);
+    r.mirror.cycle(false);
+    assert_eq!(r.hub.lock().bytes_of("new/a.txt").unwrap(), b"their edit");
+    assert!(r
+        .hub
+        .lock()
+        .inbox
+        .iter()
+        .any(|c| c.bytes == b"our outside edit"));
 }

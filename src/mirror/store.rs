@@ -43,6 +43,17 @@ const TRASH: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_v2");
 /// through.
 const DIRS: TableDefinition<&str, &str> = TableDefinition::new("dirs_v2");
 
+pub fn under(key: &str, dir: &str) -> bool {
+    key == dir
+        || key
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+pub fn overlaps(a: &str, b: &str) -> bool {
+    under(a, b) || under(b, a)
+}
+
 const RETIRED: [&str; 10] = [
     "entries_v1",
     "base_v1",
@@ -110,6 +121,16 @@ pub enum JobKind {
         from: String,
         to: String,
     },
+    /// Durable directory move intent, completed locally before it goes online.
+    RenameDir {
+        from: String,
+        to: String,
+        operation_id: String,
+        dev: u64,
+        ino: u64,
+        local_applied: bool,
+        remote: bool,
+    },
     /// Upload our version of a key the hub changed too.
     Conflict {
         key: String,
@@ -135,14 +156,14 @@ impl JobKind {
             | JobKind::Conflict { key, .. }
             | JobKind::Mkdir { key }
             | JobKind::Rmdir { key } => key,
-            JobKind::Rename { from, .. } => from,
+            JobKind::Rename { from, .. } | JobKind::RenameDir { from, .. } => from,
         }
     }
 
     /// Every key the job touches (a rename holds two).
     pub fn keys(&self) -> Vec<&str> {
         match self {
-            JobKind::Rename { from, to } => vec![from, to],
+            JobKind::Rename { from, to } | JobKind::RenameDir { from, to, .. } => vec![from, to],
             other => vec![other.key()],
         }
     }
@@ -153,6 +174,7 @@ impl JobKind {
             JobKind::Push { key } => format!("push|{key}"),
             JobKind::Delete { key } => format!("delete|{key}"),
             JobKind::Rename { from, to } => format!("rename|{from}|{to}"),
+            JobKind::RenameDir { operation_id, .. } => format!("rename_dir|{operation_id}"),
             JobKind::Conflict { key, .. } => format!("conflict|{key}"),
             JobKind::Mkdir { key } => format!("mkdir|{key}"),
             JobKind::Rmdir { key } => format!("rmdir|{key}"),
@@ -434,6 +456,90 @@ impl Store {
     }
 
     // ── base ledger ──────────────────────────────────────────────────────────
+
+    /// Re-key a directory's ledger and queued writes in one commit. The move
+    /// intent already exists, so a crash after rename(2) can finish this step.
+    pub fn apply_directory_rename(&self, job: &Job) -> Result<()> {
+        let JobKind::RenameDir {
+            from,
+            to,
+            local_applied: false,
+            ..
+        } = &job.kind
+        else {
+            return Ok(());
+        };
+        let mapped = |key: &str| format!("{to}{}", &key[from.len()..]);
+        let tx = self.db.begin_write()?;
+        for definition in [ENTRIES, BASE, CONFLICTS] {
+            let mut table = tx.open_table(definition)?;
+            let rows: Vec<_> = table
+                .iter()?
+                .flatten()
+                .filter(|(k, _)| under(k.value(), from))
+                .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+                .collect();
+            for (key, mut bytes) in rows {
+                let dest = mapped(&key);
+                if definition.name() == CONFLICTS.name() {
+                    let mut c: Conflict = serde_json::from_slice(&bytes)?;
+                    c.key = dest.clone();
+                    bytes = enc(&c)?;
+                }
+                table.remove(key.as_str())?;
+                table.insert(dest.as_str(), bytes.as_slice())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(DIRS)?;
+            let rows: Vec<_> = table
+                .iter()?
+                .flatten()
+                .map(|(k, _)| k.value().to_string())
+                .filter(|k| under(k, from))
+                .collect();
+            for key in rows {
+                table.remove(key.as_str())?;
+                table.insert(mapped(&key).as_str(), "")?;
+            }
+            table.insert(to.as_str(), "")?;
+        }
+        {
+            let mut table = tx.open_table(JOBS)?;
+            let mut counter = tx.open_table(CURSOR)?;
+            let mut next = counter.get(JOB_SEQ_KEY)?.map(|v| v.value()).unwrap_or(0);
+            let rows: Vec<Job> = table
+                .iter()?
+                .flatten()
+                .filter_map(|(_, v)| dec(v.value()))
+                .collect();
+            for mut pending in rows {
+                if pending.seq == job.seq || !under(pending.kind.key(), from) {
+                    continue;
+                }
+                match &mut pending.kind {
+                    JobKind::Push { key }
+                    | JobKind::Delete { key }
+                    | JobKind::Conflict { key, .. }
+                    | JobKind::Mkdir { key }
+                    | JobKind::Rmdir { key } => *key = mapped(key),
+                    _ => continue,
+                }
+                table.remove(pending.seq)?;
+                next += 1;
+                pending.seq = next;
+                table.insert(next, enc(&pending)?.as_slice())?;
+            }
+            counter.insert(JOB_SEQ_KEY, next)?;
+            let mut applied = job.clone();
+            if let JobKind::RenameDir { local_applied, .. } = &mut applied.kind {
+                *local_applied = true;
+            }
+            table.insert(job.seq, enc(&applied)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 
     pub fn base(&self, key: &str) -> Option<Base> {
         self.get_json(BASE, key)
