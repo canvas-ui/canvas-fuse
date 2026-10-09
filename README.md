@@ -125,10 +125,11 @@ Rules live server-side, so this mount and WebDAV agree:
 - **Under `Home/`**: `rm` deletes the file, `mkdir`/`rmdir` are real
   directories. No trash, no detach.
 
-Writes buffer per open file and flush on close. Close-time errors reach the
-application. Flush serializes against refresh so a server-driven resync cannot
-drop or rename a file mid-save. Blob files (PDFs, images, …) are readable and
-not writable.
+Live views buffer writes per open file and flush on close. Close-time errors
+reach the application. Flush serializes against refresh so a server-driven
+resync cannot drop or rename a file mid-save. Blob documents (PDFs, images, …)
+are readable and not writable. Mirrored Home files use the disk-backed write
+path described below.
 
 Editors that truncate-then-write (Obsidian, VS Code), atomic tmp+rename
 (`sed -i`, vim), append, `touch`, `mv`, and `rm` are the supported save
@@ -168,11 +169,23 @@ What the daemon does:
   (`backend.changed`), or on the poll (`--poll`, default 30 s), and carry the
   hub's mtime. Remote-only files become visible after their download; this
   mode does not expose placeholders or fetch missing files on open.
-- **Writes are write-back.** A save goes to the folder and is pushed by a
-  background engine with `If-Match` on the version it started from
-  (`If-None-Match: *` for new files). `mv` and `rm` queue the same way
-  (`POST objects/rename`, `DELETE` with `If-Match`). The queue is durable:
-  a crash or an offline stretch never loses a write.
+- **Local disk first (0.13+).** Creating, writing and truncating a Home file
+  operate on its real backing inode immediately, with bounded memory instead
+  of a whole-file RAM buffer. Open write handles follow local renames. Flush
+  and fsync commit local bytes and a durable dirty intent; they do not wait
+  for the hub. Close wakes the background uploader. Recovery scans discover
+  files left behind by an interrupted copy or daemon exit.
+- **Uploads are write-back.** The engine hashes closed files and uploads a
+  temporary immutable disk snapshot with `If-Match` on the base version
+  (`If-None-Match: *` for new files). A newer local save cannot change an
+  in-flight request's body. Snapshots use temporary space under the mount's
+  data directory and are removed after the request or on restart. `mv` and
+  `rm` update disk and queue their upstream operation the same way.
+- **Network waits do not hold Home locks.** Virtual tree refreshes have a
+  separate lock; uploads, downloads and remote metadata requests release local
+  namespace locks while waiting. A delayed download rechecks the file identity,
+  open handles and queued moves before replacing anything. Upload results
+  follow local renames and do not mark newer edits as synced.
 - **Folder moves are one operation.** Renaming a synced folder sends one
   directory rename request. The local folder and the hub folder each use a
   native filesystem rename; file contents and inodes stay in place. The
@@ -180,9 +193,11 @@ What the daemon does:
   through a paged listing rather than querying every child. A persistent
   operation ID makes retries safe after a lost response or restart. Pending
   moves protect both paths from reconciliation; a refused move stays queued
-  with its dependent writes. Another overlapping rename must wait for sync.
-  This requires canvas-server 2.15.7 (or runtime-core 0.1.3) with canvas-stored
-  1.9.5 or newer; older hubs leave the directory operation pending.
+  with its dependent writes. Further local renames and editor saves remain
+  usable while the hub is stalled; the queue preserves their remote order.
+  Use canvas-server 2.16.2 (or runtime-core 0.2.1), canvas-stored 1.9.6 and
+  canvas-synapsd 3.23.5 together for the server folder/index consistency fixes.
+  Older hubs may leave directory operations pending.
 - **Local changes wake uploads through inotify.** Recursive watches follow
   the real backing directory even while FUSE covers it. Saves are observed
   on close-write; files and populated folders moved into Home are discovered

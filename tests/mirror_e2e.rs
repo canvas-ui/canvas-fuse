@@ -1315,12 +1315,28 @@ fn directory_move_orders_dirty_children_after_the_move() {
     assert_eq!(st.bytes_of("new/edited.txt").unwrap(), b"edited");
     assert_eq!(st.bytes_of("new/new.txt").unwrap(), b"new");
     assert!(st.bytes_of("new/deleted.txt").is_none());
-    let mutation = st
+    let rename = st
         .requests
         .iter()
-        .find(|q| q.starts_with("POST ") || q.starts_with("PUT ") || q.starts_with("DELETE "))
+        .position(|q| q.ends_with("/objects/rename"))
         .unwrap();
-    assert!(mutation.ends_with("/objects/rename"));
+    let delete = st
+        .requests
+        .iter()
+        .position(|q| q.starts_with("DELETE ") && q.ends_with("/objects/old/deleted.txt"))
+        .unwrap();
+    assert!(
+        delete < rename,
+        "earlier structural changes use the old remote namespace"
+    );
+    assert!(
+        st.requests
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.starts_with("PUT "))
+            .all(|(i, _)| i > rename),
+        "content uploads follow the directory rename"
+    );
 }
 
 #[test]

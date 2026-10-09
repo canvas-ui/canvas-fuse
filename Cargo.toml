@@ -1,6 +1,6 @@
 [package]
 name = "canvas-fuse"
-version = "0.12.0"
+version = "0.13.0"
 description = "Canvas context FUSE mount that materializes context views as folders"
 authors = ["Jozef Melich <me@idnc.sk>"]
 license = "AGPL-3.0-or-later"

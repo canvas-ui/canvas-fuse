@@ -372,7 +372,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     if let Some(m) = &mirror {
         m.attach_view(mirror::sync::ViewLink {
             tree: tree.clone(),
-            refresh_lock: write_store.sync_handle(),
+            refresh_lock: write_store.home_sync_handle(),
             invalidations: mirror_invalidations.clone(),
             job_tx: job_tx.clone(),
         });

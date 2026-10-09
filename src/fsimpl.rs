@@ -478,7 +478,10 @@ impl Filesystem for CanvasFs {
         // Active write buffer is the freshest truth (editors read back
         // through the same or another handle mid-edit)
         if let Some(slice) = self.writes.read_buffer(ino, offset, size) {
-            reply.data(&slice);
+            match slice {
+                Ok(bytes) => reply.data(&bytes),
+                Err(errno) => reply.error(errno),
+            }
             return;
         }
         let content = {
@@ -508,8 +511,8 @@ impl Filesystem for CanvasFs {
                     return;
                 }
                 if let Some(m) = &self.mirror {
-                    // Cache pread, or a fetch on the pool; never the network
-                    // on this thread.
+                    // Read the real local file; mirror mode has no remote
+                    // placeholders and never fetches bytes on open/read.
                     m.read(path.trim_matches('/'), offset, size, reply);
                     return;
                 }

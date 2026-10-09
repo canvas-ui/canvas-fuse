@@ -61,6 +61,20 @@ pub struct Hashed {
     pub mtime: u64,
 }
 
+/// An immutable upload body. Network retries reopen this snapshot, never a
+/// user's actively edited inode. Dropping the request removes the staging file.
+pub struct UploadSnapshot {
+    pub path: PathBuf,
+    pub hashed: Hashed,
+    pub fingerprint: String,
+}
+
+impl Drop for UploadSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub struct Local {
     /// Where keys resolve: `/proc/self/fd/<n>` for a directory we hold open,
     /// so the path keeps working once a mount covers the directory itself.
@@ -70,6 +84,7 @@ pub struct Local {
     _fd: OwnedFd,
     trash_root: PathBuf,
     conflicts_root: PathBuf,
+    uploads_root: PathBuf,
     /// Serializes rename-into-place against a concurrent removal of the same
     /// key.
     lock: Mutex<()>,
@@ -86,7 +101,7 @@ fn io_err(e: impl std::fmt::Display) -> HubError {
 }
 
 /// A key the filesystem can hold: relative, no empty or `..` segments.
-fn check_key(key: &str) -> Result<()> {
+pub(super) fn check_key(key: &str) -> Result<()> {
     anyhow::ensure!(!key.is_empty(), "empty key");
     for seg in key.split('/') {
         anyhow::ensure!(
@@ -121,12 +136,22 @@ impl Local {
         let conflicts_root = data_dir.join("conflicts");
         std::fs::create_dir_all(&trash_root)?;
         std::fs::create_dir_all(&conflicts_root)?;
+        let uploads_root = data_dir.join("uploads");
+        std::fs::create_dir_all(&uploads_root)?;
+        // Store::open has acquired the exclusive mirror database lock. Upload
+        // bodies are transient; recover pending work from Home after a crash.
+        for entry in std::fs::read_dir(&uploads_root)?.flatten() {
+            if entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
         Ok(Self {
             root,
             display: dir.to_path_buf(),
             _fd: fd,
             trash_root,
             conflicts_root,
+            uploads_root,
             lock: Mutex::new(()),
         })
     }
@@ -273,17 +298,54 @@ impl Local {
         })
     }
 
+    pub fn upload_snapshot(&self, key: &str) -> Result<UploadSnapshot> {
+        check_key(key)?;
+        let mut source = std::fs::File::open(self.path(key))?;
+        let before = source.metadata()?;
+        let mut snapshot = UploadSnapshot {
+            path: self.uploads_root.join(super::operation_id()?),
+            hashed: Hashed {
+                sha256: String::new(),
+                size: 0,
+                mtime: before.modified().map(ms_of).unwrap_or(0),
+            },
+            fingerprint: fingerprint(&before),
+        };
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&snapshot.path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let n = source.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buffer[..n])?;
+            hasher.update(&buffer[..n]);
+            snapshot.hashed.size += n as u64;
+        }
+        anyhow::ensure!(
+            fingerprint(&source.metadata()?) == snapshot.fingerprint,
+            "file changed while preparing upload"
+        );
+        snapshot.hashed.sha256 = super::hex(&hasher.finalize());
+        Ok(snapshot)
+    }
+
     /// Download `key` from the hub into place, verifying the digest before
     /// the file takes its name. Resumes a `.canvas-part` left by a crash.
     /// Returns what landed; the digest may differ from `expected_sha` when
     /// the key changed on the hub meanwhile — the caller decides.
-    pub fn fetch(
+    pub fn fetch<G>(
         &self,
         hub: &HubClient,
         key: &str,
         expected_sha: &str,
         remote_mtime: u64,
-    ) -> Result<Hashed, HubError> {
+        before_land: &impl Fn() -> Result<G, HubError>,
+    ) -> Result<(Hashed, G), HubError> {
         use std::os::unix::fs::MetadataExt;
         let stamp = || match std::fs::symlink_metadata(self.path(key)) {
             Ok(m) => Ok(Some((
@@ -301,7 +363,11 @@ impl Local {
         check_key(key).map_err(io_err)?;
         let before = stamp()?;
         self.ensure_parent(key).map_err(io_err)?;
-        let part = self.part_path(key);
+        // Hold the parent inode while downloading: a local directory rename
+        // must not strand the staging file at its old pathname.
+        let parent = std::fs::File::open(self.path(key).parent().unwrap()).map_err(io_err)?;
+        let part = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+            .join(self.part_path(key).file_name().unwrap());
         let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         let mut hasher = Sha256::new();
         if have > 0 {
@@ -321,7 +387,7 @@ impl Local {
             // An unsatisfiable resume must restart from byte zero.
             Err(HubError::Refused { status: 416, .. }) if have > 0 => {
                 std::fs::remove_file(&part).map_err(io_err)?;
-                return self.fetch(hub, key, expected_sha, remote_mtime);
+                return self.fetch(hub, key, expected_sha, remote_mtime, before_land);
             }
             other => other?,
         };
@@ -370,6 +436,13 @@ impl Local {
                     f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_millis(remote_mtime));
             }
         }
+        let guard = match before_land() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = std::fs::remove_file(&part);
+                return Err(error);
+            }
+        };
         let _g = self.lock.lock();
         if stamp()? != before {
             // A user save can arrive while the request is in flight. Keep
@@ -382,11 +455,14 @@ impl Local {
             .and_then(|m| m.modified())
             .map(ms_of)
             .unwrap_or(remote_mtime);
-        Ok(Hashed {
-            sha256: got,
-            size: total,
-            mtime,
-        })
+        Ok((
+            Hashed {
+                sha256: got,
+                size: total,
+                mtime,
+            },
+            guard,
+        ))
     }
 
     // ── structure ────────────────────────────────────────────────────────────
@@ -485,14 +561,17 @@ impl Local {
     /// Copy the current bytes of `key` to the conflicts folder, by digest.
     /// Returns the digest of what was snapshotted.
     pub fn conflict_snapshot(&self, key: &str) -> Result<String> {
-        let h = self.hash(key)?;
-        let dest = self.conflict_path(&h.sha256);
+        let snapshot = self.upload_snapshot(key)?;
+        self.preserve_conflict(&snapshot)?;
+        Ok(snapshot.hashed.sha256.clone())
+    }
+
+    pub fn preserve_conflict(&self, snapshot: &UploadSnapshot) -> Result<()> {
+        let dest = self.conflict_path(&snapshot.hashed.sha256);
         if !dest.is_file() {
-            let tmp = dest.with_extension("part");
-            std::fs::copy(self.path(key), &tmp)?;
-            std::fs::rename(&tmp, &dest)?;
+            std::fs::rename(&snapshot.path, &dest)?;
         }
-        Ok(h.sha256)
+        Ok(())
     }
 
     pub fn has_conflict_bytes(&self, sha: &str) -> bool {

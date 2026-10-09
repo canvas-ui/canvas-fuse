@@ -5,6 +5,8 @@ use crate::state::Tree;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -55,9 +57,36 @@ enum FlushTarget {
 
 struct OpenWrite {
     buffer: Vec<u8>,
+    /// Mirror handles address the backing inode directly, including after mv.
+    disk: Option<File>,
+    unlinked: bool,
     dirty: bool,
     refs: u32,
     target: FlushTarget,
+}
+
+impl OpenWrite {
+    fn size(&self) -> u64 {
+        self.disk
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(self.buffer.len() as u64)
+    }
+
+    fn resize(&mut self, size: u64) -> WResult<()> {
+        if let Some(file) = &self.disk {
+            file.set_len(size).map_err(write_io)?;
+        } else {
+            self.buffer.resize(size as usize, 0);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+}
+
+fn write_io(error: std::io::Error) -> WriteError {
+    WriteError::Io(error.to_string())
 }
 
 /// A file that exists locally but has no document yet (created, not flushed).
@@ -82,8 +111,8 @@ pub struct WriteStore {
     api: Arc<ApiClient>,
     tree: Arc<RwLock<Tree>>,
     names: Arc<NameStore>,
-    /// Mirror mode: Home writes go to the local store + cache and are pushed
-    /// by the engine, never PUT from here.
+    /// Mirror mode: Home handles write the backing inode; uploads run on the
+    /// engine thread after close, never on the filesystem request thread.
     mirror: Option<Arc<Mirror>>,
     inner: Mutex<Inner>,
     /// Serializes tree-mutating write ops (flush/create-adopt, rename, unlink)
@@ -92,8 +121,10 @@ pub struct WriteStore {
     /// transiently drop or mis-home an entry. (Id preservation removed the
     /// *rebind* race; this guards the multi-step local mutations that remain.)
     sync: Arc<Mutex<()>>,
+    home_sync: Arc<Mutex<()>>,
 }
 
+#[derive(Debug)]
 pub enum WriteError {
     NotPermitted,
     NotFound,
@@ -138,12 +169,25 @@ impl WriteStore {
                 next_overlay_ino: FIRST_OVERLAY_INO,
             }),
             sync: Arc::new(Mutex::new(())),
+            home_sync: Arc::new(Mutex::new(())),
         }
     }
 
     /// Shared handle the refresh worker holds across its fetch+apply cycle.
     pub fn sync_handle(&self) -> Arc<Mutex<()>> {
         self.sync.clone()
+    }
+
+    pub fn home_sync_handle(&self) -> Arc<Mutex<()>> {
+        self.home_sync.clone()
+    }
+
+    fn operation_lock(&self, home: bool) -> parking_lot::MutexGuard<'_, ()> {
+        if home && self.mirror.is_some() {
+            self.home_sync.lock()
+        } else {
+            self.sync.lock()
+        }
     }
 
     /// The context a write into `dir_ino` targets. A context folder is flat, so
@@ -159,11 +203,7 @@ impl WriteStore {
         let inner = self.inner.lock();
         let ino = *inner.overlay_names.get(&(dir_ino, name.to_string()))?;
         let (_, _, mtime) = inner.overlay.get(&ino)?;
-        let size = inner
-            .states
-            .get(&ino)
-            .map(|s| s.buffer.len() as u64)
-            .unwrap_or(0);
+        let size = inner.states.get(&ino).map(OpenWrite::size).unwrap_or(0);
         Some(OverlayEntry {
             ino,
             dir_ino,
@@ -186,11 +226,7 @@ impl WriteStore {
     pub fn overlay_attr(&self, ino: u64) -> Option<OverlayEntry> {
         let inner = self.inner.lock();
         let (dir_ino, name, mtime) = inner.overlay.get(&ino)?.clone();
-        let size = inner
-            .states
-            .get(&ino)
-            .map(|s| s.buffer.len() as u64)
-            .unwrap_or(0);
+        let size = inner.states.get(&ino).map(OpenWrite::size).unwrap_or(0);
         Some(OverlayEntry {
             ino,
             dir_ino,
@@ -203,20 +239,27 @@ impl WriteStore {
     /// Size override for files with an active write buffer (editors stat
     /// between write and close; getattr must reflect the buffer).
     pub fn size_override(&self, ino: u64) -> Option<u64> {
-        self.inner
-            .lock()
-            .states
-            .get(&ino)
-            .map(|s| s.buffer.len() as u64)
+        self.inner.lock().states.get(&ino).map(OpenWrite::size)
     }
 
     /// Buffered content, if this ino has an active write state.
-    pub fn read_buffer(&self, ino: u64, offset: i64, size: u32) -> Option<Vec<u8>> {
+    pub fn read_buffer(&self, ino: u64, offset: i64, size: u32) -> Option<Result<Vec<u8>, i32>> {
         let inner = self.inner.lock();
         let state = inner.states.get(&ino)?;
+        if let Some(file) = &state.disk {
+            let mut bytes = vec![0; size as usize];
+            return Some(
+                file.read_at(&mut bytes, offset.max(0) as u64)
+                    .map(|n| {
+                        bytes.truncate(n);
+                        bytes
+                    })
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO)),
+            );
+        }
         let start = (offset.max(0) as usize).min(state.buffer.len());
         let end = (start + size as usize).min(state.buffer.len());
-        Some(state.buffer[start..end].to_vec())
+        Some(Ok(state.buffer[start..end].to_vec()))
     }
 
     // ── open / create / write / truncate ────────────────────────────────────
@@ -235,48 +278,61 @@ impl WriteStore {
     }
 
     pub fn open_existing(&self, ino: u64, truncate: bool) -> WResult<()> {
-        // Home files are edited whole: read the current bytes into the buffer so
-        // a partial write (every editor does one) does not truncate the rest of
-        // the file when the PUT replaces it.
+        {
+            let mut inner = self.inner.lock();
+            if let Some(state) = inner.states.get_mut(&ino) {
+                if truncate {
+                    state.resize(0)?;
+                }
+                state.refs += 1;
+                return Ok(());
+            }
+        }
+        // Mirrored Home uses native file handles. Live Home still buffers a
+        // whole object because its server API replaces files on PUT.
         if let Some(target) = self.home_target(ino) {
             let (path, size) = self
                 .tree
                 .read()
                 .home_file(ino)
                 .ok_or(WriteError::NotFound)?;
+            if let Some(m) = &self.mirror {
+                let disk = m
+                    .open_local_write(home_key(&path), false, truncate)
+                    .map_err(|e| WriteError::Io(e.to_string()))?;
+                self.inner.lock().states.insert(
+                    ino,
+                    OpenWrite {
+                        buffer: Vec::new(),
+                        disk: Some(disk),
+                        unlinked: false,
+                        dirty: truncate,
+                        refs: 1,
+                        target,
+                    },
+                );
+                return Ok(());
+            }
             let content = if truncate || size == 0 {
                 Vec::new()
-            } else if let Some(m) = &self.mirror {
-                // Cache hit, or one blocking fetch while online. Offline and
-                // uncached is EIO: there is nothing to edit.
-                m.bytes_for_edit(home_key(&path)).map_err(|errno| {
-                    if errno == libc::ENOENT {
-                        WriteError::NotFound
-                    } else {
-                        WriteError::Io("bytes not available".into())
-                    }
-                })?
             } else {
                 let ws = self.tree.read().ws_id().ok_or(WriteError::NotPermitted)?;
                 self.api
                     .read_home_range(&ws, &path, 0, size.saturating_sub(1))
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?
             };
-            if let Some(m) = &self.mirror {
-                // A remote landing must not swap the bytes under this handle.
-                m.note_open_write(home_key(&path));
-            }
             let mut inner = self.inner.lock();
             let state = inner.states.entry(ino).or_insert_with(|| OpenWrite {
                 buffer: content,
+                disk: None,
+                unlinked: false,
                 dirty: truncate,
                 refs: 0,
                 target,
             });
             state.refs += 1;
             if truncate {
-                state.buffer.clear();
-                state.dirty = true;
+                state.resize(0)?;
             }
             return Ok(());
         }
@@ -321,14 +377,15 @@ impl WriteStore {
         let mut inner = self.inner.lock();
         let state = inner.states.entry(ino).or_insert_with(|| OpenWrite {
             buffer: content,
+            disk: None,
+            unlinked: false,
             dirty: false,
             refs: 0,
             target,
         });
         state.refs += 1;
         if truncate {
-            state.buffer.clear();
-            state.dirty = true;
+            state.resize(0)?;
         }
         Ok(())
     }
@@ -339,8 +396,7 @@ impl WriteStore {
         let state = inner.states.get_mut(&ino).ok_or(WriteError::NotFound)?;
         state.refs += 1;
         if truncate {
-            state.buffer.clear();
-            state.dirty = true;
+            state.resize(0)?;
         }
         Ok(())
     }
@@ -350,9 +406,6 @@ impl WriteStore {
         let home_dir = self.tree.read().home_path(dir_ino);
         let target = if let Some((dir_path, _)) = home_dir {
             let path = crate::state::join_home_path(&dir_path, name);
-            if let Some(m) = &self.mirror {
-                m.note_open_write(home_key(&path));
-            }
             FlushTarget::HomeFile {
                 path,
                 dir_ino,
@@ -394,6 +447,13 @@ impl WriteStore {
             return Err(WriteError::Exists);
         }
         let ino = inner.next_overlay_ino;
+        let disk = match (&self.mirror, &target) {
+            (Some(m), FlushTarget::HomeFile { path, .. }) => Some(
+                m.open_local_write(home_key(path), true, false)
+                    .map_err(|e| WriteError::Io(e.to_string()))?,
+            ),
+            _ => None,
+        };
         inner.next_overlay_ino += 1;
         let now = SystemTime::now();
         inner.overlay.insert(ino, (dir_ino, name.to_string(), now));
@@ -402,6 +462,8 @@ impl WriteStore {
             ino,
             OpenWrite {
                 buffer: Vec::new(),
+                disk,
+                unlinked: false,
                 dirty: true,
                 refs: 1,
                 target,
@@ -419,6 +481,12 @@ impl WriteStore {
     pub fn write(&self, ino: u64, offset: i64, data: &[u8]) -> WResult<u32> {
         let mut inner = self.inner.lock();
         let state = inner.states.get_mut(&ino).ok_or(WriteError::NotPermitted)?;
+        if let Some(file) = &state.disk {
+            file.write_all_at(data, offset.max(0) as u64)
+                .map_err(write_io)?;
+            state.dirty = true;
+            return Ok(data.len() as u32);
+        }
         let offset = offset.max(0) as usize;
         let end = offset + data.len();
         if state.buffer.len() < end {
@@ -435,8 +503,7 @@ impl WriteStore {
         {
             let mut inner = self.inner.lock();
             if let Some(state) = inner.states.get_mut(&ino) {
-                state.buffer.resize(size as usize, 0);
-                state.dirty = true;
+                state.resize(size)?;
                 return Ok(());
             }
         }
@@ -444,8 +511,7 @@ impl WriteStore {
         {
             let mut inner = self.inner.lock();
             let state = inner.states.get_mut(&ino).ok_or(WriteError::NotFound)?;
-            state.buffer.resize(size as usize, 0);
-            state.dirty = true;
+            state.resize(size)?;
         }
         let result = self.flush(ino);
         self.release(ino);
@@ -454,8 +520,8 @@ impl WriteStore {
 
     // ── flush / release ──────────────────────────────────────────────────────
 
-    /// Push a dirty buffer to the server. Called from flush/fsync/release —
-    /// blocks the FUSE loop for the duration of one REST call (close-time
+    /// Flush/fsync/release commit mirrored Home to disk and its local journal.
+    /// Live views send their buffered update to the server (close-time
     /// errors must reach the application).
     pub fn flush(&self, ino: u64) -> WResult<()> {
         self.flush_inner(ino, false)
@@ -467,6 +533,15 @@ impl WriteStore {
     }
 
     fn flush_inner(&self, ino: u64, final_flush: bool) -> WResult<()> {
+        let disk = self
+            .inner
+            .lock()
+            .states
+            .get(&ino)
+            .is_some_and(|s| s.disk.is_some());
+        if disk {
+            return self.flush_local(ino, final_flush);
+        }
         let _sync = self.sync.lock();
         let (buffer, target, dirty) = {
             let mut inner = self.inner.lock();
@@ -614,12 +689,51 @@ impl WriteStore {
         result
     }
 
+    fn flush_local(&self, ino: u64, final_flush: bool) -> WResult<()> {
+        let m = self.mirror.as_ref().expect("local handle has a mirror");
+        let _namespace = m.lock_directory_moves();
+        let _sync = self.home_sync.lock();
+        let mut inner = self.inner.lock();
+        let Some(state) = inner.states.get_mut(&ino) else {
+            return Ok(());
+        };
+        let FlushTarget::HomeFile {
+            path,
+            dir_ino,
+            name,
+        } = state.target.clone()
+        else {
+            unreachable!()
+        };
+        let file = state.disk.as_ref().expect("local handle");
+        file.sync_data().map_err(write_io)?;
+        if state.unlinked {
+            state.dirty = false;
+            return Ok(());
+        }
+        let size = file.metadata().map_err(write_io)?.len();
+        if state.dirty {
+            m.commit_local_file(home_key(&path))
+                .map_err(|e| WriteError::Io(e.to_string()))?;
+            state.dirty = false;
+        }
+        if final_flush {
+            inner.overlay_names.remove(&(dir_ino, name.clone()));
+            inner.overlay.remove(&ino);
+            self.tree
+                .write()
+                .upsert_home_file(dir_ino, &name, &path, size, Some(ino));
+        }
+        Ok(())
+    }
+
     pub fn release(&self, ino: u64) {
         let mut inner = self.inner.lock();
         if let Some(state) = inner.states.get_mut(&ino) {
             state.refs = state.refs.saturating_sub(1);
             if state.refs == 0 {
-                if let (Some(m), FlushTarget::HomeFile { path, .. }) = (&self.mirror, &state.target)
+                if let (Some(m), FlushTarget::HomeFile { path, .. }, false) =
+                    (&self.mirror, &state.target, state.unlinked)
                 {
                     m.note_close_write(home_key(path));
                 }
@@ -640,14 +754,31 @@ impl WriteStore {
     // ── unlink / rename ──────────────────────────────────────────────────────
 
     pub fn unlink(&self, dir_ino: u64, name: &str) -> WResult<()> {
-        let _sync = self.sync.lock();
+        let home = self.tree.read().home_path(dir_ino).is_some();
+        let _namespace = self
+            .mirror
+            .as_ref()
+            .filter(|_| home)
+            .map(|m| m.lock_directory_moves());
+        let _sync = self.operation_lock(home);
 
         // Pending overlay file: purely local, applies to either mode.
         {
             let mut inner = self.inner.lock();
             if let Some(ino) = inner.overlay_names.remove(&(dir_ino, name.to_string())) {
                 inner.overlay.remove(&ino);
-                inner.states.remove(&ino);
+                if let Some(state) = inner.states.get_mut(&ino) {
+                    if let (Some(m), FlushTarget::HomeFile { path, .. }) =
+                        (&self.mirror, &state.target)
+                    {
+                        m.delete_local(home_key(path))
+                            .map_err(|e| WriteError::Io(e.to_string()))?;
+                        m.note_close_write(home_key(path));
+                        state.unlinked = true;
+                    } else {
+                        inner.states.remove(&ino);
+                    }
+                }
                 return Ok(());
             }
         }
@@ -672,7 +803,14 @@ impl WriteStore {
                     .map_err(|e| WriteError::Io(format!("{e:#}")))?;
             }
             self.tree.write().remove_node(ino);
-            self.inner.lock().states.remove(&ino);
+            let mut inner = self.inner.lock();
+            if self.mirror.is_some() {
+                if let Some(state) = inner.states.get_mut(&ino) {
+                    state.unlinked = true;
+                }
+            } else {
+                inner.states.remove(&ino);
+            }
             return Ok(());
         }
 
@@ -850,7 +988,13 @@ impl WriteStore {
 
     /// Create a directory node (mkdir) — inserts a tree path on the server.
     pub fn mkdir(&self, parent_ino: u64, name: &str) -> WResult<u64> {
-        let _sync = self.sync.lock();
+        let home = self.tree.read().home_path(parent_ino).is_some();
+        let _namespace = self
+            .mirror
+            .as_ref()
+            .filter(|_| home)
+            .map(|m| m.lock_directory_moves());
+        let _sync = self.operation_lock(home);
 
         // A folder on the home drive is a real directory.
         // Bind the path BEFORE the body: an `if let` holds the read guard for the
@@ -896,7 +1040,13 @@ impl WriteStore {
 
     /// Remove a directory node (rmdir) — removes the tree path on the server.
     pub fn rmdir(&self, parent_ino: u64, name: &str) -> WResult<()> {
-        let _sync = self.sync.lock();
+        let home = self.tree.read().home_path(parent_ino).is_some();
+        let _namespace = self
+            .mirror
+            .as_ref()
+            .filter(|_| home)
+            .map(|m| m.lock_directory_moves());
+        let _sync = self.operation_lock(home);
 
         let home_child = self
             .tree
@@ -1000,9 +1150,12 @@ impl WriteStore {
         dst_dir_path: &str,
     ) -> WResult<()> {
         let _mirror_moves = self.mirror.as_ref().map(|m| m.lock_directory_moves());
-        let _sync = self.sync.lock();
+        let _sync = self.operation_lock(true);
         let src_path = crate::state::join_home_path(src_dir_path, src_name);
         let dst_path = crate::state::join_home_path(dst_dir_path, dst_name);
+        if src_path == dst_path {
+            return Ok(());
+        }
         let dst_ino = self.tree.read().lookup(dst_dir, dst_name).map(|n| n.ino);
         let dst_is_dir = dst_ino
             .and_then(|i| self.tree.read().get(i).map(|n| n.is_dir()))
@@ -1027,6 +1180,10 @@ impl WriteStore {
                     return Err(WriteError::Exists);
                 }
                 self.tree.write().remove_node(dst_ino);
+            }
+            if let Some(m) = &self.mirror {
+                m.rename_local(home_key(&src_path), home_key(&dst_path))
+                    .map_err(|e| WriteError::Io(e.to_string()))?;
             }
             let mut inner = self.inner.lock();
             inner.overlay_names.remove(&(src_dir, src_name.to_string()));

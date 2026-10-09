@@ -489,6 +489,7 @@ impl Store {
             from,
             to,
             local_applied: false,
+            remote,
             ..
         } = &job.kind
         else {
@@ -524,6 +525,9 @@ impl Store {
                 if definition.name() == CONFLICTS.name() {
                     let mut c: Conflict = serde_json::from_slice(&bytes)?;
                     c.key = dest.clone();
+                    c.copy_key = c
+                        .copy_key
+                        .map(|key| if under(&key, from) { mapped(&key) } else { key });
                     bytes = enc(&c)?;
                 }
                 table.remove(key.as_str())?;
@@ -555,6 +559,18 @@ impl Store {
                 .collect();
             for mut pending in rows {
                 if pending.seq == job.seq || !under(pending.kind.key(), from) {
+                    continue;
+                }
+                // Earlier structural operations still address the server's
+                // old namespace. Keep their order; only content work follows
+                // the local path past this directory move.
+                if *remote
+                    && pending.seq < job.seq
+                    && matches!(
+                        pending.kind,
+                        JobKind::Delete { .. } | JobKind::Mkdir { .. } | JobKind::Rmdir { .. }
+                    )
+                {
                     continue;
                 }
                 match &mut pending.kind {
@@ -645,6 +661,13 @@ impl Store {
             let mut t = tx.open_table(META)?;
             t.insert(name, value)?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_meta(&self, name: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?.remove(name)?;
         tx.commit()?;
         Ok(())
     }
