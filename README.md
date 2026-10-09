@@ -162,11 +162,12 @@ opens before mounting, so the two never disagree about where bytes live.
 
 What the daemon does:
 
-- **Every file is local.** The first mount lists the hub and downloads
+- **Full local mirror.** The first mount lists the hub and downloads
   everything (verified by digest, written atomically next to its target).
   Remote changes land in the folder within a second on a socket nudge
   (`backend.changed`), or on the poll (`--poll`, default 30 s), and carry the
-  hub's mtime.
+  hub's mtime. Remote-only files become visible after their download; this
+  mode does not expose placeholders or fetch missing files on open.
 - **Writes are write-back.** A save goes to the folder and is pushed by a
   background engine with `If-Match` on the version it started from
   (`If-None-Match: *` for new files). `mv` and `rm` queue the same way
@@ -182,14 +183,27 @@ What the daemon does:
   with its dependent writes. Another overlapping rename must wait for sync.
   This requires canvas-server 2.15.7 (or runtime-core 0.1.3) with canvas-stored
   1.9.5 or newer; older hubs leave the directory operation pending.
-- **The folder is scanned** at every mount, on `sync now`, and hourly.
+- **Local changes wake uploads through inotify.** Recursive watches follow
+  the real backing directory even while FUSE covers it. Saves are observed
+  on close-write; files and populated folders moved into Home are discovered
+  too. Ordinary events inspect only the affected path or incoming subtree.
+  Download staging files and the mirror's own atomic landings are suppressed.
+  Fresh user work takes priority over offline discoveries and background
+  repair, while rename/mkdir dependencies and retry backoff remain ordered.
+  Uploads run before remote listing/downloads and between background requests;
+  an already-running request finishes first. New folder names are published
+  before their contents, and optimistic write preconditions still apply.
+- **Recovery scans** run at every mount, on `sync now`, hourly, and after an
+  inotify queue overflow. The normal disk scan frequency has not increased.
   Files edited, added or removed while no daemon was running are hashed
   and become pushes and deletes under the same rules as live edits. A
   touched-but-unchanged file costs one hash and nothing on the wire.
 - **Conflicts never overwrite.** If a file changed here *and* on the hub
   since the last sync, the hub's version keeps the name and yours is saved
   next to it as `name (conflict from <device> <YYYY-MM-DD HHmm>).ext`
-  (`--conflicts rename`, the default). Use `--conflicts prompt` to send yours
+  (`--conflicts rename`, the default). Repeated conflicts in the same minute
+  receive distinct names when their content differs; retries reuse the persisted
+  copy name and digest. Use `--conflicts prompt` to send yours
   to the hub's conflict inbox and resolve in *Workspace settings › Sync* or
   the CLI instead. Existing configurations that explicitly select `prompt`
   keep that policy; change them to `rename` to use conflict copies.
@@ -201,6 +215,11 @@ What the daemon does:
   `canvas-fuse trash list|restore <mountpoint> [<key>]` (restore = push as a
   new file). An edit on one side beats a delete on the other, both ways.
   `--deletes keep` makes a local `rm` drop only the local copy.
+  On the hub, deleting the final location removes the document from the index
+  by default (server 2.16.0 / runtime-core 0.2.0). Workspace administrators can
+  set `orphanPolicy: "keep"` using `PATCH /rest/v2/workspaces/:id/sync/settings`
+  to retain its metadata and curation. Copies on other backends keep the
+  document indexed under either policy.
 - **Never uploaded:** dotfiles and everything the hub excludes (its
   `effectiveExclusions`, e.g. `node_modules/`), plus your own `--ignore
   <glob>`s. Such files stay in the folder and count as `skipped` in the
@@ -209,8 +228,10 @@ What the daemon does:
 **Offline.** The mount stays up (it also *mounts* without the hub, once it
 has seen the workspace once), and every file reads and writes normally —
 there is no cache to miss. Reconnect (socket re-auth, the poll, or
-`canvas-fuse sync now <mountpoint>`) catches up on the change feed,
-reconciles, and drains the queue.
+`canvas-fuse sync now <mountpoint>`) uploads pending local work before
+catching up on background changes. Files added while the daemon was stopped
+are discovered by the startup scan; while it is running, inotify wakes it
+without waiting for `--poll`.
 
 **Identity and locations.** The device id is `deviceId` from
 `~/.canvas/device.json` (canvas-cli) or a stable hash of hostname + user;
@@ -289,7 +310,16 @@ install -Dm755 target/release/canvas-fuse ~/.local/bin/canvas-fuse
 ```
 
 `cargo test --all` is the test suite (view diffs, sticky names, inode
-stability, workspace/home materialization). CI also runs `cargo fmt --check`
+stability, workspace/home materialization). The mirror suite covers two-device
+convergence, offline changes, editor atomic saves, priority/inotify behavior,
+1,000-file directory renames, conflict races, retry/restart, stale cursors,
+corrupted/resumed downloads, permissions, trash failures and delete/edit races.
+Run `cargo test --test mirror_real_server -- --ignored` with the sibling
+canvas-server dependencies installed for the isolated real HTTP/database test;
+`CANVAS_TEST_RUNTIME_CORE=1` selects the shared canvas-common runtime instead.
+These engine tests do not mount FUSE. Mounted application workloads, disk-full
+faults, forced termination and power-loss durability still need dedicated
+release validation on a host with `/dev/fuse`. CI also runs `cargo fmt --check`
 and `cargo clippy --all-targets -- -D warnings`.
 
 ### Cross targets

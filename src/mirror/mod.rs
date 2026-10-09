@@ -30,6 +30,7 @@ pub mod local;
 pub mod reconcile;
 pub mod store;
 pub mod sync;
+mod watch;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

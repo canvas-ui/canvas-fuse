@@ -126,6 +126,8 @@ pub enum HubError {
         message: String,
     },
     Other(String),
+    /// The user changed the destination while a background download ran.
+    LocalChanged(String),
 }
 
 impl std::fmt::Display for HubError {
@@ -152,6 +154,7 @@ impl std::fmt::Display for HubError {
             ),
             HubError::Retryable { status, message } => write!(f, "HTTP {status}: {message}"),
             HubError::Other(m) => write!(f, "{m}"),
+            HubError::LocalChanged(key) => write!(f, "{key}: changed locally during download"),
         }
     }
 }

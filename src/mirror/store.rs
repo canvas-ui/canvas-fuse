@@ -115,6 +115,10 @@ pub enum JobKind {
     /// `DELETE objects/<key>` with `If-Match` = base.
     Delete {
         key: String,
+        /// Fixed precondition for a destination removed before an overwrite
+        /// rename. Its current ledger already describes the incoming file.
+        #[serde(default)]
+        if_match: Option<String>,
     },
     /// `POST objects/rename`.
     Rename {
@@ -152,7 +156,7 @@ impl JobKind {
     pub fn key(&self) -> &str {
         match self {
             JobKind::Push { key }
-            | JobKind::Delete { key }
+            | JobKind::Delete { key, .. }
             | JobKind::Conflict { key, .. }
             | JobKind::Mkdir { key }
             | JobKind::Rmdir { key } => key,
@@ -172,7 +176,7 @@ impl JobKind {
     pub fn dedupe_id(&self) -> String {
         match self {
             JobKind::Push { key } => format!("push|{key}"),
-            JobKind::Delete { key } => format!("delete|{key}"),
+            JobKind::Delete { key, .. } => format!("delete|{key}"),
             JobKind::Rename { from, to } => format!("rename|{from}|{to}"),
             JobKind::RenameDir { operation_id, .. } => format!("rename_dir|{operation_id}"),
             JobKind::Conflict { key, .. } => format!("conflict|{key}"),
@@ -182,12 +186,23 @@ impl JobKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobPriority {
+    #[default]
+    Background,
+    Discovered,
+    Interactive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     #[serde(default)]
     pub seq: u64,
     #[serde(flatten)]
     pub kind: JobKind,
+    #[serde(default)]
+    pub priority: JobPriority,
     #[serde(default)]
     pub attempts: u32,
     /// Do not run before this (ms since epoch); backoff after a failure.
@@ -407,7 +422,12 @@ impl Store {
     }
 
     pub fn remove_entry(&self, key: &str) -> Result<()> {
-        self.remove_key(ENTRIES, key)
+        let tx = self.db.begin_write()?;
+        tx.open_table(ENTRIES)?.remove(key)?;
+        tx.open_table(META)?
+            .remove(format!("local-stamp:{key}").as_str())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Entries whose key starts with `prefix` (`""` = all), in key order.
@@ -437,6 +457,11 @@ impl Store {
     /// renames on both sides: the bytes did not change, only their name.
     pub fn rekey(&self, from: &str, to: &str) -> Result<()> {
         let tx = self.db.begin_write()?;
+        {
+            let mut stamps = tx.open_table(META)?;
+            stamps.remove(format!("local-stamp:{from}").as_str())?;
+            stamps.remove(format!("local-stamp:{to}").as_str())?;
+        }
         {
             let mut e = tx.open_table(ENTRIES)?;
             let v = e.get(from)?.map(|v| v.value().to_vec());
@@ -471,6 +496,21 @@ impl Store {
         };
         let mapped = |key: &str| format!("{to}{}", &key[from.len()..]);
         let tx = self.db.begin_write()?;
+        {
+            let mut stamps = tx.open_table(META)?;
+            let stale: Vec<String> = stamps
+                .iter()?
+                .flatten()
+                .map(|(key, _)| key.value().to_string())
+                .filter(|key| {
+                    key.strip_prefix("local-stamp:")
+                        .is_some_and(|key| under(key, from) || under(key, to))
+                })
+                .collect();
+            for key in stale {
+                stamps.remove(key.as_str())?;
+            }
+        }
         for definition in [ENTRIES, BASE, CONFLICTS] {
             let mut table = tx.open_table(definition)?;
             let rows: Vec<_> = table
@@ -519,7 +559,7 @@ impl Store {
                 }
                 match &mut pending.kind {
                     JobKind::Push { key }
-                    | JobKind::Delete { key }
+                    | JobKind::Delete { key, .. }
                     | JobKind::Conflict { key, .. }
                     | JobKind::Mkdir { key }
                     | JobKind::Rmdir { key } => *key = mapped(key),
@@ -616,6 +656,10 @@ impl Store {
     /// when it runs, so nothing is lost), and its backoff is reset — the user
     /// just did something new.
     pub fn enqueue(&self, kind: JobKind) -> Result<u64> {
+        self.enqueue_with_priority(kind, JobPriority::Interactive)
+    }
+
+    pub fn enqueue_with_priority(&self, kind: JobKind, priority: JobPriority) -> Result<u64> {
         let id = kind.dedupe_id();
         let tx = self.db.begin_write()?;
         let seq;
@@ -642,6 +686,7 @@ impl Store {
             let job = Job {
                 seq,
                 kind,
+                priority,
                 attempts: 0,
                 not_before: 0,
                 last_error: None,
@@ -679,6 +724,11 @@ impl Store {
         let tx = self.db.begin_write()?;
         {
             let mut t = tx.open_table(JOBS)?;
+            // A fresh edit may have replaced this in-flight job. Its old
+            // failure must not resurrect an earlier dependency/backoff.
+            if t.get(job.seq)?.is_none() {
+                return Ok(());
+            }
             t.insert(job.seq, bytes.as_slice())?;
         }
         tx.commit()?;
@@ -915,7 +965,11 @@ mod tests {
             assert_eq!(s.cursor(), None);
             s.set_cursor(42).unwrap();
             s.enqueue(JobKind::Push { key: "a".into() }).unwrap();
-            s.enqueue(JobKind::Delete { key: "b".into() }).unwrap();
+            s.enqueue(JobKind::Delete {
+                key: "b".into(),
+                if_match: None,
+            })
+            .unwrap();
             // Same (kind, key) replaces rather than duplicates.
             s.enqueue(JobKind::Push { key: "a".into() }).unwrap();
             s.add_dir("Empty").unwrap();
@@ -927,6 +981,7 @@ mod tests {
         // The replaced push moved to the back of the queue.
         assert!(matches!(jobs[0].kind, JobKind::Delete { .. }));
         assert!(matches!(jobs[1].kind, JobKind::Push { .. }));
+        assert_eq!(jobs[1].priority, JobPriority::Interactive);
         assert!(s.has_dir("Empty"));
         let dropped = s.remove_jobs_for("a").unwrap();
         assert_eq!(dropped.len(), 1);

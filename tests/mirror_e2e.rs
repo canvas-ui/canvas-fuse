@@ -66,6 +66,389 @@ fn opts() -> MirrorOptions {
     }
 }
 
+fn settle(mirror: &Mirror) {
+    for _ in 0..4 {
+        mirror.cycle(false);
+    }
+}
+
+#[test]
+fn daily_empty_binary_and_unicode_files_roundtrip_between_two_mirrors() {
+    let hub = FakeHub::start();
+    let (a, _a_dir) = rig_with(&hub.url, opts());
+    let (b, b_dir) = rig_with(&hub.url, opts());
+    a.cycle(true);
+    b.cycle(true);
+    let cases: &[(&str, &[u8])] = &[
+        ("empty.txt", b""),
+        (
+            "Architektúra/Žehňa/Fotky/photo #1 %.jpg",
+            &[0, 255, 1, 128, 10],
+        ),
+        ("Documents/notes.txt", b"first draft\n"),
+    ];
+    for (key, bytes) in cases {
+        a.commit_write(key, bytes).unwrap();
+    }
+    settle(&a);
+    settle(&b);
+    for (key, bytes) in cases {
+        assert_eq!(
+            std::fs::read(b_dir.path().join("Home").join(key)).unwrap(),
+            *bytes
+        );
+        assert_eq!(b.entry(key).unwrap().state, EntryState::Clean);
+    }
+    b.commit_write("Documents/notes.txt", b"reviewed\n")
+        .unwrap();
+    settle(&b);
+    settle(&a);
+    assert_eq!(
+        a.local.read_all("Documents/notes.txt").unwrap(),
+        b"reviewed\n"
+    );
+}
+
+#[test]
+fn two_offline_writers_preserve_both_versions_and_converge() {
+    let hub = FakeHub::start();
+    hub.lock().put("shared.txt", b"base");
+    let (a, _a_dir) = rig_with(&hub.url, opts());
+    let (b, _b_dir) = rig_with(&hub.url, opts());
+    a.cycle(true);
+    b.cycle(true);
+    a.commit_write("shared.txt", b"writer a").unwrap();
+    b.commit_write("shared.txt", b"writer b").unwrap();
+    settle(&a);
+    settle(&b);
+    settle(&a);
+    let objects = hub.lock().objects.clone();
+    assert_eq!(objects.len(), 2);
+    assert!(objects.values().any(|o| o.bytes == b"writer a"));
+    assert!(objects.values().any(|o| o.bytes == b"writer b"));
+    for (key, o) in objects {
+        assert_eq!(a.local.read_all(&key).unwrap(), o.bytes);
+        assert_eq!(b.local.read_all(&key).unwrap(), o.bytes);
+    }
+}
+
+#[test]
+fn a_new_file_deleted_before_upload_never_reaches_the_hub() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    r.mirror.commit_write("scratch.txt", b"temporary").unwrap();
+    r.mirror.delete_local("scratch.txt").unwrap();
+    settle(&r.mirror);
+    assert!(r.hub.lock().entries("put").is_empty());
+    assert_eq!(r.mirror.status().pending, 0);
+}
+
+#[test]
+fn a_local_edit_survives_a_remote_delete() {
+    let r = rig(opts());
+    r.hub.lock().put("work.txt", b"base");
+    r.mirror.cycle(true);
+    r.mirror.commit_write("work.txt", b"unsynced edit").unwrap();
+    r.hub.lock().delete("work.txt");
+    settle(&r.mirror);
+    assert_eq!(r.hub.lock().bytes_of("work.txt").unwrap(), b"unsynced edit");
+    assert_eq!(r.home_read("work.txt").unwrap(), b"unsynced edit");
+}
+
+#[test]
+fn keep_delete_policy_never_deletes_the_remote_copy() {
+    let r = rig(MirrorOptions {
+        deletes: canvas_fuse::mirror::DeleteMode::Keep,
+        ..opts()
+    });
+    r.hub.lock().put("keep.txt", b"remote copy");
+    r.mirror.cycle(true);
+    r.mirror.delete_local("keep.txt").unwrap();
+    settle(&r.mirror);
+    r.mirror.cycle(true);
+    assert_eq!(r.hub.lock().bytes_of("keep.txt").unwrap(), b"remote copy");
+    assert!(r.hub.lock().entries("delete").is_empty());
+}
+
+#[test]
+fn corrupted_download_is_retried_without_waiting_for_a_full_scan() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    r.hub.lock().put("photo.jpg", b"original photo");
+    r.hub.lock().corrupt_downloads.insert("photo.jpg".into());
+    r.mirror.cycle(false);
+    settle(&r.mirror);
+    assert_eq!(r.home_read("photo.jpg").unwrap(), b"original photo");
+    assert_eq!(
+        r.mirror.entry("photo.jpg").unwrap().sha256,
+        sha_hex(b"original photo")
+    );
+}
+
+#[test]
+fn a_corrupt_download_without_etag_never_replaces_a_good_local_copy() {
+    let r = rig(opts());
+    r.hub.lock().put("photo.jpg", b"good local photo");
+    r.mirror.cycle(true);
+    let cursor = r.mirror.status().cursor;
+    r.hub.lock().put("photo.jpg", b"updated remote photo");
+    r.hub.lock().corrupt_downloads.insert("photo.jpg".into());
+    r.hub
+        .lock()
+        .downloads_without_etag
+        .insert("photo.jpg".into());
+    r.mirror.cycle(false);
+    assert_eq!(r.home_read("photo.jpg").unwrap(), b"good local photo");
+    assert_eq!(r.mirror.status().cursor, cursor);
+    settle(&r.mirror);
+    assert_eq!(r.home_read("photo.jpg").unwrap(), b"updated remote photo");
+}
+
+#[test]
+fn a_stale_partial_download_larger_than_the_new_remote_file_recovers() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    std::fs::write(
+        r._dir.path().join("Home/.small.txt.canvas-part"),
+        b"old much larger partial content",
+    )
+    .unwrap();
+    r.hub.lock().put("small.txt", b"new");
+    settle(&r.mirror);
+    assert_eq!(r.home_read("small.txt").unwrap(), b"new");
+    assert!(!r._dir.path().join("Home/.small.txt.canvas-part").exists());
+}
+
+#[test]
+fn matching_partial_download_resumes_and_never_uploads_the_staging_file() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    std::fs::write(r._dir.path().join("Home/.large.bin.canvas-part"), b"first-").unwrap();
+    r.hub.lock().put("large.bin", b"first-second");
+    settle(&r.mirror);
+    assert_eq!(r.home_read("large.bin").unwrap(), b"first-second");
+    assert!(r
+        .hub
+        .lock()
+        .entries("put")
+        .iter()
+        .all(|e| !e.key.ends_with("canvas-part")));
+}
+
+#[test]
+fn a_failed_local_trash_move_keeps_the_ledger_and_retries() {
+    let r = rig(opts());
+    r.hub.lock().put("Docs/a.txt", b"recoverable");
+    r.mirror.cycle(true);
+    let blocker = r._dir.path().join("data/trash/Docs");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    r.hub.lock().delete("Docs/a.txt");
+    r.mirror.cycle(false);
+    assert!(
+        r.mirror.store.entry("Docs/a.txt").is_some(),
+        "failed trash move must not forget local bytes"
+    );
+    assert_eq!(r.home_read("Docs/a.txt").unwrap(), b"recoverable");
+    std::fs::remove_file(blocker).unwrap();
+    settle(&r.mirror);
+    assert!(r.home_read("Docs/a.txt").is_none());
+    assert_eq!(r.mirror.trash_list().len(), 1);
+    assert!(
+        r.hub.lock().bytes_of("Docs/a.txt").is_none(),
+        "failed trash must not resurrect remote data"
+    );
+}
+
+#[test]
+fn an_editor_atomic_save_over_an_existing_file_updates_the_remote() {
+    let r = rig(opts());
+    r.hub.lock().put("document.txt", b"old");
+    r.mirror.cycle(true);
+    r.mirror
+        .commit_write("save.tmp", b"new editor content")
+        .unwrap();
+    r.mirror.rename_local("save.tmp", "document.txt").unwrap();
+    settle(&r.mirror);
+    assert_eq!(
+        r.hub.lock().bytes_of("document.txt").unwrap(),
+        b"new editor content"
+    );
+    assert!(r.hub.lock().bytes_of("save.tmp").is_none());
+    assert_eq!(r.home_read("document.txt").unwrap(), b"new editor content");
+    assert_eq!(r.mirror.status().pending, 0);
+}
+
+#[test]
+fn chained_local_file_renames_before_sync_keep_only_the_final_name() {
+    let r = rig(opts());
+    r.hub.lock().put("a.txt", b"same bytes");
+    r.mirror.cycle(true);
+    r.mirror.rename_local("a.txt", "b.txt").unwrap();
+    r.mirror.rename_local("b.txt", "c.txt").unwrap();
+    settle(&r.mirror);
+    let objects = r.hub.lock().objects.clone();
+    assert_eq!(objects.keys().cloned().collect::<Vec<_>>(), vec!["c.txt"]);
+    assert_eq!(objects["c.txt"].bytes, b"same bytes");
+}
+
+#[test]
+fn local_saves_during_a_conflict_upload_are_not_overwritten_by_the_pull() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let r = rig(opts());
+    r.hub.lock().put("doc.txt", b"base");
+    r.mirror.cycle(true);
+    r.mirror
+        .commit_write("doc.txt", b"first local edit")
+        .unwrap();
+    r.hub.lock().put("doc.txt", b"remote edit");
+    let weak = Arc::downgrade(&r.mirror);
+    let once = AtomicBool::new(false);
+    r.hub.lock().on_request = Some(Arc::new(move |request| {
+        if request.starts_with("PUT ")
+            && request.contains("conflict")
+            && !once.swap(true, Ordering::Relaxed)
+        {
+            weak.upgrade()
+                .unwrap()
+                .commit_write("doc.txt", b"latest local edit")
+                .unwrap();
+        }
+    }));
+    settle(&r.mirror);
+    let st = r.hub.lock();
+    for bytes in [
+        b"first local edit".as_slice(),
+        b"latest local edit",
+        b"remote edit",
+    ] {
+        assert!(
+            st.objects.values().any(|o| o.bytes == bytes)
+                || r.home_read("doc.txt").as_deref() == Some(bytes),
+            "lost {}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+#[test]
+fn replacing_a_synced_file_with_another_synced_file_preserves_the_source_bytes() {
+    let r = rig(opts());
+    r.hub.lock().put("source.txt", b"replacement");
+    r.hub.lock().put("target.txt", b"old target");
+    r.mirror.cycle(true);
+    r.mirror.rename_local("source.txt", "target.txt").unwrap();
+    settle(&r.mirror);
+    assert_eq!(r.hub.lock().bytes_of("target.txt").unwrap(), b"replacement");
+    assert!(r.hub.lock().bytes_of("source.txt").is_none());
+    assert_eq!(r.home_read("target.txt").unwrap(), b"replacement");
+}
+
+#[test]
+fn a_recreated_file_during_its_delete_request_is_uploaded_as_new() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let r = rig(opts());
+    r.hub.lock().put("work.txt", b"old");
+    r.mirror.cycle(true);
+    r.mirror.delete_local("work.txt").unwrap();
+    let weak = Arc::downgrade(&r.mirror);
+    let once = AtomicBool::new(false);
+    r.hub.lock().on_request = Some(Arc::new(move |request| {
+        if request.starts_with("DELETE ") && !once.swap(true, Ordering::Relaxed) {
+            weak.upgrade()
+                .unwrap()
+                .commit_write("work.txt", b"recreated")
+                .unwrap();
+        }
+    }));
+    settle(&r.mirror);
+    assert_eq!(r.home_read("work.txt").unwrap(), b"recreated");
+    assert_eq!(r.hub.lock().bytes_of("work.txt").unwrap(), b"recreated");
+}
+
+#[test]
+fn denied_listing_never_trashes_previously_synced_files() {
+    let r = rig(opts());
+    r.hub.lock().put("important.txt", b"keep me");
+    r.mirror.cycle(true);
+    let cursor = r.mirror.status().cursor;
+    r.hub.lock().failures.push((
+        "GET /rest/v2/workspaces/ws1/backends/file/workspace%3Ahome/objects".into(),
+        403,
+    ));
+    r.mirror.cycle(true);
+    assert_eq!(r.home_read("important.txt").unwrap(), b"keep me");
+    assert!(r.mirror.trash_list().is_empty());
+    assert_eq!(r.mirror.status().cursor, cursor);
+}
+
+#[test]
+fn revoked_credentials_pause_sync_without_losing_pending_writes() {
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    r.mirror
+        .commit_write("private.txt", b"offline work")
+        .unwrap();
+    r.hub.lock().failures.push((
+        "PUT /rest/v2/workspaces/ws1/backends/file/workspace%3Ahome/objects/private.txt".into(),
+        401,
+    ));
+    r.mirror.cycle(false);
+    assert_eq!(r.mirror.status().state, SyncState::Paused);
+    assert_eq!(
+        r.mirror.entry("private.txt").unwrap().state,
+        EntryState::Dirty
+    );
+    assert!(r.mirror.status().pending > 0);
+    r.mirror.cycle(false);
+    assert!(r.hub.lock().bytes_of("private.txt").is_none());
+    r.mirror.cycle(true);
+    assert_eq!(
+        r.hub.lock().bytes_of("private.txt").unwrap(),
+        b"offline work"
+    );
+}
+
+#[test]
+fn offline_equal_length_edit_with_preserved_mtime_is_detected_after_restart() {
+    let hub = FakeHub::start();
+    hub.lock().put("work.txt", b"before");
+    let (m, dir) = rig_with(&hub.url, opts());
+    m.cycle(true);
+    m.scan_local(); // remember the previous scan's stamp
+    let path = dir.path().join("Home/work.txt");
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    drop(m);
+    std::fs::write(&path, b"edited").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let restarted = open_mirror(&dir, &hub.url, opts());
+    restarted.cycle(true);
+    assert_eq!(hub.lock().bytes_of("work.txt").unwrap(), b"edited");
+}
+
+#[test]
+fn unreadable_local_subtree_does_not_queue_remote_deletions() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig(opts());
+    r.hub.lock().put("private/a.txt", b"valuable");
+    r.mirror.cycle(true);
+    let dir = r._dir.path().join("Home/private");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let scan = r.mirror.scan_local();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(scan.removed, 0, "permission failure is not a deletion");
+    assert!(r
+        .mirror
+        .store
+        .jobs()
+        .iter()
+        .all(|j| !matches!(j.kind, canvas_fuse::mirror::store::JobKind::Delete { .. })));
+}
+
 #[test]
 fn initial_listing_pulls_every_file_into_the_folder() {
     let r = rig(opts());
@@ -575,17 +958,19 @@ fn a_folder_that_existed_before_the_first_mount_is_pushed() {
 
     let m = open_mirror(&dir, &hub.url, opts());
     // The scan ran at open: both files are entries, dirty, with pushes
-    // queued; the empty dir is known and wants a mkdir on the hub.
+    // queued; both directory names get published ahead of their contents.
     assert_eq!(m.entry("Docs/plan.md").unwrap().state, EntryState::Dirty);
     assert_eq!(m.entry("README").unwrap().state, EntryState::Dirty);
     assert!(m.store.has_dir("Docs"));
     assert!(m.store.has_dir("Empty"));
-    assert_eq!(m.status().pending, 3);
+    assert_eq!(m.status().pending, 4);
 
     m.cycle(true);
     assert_eq!(hub.lock().bytes_of("Docs/plan.md").unwrap(), b"local plan");
     assert_eq!(hub.lock().bytes_of("README").unwrap(), b"readme");
-    assert_eq!(hub.lock().mkdirs, vec!["Empty".to_string()]);
+    let mut dirs = hub.lock().mkdirs.clone();
+    dirs.sort();
+    assert_eq!(dirs, vec!["Docs".to_string(), "Empty".to_string()]);
     assert_eq!(
         std::fs::read(dir.path().join("Home/remote.txt")).unwrap(),
         b"from the hub"
@@ -631,8 +1016,8 @@ fn offline_edits_are_reconciled_when_the_daemon_comes_back() {
     assert_eq!(m.entry("trip/new.md").unwrap().state, EntryState::Dirty);
     assert_eq!(m.entry("same.txt").unwrap().state, EntryState::Clean);
     assert!(m.entry("old.txt").is_none(), "tombstoned");
-    // push notes, push new, delete old — nothing for same.txt.
-    assert_eq!(m.status().pending, 3);
+    // push notes, mkdir trip, push new, delete old — nothing for same.txt.
+    assert_eq!(m.status().pending, 4);
 
     m.cycle(false);
     assert_eq!(
@@ -824,8 +1209,8 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
     );
     assert_eq!(
         m.status().pending,
-        1,
-        "the excluded lock file is not pushed"
+        2,
+        "the directory and edited file are queued; the excluded lock file is not pushed"
     );
     assert_eq!(m.status().cursor, None, "old cursor retired: full listing");
 
@@ -1058,4 +1443,224 @@ fn edit_outside_fuse_during_a_pending_move_is_preserved_on_reconcile() {
         .inbox
         .iter()
         .any(|c| c.bytes == b"our outside edit"));
+}
+
+#[test]
+fn offline_additions_upload_before_the_first_remote_listing_or_download() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..20 {
+        hub.lock().put(&format!("remote/{n}.jpg"), b"remote photo");
+    }
+    std::fs::create_dir_all(dir.path().join("Home/Working/Empty")).unwrap();
+    std::fs::write(dir.path().join("Home/Working/new.txt"), b"offline work").unwrap();
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    let st = hub.lock();
+    assert_eq!(st.bytes_of("Working/new.txt").unwrap(), b"offline work");
+    let upload = st
+        .requests
+        .iter()
+        .position(|q| q.starts_with("PUT "))
+        .unwrap();
+    let listing = st
+        .requests
+        .iter()
+        .position(|q| q.ends_with("/objects"))
+        .unwrap();
+    assert!(upload < listing, "{:?}", st.requests);
+    assert!(st.mkdirs.contains(&"Working".into()));
+    assert!(st.mkdirs.contains(&"Working/Empty".into()));
+}
+
+#[test]
+fn fresh_activity_preempts_a_discovered_upload_backlog() {
+    use canvas_fuse::mirror::store::JobPriority;
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    for n in 0..5 {
+        r.mirror
+            .commit_write(&format!("backlog-{n}.txt"), b"offline")
+            .unwrap();
+    }
+    for mut job in r.mirror.store.jobs() {
+        job.priority = JobPriority::Discovered;
+        r.mirror.store.update_job(&job).unwrap();
+    }
+    r.mirror.commit_write("active.txt", b"working now").unwrap();
+    let weak = Arc::downgrade(&r.mirror);
+    r.hub.lock().on_request = Some(Arc::new(move |request| {
+        if request.ends_with("/objects/active.txt") && request.starts_with("PUT ") {
+            weak.upgrade()
+                .unwrap()
+                .commit_write("urgent.txt", b"just saved")
+                .unwrap();
+        }
+    }));
+    r.hub.lock().requests.clear();
+    r.mirror.cycle(false);
+    let st = r.hub.lock();
+    let puts: Vec<_> = st
+        .requests
+        .iter()
+        .filter(|q| q.starts_with("PUT "))
+        .collect();
+    assert!(puts[0].ends_with("/active.txt"), "{puts:?}");
+    assert!(puts[1].ends_with("/urgent.txt"), "{puts:?}");
+    assert_eq!(puts.len(), 7);
+}
+
+#[test]
+fn uploads_during_a_listing_preempt_downloads_without_using_stale_metadata() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let r = rig(opts());
+    r.hub.lock().put("z.txt", b"base");
+    r.mirror.cycle(true);
+    for n in 0..20 {
+        r.hub.lock().put(&format!("remote/{n}.txt"), b"download");
+    }
+    let weak = Arc::downgrade(&r.mirror);
+    let once = AtomicBool::new(false);
+    r.hub.lock().on_request = Some(Arc::new(move |request| {
+        if request.ends_with("/objects") && !once.swap(true, Ordering::Relaxed) {
+            let m = weak.upgrade().unwrap();
+            m.mkdir_local("remote").unwrap();
+            m.commit_write("active.txt", b"created during listing")
+                .unwrap();
+            m.commit_write("z.txt", b"edited during listing").unwrap();
+        }
+    }));
+    r.hub.lock().requests.clear();
+    r.mirror.cycle(true);
+    assert_eq!(
+        r.home_read("active.txt").unwrap(),
+        b"created during listing"
+    );
+    assert_eq!(r.home_read("z.txt").unwrap(), b"edited during listing");
+    assert!(r.mirror.conflicts().is_empty());
+    let st = r.hub.lock();
+    let first_download = st
+        .requests
+        .iter()
+        .position(|q| q.starts_with("GET ") && q.contains("/objects/"))
+        .unwrap();
+    let last_upload = st
+        .requests
+        .iter()
+        .rposition(|q| q.starts_with("PUT "))
+        .unwrap();
+    assert!(last_upload < first_download, "{:?}", st.requests);
+    assert_eq!(
+        st.bytes_of("active.txt").unwrap(),
+        b"created during listing"
+    );
+}
+
+#[test]
+fn a_save_during_a_background_download_is_preserved_and_uploaded_next() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let r = rig(opts());
+    r.mirror.cycle(true);
+    r.hub.lock().put("a.txt", b"remote");
+    r.hub.lock().put("b.txt", b"background");
+    let weak = Arc::downgrade(&r.mirror);
+    let once = AtomicBool::new(false);
+    r.hub.lock().on_request = Some(Arc::new(move |request| {
+        if request.starts_with("GET ")
+            && request.ends_with("/objects/a.txt")
+            && !once.swap(true, Ordering::Relaxed)
+        {
+            let m = weak.upgrade().unwrap();
+            m.commit_write("a.txt", b"our concurrent save").unwrap();
+            m.commit_write("urgent.txt", b"fresh activity").unwrap();
+        }
+    }));
+    r.hub.lock().requests.clear();
+    r.mirror.cycle(true);
+    let st = r.hub.lock();
+    assert_eq!(st.bytes_of("urgent.txt").unwrap(), b"fresh activity");
+    assert!(st.inbox.iter().any(|c| c.bytes == b"our concurrent save"));
+    let upload = st
+        .requests
+        .iter()
+        .position(|q| q.starts_with("PUT ") && q.ends_with("/urgent.txt"))
+        .unwrap();
+    let next_download = st
+        .requests
+        .iter()
+        .position(|q| q.starts_with("GET ") && q.ends_with("/objects/b.txt"))
+        .unwrap();
+    assert!(upload < next_download, "{:?}", st.requests);
+}
+
+#[test]
+fn inotify_uploads_direct_additions_edits_and_imported_subtrees_without_polling() {
+    use canvas_fuse::mirror::sync::EngineMsg;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let mut options = opts();
+    options.poll_secs = 3600;
+    let r = rig(options);
+    r.mirror.cycle(true);
+    let stop = Arc::new(AtomicBool::new(false));
+    let tx = r.mirror.spawn_engine(stop.clone()).unwrap();
+    let wait = |key: &str, bytes: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if r.hub.lock().bytes_of(key).as_deref() == Some(bytes) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "inotify did not upload {key}; status: {:?}",
+            r.mirror.status()
+        );
+    };
+    // Let the engine finish its startup pass, so no scan can discover this.
+    assert!(r.mirror.sync_now(Duration::from_secs(5)));
+    std::fs::write(r._dir.path().join("Home/active.txt"), b"new").unwrap();
+    wait("active.txt", b"new");
+    std::fs::write(r._dir.path().join("Home/active.txt"), b"edited").unwrap();
+    wait("active.txt", b"edited");
+    // Millisecond timestamps and equal lengths cannot hide a notified save.
+    let modified = std::fs::metadata(r._dir.path().join("Home/active.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(r._dir.path().join("Home/active.txt"))
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"EDITED").unwrap();
+    file.set_modified(modified).unwrap();
+    drop(file);
+    wait("active.txt", b"EDITED");
+    std::fs::create_dir_all(r._dir.path().join("import/sub")).unwrap();
+    std::fs::write(
+        r._dir.path().join("import/sub/photo.jpg"),
+        b"imported photo",
+    )
+    .unwrap();
+    std::fs::rename(
+        r._dir.path().join("import"),
+        r._dir.path().join("Home/Imported"),
+    )
+    .unwrap();
+    wait("Imported/sub/photo.jpg", b"imported photo");
+    // Descendant watches must have been installed for the imported tree.
+    std::fs::write(
+        r._dir.path().join("Home/Imported/sub/next.jpg"),
+        b"next photo",
+    )
+    .unwrap();
+    wait("Imported/sub/next.jpg", b"next photo");
+    stop.store(true, Ordering::Relaxed);
+    tx.send(EngineMsg::Stop).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&r.mirror) > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(Arc::strong_count(&r.mirror), 1, "engine stopped");
 }

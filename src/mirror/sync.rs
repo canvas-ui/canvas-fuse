@@ -10,12 +10,11 @@
 //!
 //! 1. on a full pass, scan the folder: what changed while the daemon was
 //!    down (or before it ever ran) becomes a push, a delete, a new entry;
-//! 2. catch up on the hub's change feed (or rebuild from the listing when
+//! 2. upload queued local work before background reads; service fresh work
+//!    between background requests, preserving path dependencies and backoff;
+//! 3. catch up on the hub's change feed (or rebuild from the listing when
 //!    there is no cursor / the cursor is too old), reconciling every touched
 //!    key with the three-way table in `reconcile.rs`;
-//! 3. drain the durable job queue (pushes, deletes, renames, conflict
-//!    uploads) — in submission order, one job in flight per key, backoff
-//!    per job;
 //! 4. expire the local trash, write the status file, report to the hub.
 //!
 //! It wakes on a nudge (`backend.changed` on the socket), on a local write,
@@ -27,8 +26,8 @@ use super::hub::{Change, ChangeOp, HubClient, HubError, PutBody, PutOptions, Rem
 use super::local::Local;
 use super::reconcile::{decide, Action};
 use super::store::{
-    Base, Conflict, Entry, EntryState, Job, JobKind, Store, Trashed, HEAD_KEY, META_INSTANCE,
-    META_LISTED,
+    Base, Conflict, Entry, EntryState, Job, JobKind, JobPriority, Store, Trashed, HEAD_KEY,
+    META_INSTANCE, META_LISTED,
 };
 use super::{ConflictMode, DeleteMode, DeviceIdentity, IgnoreRules, MirrorOptions};
 use crate::state::{Invalidation, Tree};
@@ -156,13 +155,16 @@ pub struct Mirror {
     pub opts: MirrorOptions,
     pub mountpoint: PathBuf,
     status_path: Option<PathBuf>,
-    ignore: RwLock<IgnoreRules>,
+    ignore: Arc<RwLock<IgnoreRules>>,
     rt: Mutex<Runtime>,
-    engine_tx: Mutex<Option<Sender<EngineMsg>>>,
+    engine_tx: Arc<Mutex<Option<Sender<EngineMsg>>>>,
+    local_changes: Arc<Mutex<super::watch::Changes>>,
+    watcher: Mutex<Option<super::watch::Watcher>>,
     view: Mutex<Option<ViewLink>>,
     /// Keys with an open write handle: remote landings wait for the close.
     open_writes: Mutex<HashSet<String>>,
     directory_moves: ReentrantMutex<()>,
+    directory_epoch: std::sync::atomic::AtomicU64,
 }
 
 fn ms_to_systime(ms: u64) -> SystemTime {
@@ -225,7 +227,7 @@ impl Mirror {
             opts: cfg.opts,
             mountpoint: cfg.mountpoint,
             status_path: cfg.status_path,
-            ignore: RwLock::new(IgnoreRules::new(patterns)),
+            ignore: Arc::new(RwLock::new(IgnoreRules::new(patterns))),
             rt: Mutex::new(Runtime {
                 state: SyncState::Idle,
                 last_sync: None,
@@ -236,11 +238,37 @@ impl Mirror {
                 skipped: HashMap::new(),
                 recheck: HashSet::new(),
             }),
-            engine_tx: Mutex::new(None),
+            engine_tx: Arc::new(Mutex::new(None)),
+            local_changes: Arc::new(Mutex::new(super::watch::Changes::default())),
+            watcher: Mutex::new(None),
             view: Mutex::new(None),
             open_writes: Mutex::new(HashSet::new()),
             directory_moves: ReentrantMutex::new(()),
+            directory_epoch: std::sync::atomic::AtomicU64::new(0),
         });
+        // Watches are live before the initial scan, so changes made during
+        // startup cannot fall between scanning and starting observation.
+        let changes = mirror.local_changes.clone();
+        let engine_tx = mirror.engine_tx.clone();
+        *mirror.watcher.lock() = Some(super::watch::Watcher::start(
+            mirror.local.clone(),
+            mirror.ignore.clone(),
+            move |incoming| {
+                let mut pending = changes.lock();
+                pending.rescan |= incoming.rescan;
+                pending.paths.extend(incoming.paths);
+                if pending.paths.len() > 8192 {
+                    pending.rescan = true;
+                }
+                if pending.rescan {
+                    pending.paths.clear();
+                }
+                drop(pending);
+                if let Some(tx) = engine_tx.lock().as_ref() {
+                    let _ = tx.send(EngineMsg::Wake);
+                }
+            },
+        )?);
         // What happened to the folder while no daemon was looking is the
         // first thing to know — before the view is built, before the hub
         // is asked anything.
@@ -470,6 +498,7 @@ impl Mirror {
                 )?;
                 self.store.enqueue(JobKind::Delete {
                     key: key.to_string(),
+                    if_match: None,
                 })?;
             }
             _ => {
@@ -527,10 +556,44 @@ impl Mirror {
             !self.pending_directory_move(from) && !self.pending_directory_move(to),
             "directory rename is still pending; retry after sync"
         );
+        if self.store.base(from).is_none() && self.store.entry(to).is_some() {
+            // Editors commonly save a fresh temp file, then rename it over
+            // the original. This is a conditional PUT of the destination,
+            // not DELETE + RENAME (the temp has never existed upstream).
+            self.local.rename(from, to)?;
+            self.store.remove_jobs_for(from)?;
+            self.store.remove_jobs_for(to)?;
+            self.store.rekey(from, to)?; // retains the destination's base
+            {
+                let mut writes = self.open_writes.lock();
+                if writes.remove(from) {
+                    writes.insert(to.to_string());
+                }
+            }
+            if let Some(mut entry) = self.store.entry(to) {
+                entry.state = EntryState::Dirty;
+                self.store.put_entry(to, &entry)?;
+            }
+            if !self.is_ignored(to) {
+                self.store.enqueue(JobKind::Push {
+                    key: to.to_string(),
+                })?;
+            }
+            self.record_dirs_for(to);
+            self.wake();
+            return Ok(());
+        }
         if self.store.entry(to).is_some() {
             // Overwrite-rename: the destination goes first, in the queue
             // too, so the hub sees delete(to) then rename(from → to).
+            let destination_base = self.store.base(to);
             self.delete_local(to)?;
+            if let Some(base) = destination_base {
+                self.store.enqueue(JobKind::Delete {
+                    key: to.to_string(),
+                    if_match: Some(base.sha256),
+                })?;
+            }
         }
         self.local.rename(from, to)?;
         self.rekey_entry(from, to)?;
@@ -559,9 +622,11 @@ impl Mirror {
             if self.is_ignored(to) {
                 // Moving INTO an excluded name: the hub cannot hold it there.
                 // Delete the source on the hub; the bytes stay local.
+                let source_base = self.store.base(to);
                 self.store.remove_base(to)?;
                 self.store.enqueue(JobKind::Delete {
                     key: from.to_string(),
+                    if_match: source_base.map(|b| b.sha256),
                 })?;
             } else {
                 self.store.enqueue(JobKind::Rename {
@@ -936,18 +1001,48 @@ impl Mirror {
     /// so it runs offline too. Keys with an open write handle are left to
     /// their close.
     pub fn scan_local(&self) -> ScanReport {
+        self.scan_paths(&[String::new()], JobPriority::Discovered)
+    }
+
+    fn process_local_events(&self) {
+        let changes = std::mem::take(&mut *self.local_changes.lock());
+        if changes.rescan {
+            log::warn!("mirror: recovering local changes with a full scan");
+            self.scan_local();
+        } else if !changes.paths.is_empty() {
+            let mut paths: Vec<_> = changes.paths.into_iter().collect();
+            paths.sort();
+            let mut roots: Vec<String> = Vec::new();
+            for path in paths {
+                if !roots.iter().any(|root| super::store::under(&path, root)) {
+                    roots.push(path);
+                }
+            }
+            self.scan_paths(&roots, JobPriority::Interactive);
+        }
+    }
+
+    fn scan_paths(&self, paths: &[String], priority: JobPriority) -> ScanReport {
         let _guard = self.directory_moves.lock();
         let mut report = ScanReport::default();
         let mut seen_files: HashSet<String> = HashSet::new();
         let mut seen_dirs: HashSet<String> = HashSet::new();
-        let mut new_dirs: Vec<String> = Vec::new();
-        for (key, st) in self.local.walk() {
+        let affected = |key: &str| {
+            paths
+                .iter()
+                .any(|p| p.is_empty() || super::store::under(key, p))
+        };
+        for (key, st) in paths.iter().flat_map(|p| self.local.walk_from(p)) {
             if st.is_dir {
                 seen_dirs.insert(key.clone());
                 if !self.store.has_dir(&key) {
                     let _ = self.store.add_dir(&key);
                     self.view_ensure_dir(&key);
-                    new_dirs.push(key);
+                    if !self.is_ignored(&key) {
+                        let _ = self
+                            .store
+                            .enqueue_with_priority(JobKind::Mkdir { key }, priority);
+                    }
                 }
                 continue;
             }
@@ -960,12 +1055,20 @@ impl Mirror {
             }
             let entry = self.store.entry(&key);
             let live = entry.as_ref().filter(|e| e.state != EntryState::Tombstone);
-            if live.is_some_and(|e| e.size == st.size && e.mtime == st.mtime) {
+            // A close-write/rename event is authoritative even if two saves
+            // happen within the same millisecond with equal file lengths.
+            let notified_file = priority == JobPriority::Interactive && paths.contains(&key);
+            let stamp_key = format!("local-stamp:{key}");
+            if !notified_file
+                && live.is_some_and(|e| e.size == st.size && e.mtime == st.mtime)
+                && self.store.meta(&stamp_key).as_deref() == Some(st.fingerprint.as_str())
+            {
                 continue;
             }
             let Ok(h) = self.local.hash(&key) else {
                 continue;
             };
+            let _ = self.store.set_meta(&stamp_key, &st.fingerprint);
             if let Some(e) = live {
                 if e.sha256 == h.sha256 {
                     // Touched, not changed: remember the new stamp so the
@@ -1004,16 +1107,20 @@ impl Mirror {
                 self.rt.lock().skipped.remove(&key);
                 // `enqueue`, not `ensure_job`: the user did something new,
                 // so a push in backoff starts over.
-                let _ = self.store.enqueue(JobKind::Push { key: key.clone() });
+                let _ = self
+                    .store
+                    .enqueue_with_priority(JobKind::Push { key: key.clone() }, priority);
             }
             self.view_upsert(&key, new.size, new.mtime);
         }
         for (key, e) in self.store.entries("") {
-            if e.state == EntryState::Tombstone
+            if !affected(&key)
+                || e.state == EntryState::Tombstone
                 || seen_files.contains(&key)
                 || self.pending_directory_move(&key)
                 || self.local.is_file(&key)
                 || self.is_open_for_write(&key)
+                || !matches!(std::fs::symlink_metadata(self.local.path(&key)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
             {
                 continue;
             }
@@ -1021,26 +1128,20 @@ impl Mirror {
             let _ = self.note_local_gone(&key);
             self.view_remove(&key);
         }
-        // A new directory with something in it is created on the hub by
-        // the puts below it; an empty one has nothing to carry its name.
-        // Decided once the walk is complete, not when the directory was
-        // met (its files come after it).
-        for d in new_dirs {
-            let prefix = format!("{d}/");
-            let has_children = seen_files.iter().any(|k| k.starts_with(&prefix))
-                || seen_dirs.iter().any(|k| k.starts_with(&prefix));
-            if !has_children && !self.is_ignored(&d) {
-                self.ensure_job(JobKind::Mkdir { key: d });
-            }
-        }
         for d in self.store.dirs() {
-            if seen_dirs.contains(&d) || self.pending_directory_move(&d) {
+            if !affected(&d)
+                || seen_dirs.contains(&d)
+                || self.pending_directory_move(&d)
+                || !matches!(std::fs::symlink_metadata(self.local.path(&d)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
                 continue;
             }
             let _ = self.store.remove_dir(&d);
             let _ = self.store.remove_jobs_for(&d);
             if !self.is_ignored(&d) {
-                self.ensure_job(JobKind::Rmdir { key: d.clone() });
+                let _ = self
+                    .store
+                    .enqueue_with_priority(JobKind::Rmdir { key: d.clone() }, priority);
             }
             self.view_remove(&d);
         }
@@ -1107,7 +1208,7 @@ impl Mirror {
         log::debug!("mirror engine exiting");
     }
 
-    /// One pass: scan (full only), catch up, reconcile, drain, report.
+    /// One pass: observe local changes, upload first, then catch up and report.
     /// Public so tests drive it without a thread.
     pub fn cycle(&self, full: bool) {
         let before = self.rt.lock().state;
@@ -1169,7 +1270,10 @@ impl Mirror {
                 );
             }
         }
+        self.process_local_events();
         self.refresh_hub_rules()?;
+        self.recover_jobs();
+        self.drain_jobs(64)?;
         if full
             || self.store.meta("directory-refresh").as_deref() == Some("1")
             || self.store.cursor().is_none()
@@ -1182,10 +1286,8 @@ impl Mirror {
         }
         self.recheck_deferred()?;
         self.recover_jobs();
-        self.drain_jobs()?;
+        self.drain_jobs(64)?;
         if self.store.meta("directory-refresh").as_deref() == Some("1") {
-            // Include edits made outside FUSE while the move was pending.
-            self.scan_local();
             self.rebuild_from_listing()?;
         }
         Ok(())
@@ -1222,6 +1324,8 @@ impl Mirror {
     /// we or the hub know, and tail from the listing's head.
     fn rebuild_from_listing(&self) -> Result<(), HubError> {
         log::info!("mirror: full listing pass");
+        let epoch = self.directory_epoch.load(Ordering::Relaxed);
+        let mut touched = HashSet::new();
         let mut remote: BTreeMap<String, RemoteStat> = BTreeMap::new();
         let mut cursor: Option<String> = None;
         let mut head = 0u64;
@@ -1240,6 +1344,7 @@ impl Mirror {
                     },
                 );
             }
+            touched.extend(self.drain_jobs(16)?);
             match page.cursor {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -1251,12 +1356,21 @@ impl Mirror {
         let mut sorted: Vec<String> = keys.into_iter().collect();
         sorted.sort();
         for key in sorted {
+            touched.extend(self.drain_jobs(16)?);
+            // This snapshot predates a prioritized mutation. Its feed echo
+            // (after `head`) will reconcile it against current server state.
+            if touched.iter().any(|path| super::store::under(&key, path)) {
+                continue;
+            }
             self.reconcile_key(&key, remote.get(&key), 0)?;
         }
         let _ = self.store.set_cursor(head);
         let _ = self.store.set_number(HEAD_KEY, head);
         let _ = self.store.set_meta(META_LISTED, "1");
-        let _ = self.store.set_meta("directory-refresh", "0");
+        let moved = self.directory_epoch.load(Ordering::Relaxed) != epoch;
+        let _ = self
+            .store
+            .set_meta("directory-refresh", if moved { "1" } else { "0" });
         Ok(())
     }
 
@@ -1275,6 +1389,10 @@ impl Mirror {
             let n = page.changes.len();
             let mut last = since;
             for change in &page.changes {
+                self.drain_jobs(16)?;
+                if self.store.meta("directory-refresh").as_deref() == Some("1") {
+                    return self.rebuild_from_listing();
+                }
                 self.apply_change(change)?;
                 last = last.max(change.seq);
             }
@@ -1432,6 +1550,7 @@ impl Mirror {
                 if self.opts.deletes == DeleteMode::Propagate {
                     self.ensure_job(JobKind::Delete {
                         key: key.to_string(),
+                        if_match: None,
                     });
                 } else {
                     let _ = self.store.remove_entry(key);
@@ -1459,7 +1578,11 @@ impl Mirror {
                                 "{key}: deleted on the hub; local copy kept in the mirror trash"
                             );
                         }
-                        Err(err) => log::warn!("{key}: deleted on the hub; could not move the local copy to the trash: {err:#}"),
+                        Err(err) => {
+                            return Err(HubError::Other(format!(
+                                "{key}: could not preserve the local copy in trash: {err:#}"
+                            )))
+                        }
                     }
                 }
                 let _ = self.store.remove_jobs_for(key);
@@ -1507,13 +1630,14 @@ impl Mirror {
                 // Gone between the feed and now; the next change says so.
                 return Ok(());
             }
-            Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
-            Err(e) => {
-                // A digest mismatch or a local disk error: the key stays as
-                // it was and the next pass tries again.
-                log::warn!("{key}: pull failed ({e}); will retry");
+            Err(HubError::LocalChanged(_)) => {
+                self.scan_paths(&[key.to_string()], JobPriority::Interactive);
+                self.rt.lock().recheck.insert(key.to_string());
                 return Ok(());
             }
+            // Do not acknowledge the feed/listing cursor for bytes we could
+            // not verify or land. The next normal cycle retries this key.
+            Err(e) => return Err(e),
         };
         let new_entry = Entry {
             sha256: h.sha256.clone(),
@@ -1607,7 +1731,9 @@ impl Mirror {
         if self.store.jobs().iter().any(|j| j.kind.dedupe_id() == id) {
             return;
         }
-        let _ = self.store.enqueue(kind);
+        let _ = self
+            .store
+            .enqueue_with_priority(kind, JobPriority::Background);
     }
 
     /// Keys whose remote change we skipped because a handle was open:
@@ -1652,54 +1778,80 @@ impl Mirror {
                     }
                     JobKind::Push { key: key.clone() }
                 }
-                EntryState::Tombstone => JobKind::Delete { key: key.clone() },
+                EntryState::Tombstone => JobKind::Delete {
+                    key: key.clone(),
+                    if_match: None,
+                },
             };
             if !have.contains(&wanted.dedupe_id()) {
-                let _ = self.store.enqueue(wanted);
+                let _ = self
+                    .store
+                    .enqueue_with_priority(wanted, JobPriority::Discovered);
             }
         }
     }
 
-    /// Run the queue in order. A job in backoff blocks later jobs on the
-    /// same keys (a push of `b` must not overtake the rename `a → b`), and
-    /// the first offline answer stops the pass.
-    fn drain_jobs(&self) -> Result<(), HubError> {
-        // A job can queue another (a 412 turns a push into a conflict
-        // upload); keep going until a pass runs nothing.
-        for _round in 0..8 {
+    /// Prioritize current user work, then offline discoveries, then repair.
+    /// Dependencies always win: a write cannot overtake its rename or mkdir.
+    /// Reload after every request so a fresh edit can jump an existing backlog.
+    fn drain_jobs(&self, budget: usize) -> Result<HashSet<String>, HubError> {
+        let mut touched = HashSet::new();
+        for _ in 0..budget {
+            self.process_local_events();
             let now = super::now_ms();
-            let mut blocked: HashSet<String> = HashSet::new();
-            let mut ran = false;
-            let jobs = self.store.jobs();
-            if jobs.is_empty() {
-                break;
-            }
-            for job in jobs {
-                if job
-                    .kind
+            let mut jobs = self.store.jobs();
+            jobs.sort_by(|a, b| {
+                b.priority.cmp(&a.priority).then_with(|| {
+                    if a.priority == JobPriority::Interactive {
+                        b.seq.cmp(&a.seq)
+                    } else {
+                        a.seq.cmp(&b.seq)
+                    }
+                })
+            });
+            let overlaps = |a: &Job, b: &Job| {
+                a.kind
                     .keys()
                     .iter()
-                    .any(|k| blocked.iter().any(|held| super::store::overlaps(k, held)))
+                    .any(|x| b.kind.keys().iter().any(|y| super::store::overlaps(x, y)))
+            };
+            let mut selected = None;
+            for candidate in &jobs {
+                let mut job = candidate;
+                // Inherit urgency through earlier operations on either path.
+                while let Some(prior) = jobs
+                    .iter()
+                    .filter(|j| j.seq < job.seq && overlaps(j, job))
+                    .min_by_key(|j| j.seq)
+                {
+                    job = prior;
+                }
+                if job.not_before > now
+                    || job
+                        .kind
+                        .keys()
+                        .iter()
+                        .any(|key| self.is_open_for_write(key))
                 {
                     continue;
                 }
-                if job.not_before > now {
-                    for k in job.kind.keys() {
-                        blocked.insert(k.to_string());
-                    }
-                    continue;
-                }
-                ran = true;
-                self.run_one(&job, &mut blocked)?;
-            }
-            if !ran {
+                selected = Some(job.clone());
                 break;
             }
+            let Some(job) = selected else {
+                break;
+            };
+            // Creating an empty folder does not invalidate the listing of
+            // existing remote children under that name.
+            if !matches!(job.kind, JobKind::Mkdir { .. } | JobKind::Rmdir { .. }) {
+                touched.extend(job.kind.keys().into_iter().map(str::to_string));
+            }
+            self.run_one(&job)?;
         }
-        Ok(())
+        Ok(touched)
     }
 
-    fn run_one(&self, job: &Job, blocked: &mut HashSet<String>) -> Result<(), HubError> {
+    fn run_one(&self, job: &Job) -> Result<(), HubError> {
         // Wait for the local syscall and ledger commit before loading a move
         // intent. Otherwise a worker could persist a stale, unapplied intent.
         let _move_guard = self.directory_moves.lock();
@@ -1718,6 +1870,12 @@ impl Mirror {
         match self.run_job(job) {
             Ok(()) => {
                 let _ = self.store.remove_job(job.seq);
+                if let JobKind::RenameDir { from, to, .. } = &job.kind {
+                    // Notifications under pending moves were deliberately
+                    // deferred. Inspect those paths before any remote listing
+                    // can overwrite an unobserved edit at the destination.
+                    self.scan_paths(&[from.clone(), to.clone()], JobPriority::Interactive);
+                }
                 self.write_status(false);
             }
             Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
@@ -1741,9 +1899,6 @@ impl Mirror {
                     backoff_ms(j.attempts) / 1000
                 );
                 let _ = self.store.update_job(&j);
-                for k in job.kind.keys() {
-                    blocked.insert(k.to_string());
-                }
             }
         }
         Ok(())
@@ -1752,7 +1907,7 @@ impl Mirror {
     fn run_job(&self, job: &Job) -> Result<(), HubError> {
         match &job.kind {
             JobKind::Push { key } => self.run_push(key),
-            JobKind::Delete { key } => self.run_delete(key),
+            JobKind::Delete { key, if_match } => self.run_delete(key, if_match.as_deref()),
             JobKind::Rename { from, to } => self.run_rename(from, to),
             JobKind::RenameDir {
                 from,
@@ -1780,6 +1935,7 @@ impl Mirror {
                     }
                     log::info!("{from} → {to}: directory renamed on the hub");
                 }
+                self.directory_epoch.fetch_add(1, Ordering::Relaxed);
                 self.store
                     .set_meta("directory-refresh", "1")
                     .map_err(|e| HubError::Other(e.to_string()))?;
@@ -1884,20 +2040,34 @@ impl Mirror {
         }
     }
 
-    fn run_delete(&self, key: &str) -> Result<(), HubError> {
+    fn run_delete(&self, key: &str, fixed_match: Option<&str>) -> Result<(), HubError> {
         let base = self.store.base(key);
-        let Some(base) = base else {
+        let Some(expected) = fixed_match.or_else(|| base.as_ref().map(|b| b.sha256.as_str()))
+        else {
             let _ = self.store.remove_entry(key);
             return Ok(());
         };
-        match self.hub.delete_object(key, Some(&base.sha256)) {
+        match self.hub.delete_object(key, Some(expected)) {
             Ok(()) | Err(HubError::NotFound) => {
-                let _ = self.store.remove_entry(key);
-                let _ = self.store.remove_base(key);
+                if fixed_match.is_none() {
+                    if self
+                        .store
+                        .entry(key)
+                        .is_some_and(|e| e.state == EntryState::Tombstone)
+                    {
+                        let _ = self.store.remove_entry(key);
+                    }
+                    let _ = self.store.remove_base(key);
+                }
                 log::info!("{key}: deleted on the hub");
                 Ok(())
             }
             Err(HubError::PreconditionFailed { current }) => {
+                if fixed_match.is_some() {
+                    // A different writer changed the destination. Keep the
+                    // dependent move queued and preserve both sides.
+                    return Err(HubError::PreconditionFailed { current });
+                }
                 // Edit beats delete: the hub's version comes back.
                 self.reconcile_key(key, current.as_ref(), 0)
             }
@@ -1999,20 +2169,67 @@ impl Mirror {
             base_sha256: base_sha.map(str::to_string),
             ..Default::default()
         };
-        let target = match self.opts.conflicts {
+        let stamp = chrono::DateTime::from_timestamp_millis(record.ts as i64)
+            .unwrap_or_else(chrono::Utc::now);
+        let mut target = match self.opts.conflicts {
             ConflictMode::Prompt => key.to_string(),
-            ConflictMode::Rename => {
-                super::conflict_copy_key(key, &self.device.name, chrono::Utc::now())
-            }
+            ConflictMode::Rename => record
+                .copy_key
+                .clone()
+                .unwrap_or_else(|| super::conflict_copy_key(key, &self.device.name, stamp)),
         };
-        let res = self.hub.put_object(&target, &PutBody::File(path), &opts)?;
+        let mut existing = None;
+        if self.opts.conflicts == ConflictMode::Rename {
+            existing = self.hub.head_object(&target)?;
+            if existing
+                .as_ref()
+                .is_some_and(|stat| stat.sha256 != local_sha)
+            {
+                // Two saves in the same minute must never share a conflict
+                // destination. The digest also makes crash retries stable.
+                target = super::conflict_copy_key(
+                    key,
+                    &format!("{} {local_sha}", self.device.name),
+                    stamp,
+                );
+                existing = self.hub.head_object(&target)?;
+            }
+            record.copy_key = Some(target.clone());
+            self.store
+                .put_conflict(&record)
+                .map_err(|e| HubError::Other(e.to_string()))?;
+        }
+        let res = if existing
+            .as_ref()
+            .is_some_and(|stat| stat.sha256 == local_sha)
+        {
+            None // prior upload committed but its reply was lost
+        } else {
+            Some(self.hub.put_object(&target, &PutBody::File(path), &opts)?)
+        };
         record.uploaded = true;
-        record.inbox_doc_id = res.doc_id;
+        if let Some(res) = res {
+            record.inbox_doc_id = res.doc_id;
+        }
         if self.opts.conflicts == ConflictMode::Rename {
             record.copy_key = Some(target.clone());
         }
         let _ = self.store.put_conflict(&record);
         log::info!("{key}: conflict copy uploaded ({target})");
+
+        // The saved snapshot covers only `local_sha`. A newer save that
+        // arrived while it uploaded needs its own reconciliation; it must
+        // not be replaced by the hub's bytes below.
+        if self
+            .local
+            .hash(key)
+            .is_ok_and(|current| current.sha256 != local_sha)
+            || self.is_open_for_write(key)
+        {
+            self.scan_paths(&[key.to_string()], JobPriority::Interactive);
+            self.rt.lock().recheck.insert(key.to_string());
+            return Ok(());
+        }
 
         // Now the hub version keeps the name: take it. Ask the hub rather
         // than trusting the stat that raised the conflict — it may have
@@ -2106,7 +2323,10 @@ fn migrate_legacy(
                 if let Some(b) = bases.get(&key) {
                     let _ = store.put_base(&key, b);
                 }
-                let _ = store.enqueue(JobKind::Delete { key: key.clone() });
+                let _ = store.enqueue(JobKind::Delete {
+                    key: key.clone(),
+                    if_match: None,
+                });
             }
             continue;
         }

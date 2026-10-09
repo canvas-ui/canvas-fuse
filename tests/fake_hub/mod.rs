@@ -10,7 +10,7 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +50,8 @@ pub struct InboxItem {
     pub bytes: Vec<u8>,
 }
 
+type RequestHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Default)]
 pub struct HubState {
     pub objects: BTreeMap<String, Obj>,
@@ -64,6 +66,11 @@ pub struct HubState {
     pub requests: Vec<String>,
     pub directory_renames: Vec<(String, String)>,
     pub directory_receipts: BTreeMap<String, (String, String)>,
+    pub on_request: Option<RequestHook>,
+    /// One-shot faults, matched against `METHOD /path` in request order.
+    pub failures: Vec<(String, u16)>,
+    pub corrupt_downloads: BTreeSet<String>,
+    pub downloads_without_etag: BTreeSet<String>,
 }
 
 pub fn sha_hex(bytes: &[u8]) -> String {
@@ -359,6 +366,22 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
         .unwrap()
         .requests
         .push(format!("{method} {path}"));
+    let hook = state.lock().unwrap().on_request.clone();
+    if let Some(hook) = hook {
+        hook(&format!("{method} {path}"));
+    }
+
+    let failure = {
+        let mut st = state.lock().unwrap();
+        st.failures
+            .iter()
+            .position(|(p, _)| p == &format!("{method} {path}"))
+            .map(|i| st.failures.remove(i).1)
+    };
+    if let Some(status) = failure {
+        let _ = req.respond(envelope(status, Value::Null, "injected failure", None));
+        return;
+    }
 
     let mut body = Vec::new();
     let _ = req.as_reader().read_to_end(&mut body);
@@ -555,7 +578,9 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
                 }
             }
             Method::Get => {
-                let st = state.lock().unwrap();
+                let mut st = state.lock().unwrap();
+                let corrupt = st.corrupt_downloads.remove(&key);
+                let omit_etag = st.downloads_without_etag.contains(&key);
                 match st.objects.get(&key) {
                     None => envelope(404, Value::Null, "not found", Some("NOT_FOUND")),
                     Some(o) => {
@@ -583,9 +608,16 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
                                 }
                                 None => (200, o.bytes.clone(), None),
                             };
+                        let data = if corrupt {
+                            b"corrupted transfer".to_vec()
+                        } else {
+                            data
+                        };
                         let mut r = Response::from_data(data).with_status_code(status);
                         for h in describe(o) {
-                            r = r.with_header(h);
+                            if !omit_etag || !h.field.equiv("ETag") {
+                                r = r.with_header(h);
+                            }
                         }
                         if let Some(cr) = extra {
                             r = r.with_header(Header::from_bytes("Content-Range", cr).unwrap());
@@ -622,6 +654,16 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
                 if let Some(conflict_of) = header(&req, "X-Canvas-Conflict-Of") {
                     let mode =
                         header(&req, "X-Canvas-Conflict-Mode").unwrap_or_else(|| "inbox".into());
+                    if mode == "rename" && st.objects.contains_key(&key) {
+                        return req
+                            .respond(envelope(
+                                412,
+                                json!({}),
+                                "target exists",
+                                Some("PRECONDITION_FAILED"),
+                            ))
+                            .unwrap();
+                    }
                     st.inbox.push(InboxItem {
                         key: key.clone(),
                         conflict_of: conflict_of.clone(),

@@ -35,6 +35,22 @@ pub struct LocalStat {
     /// ms since the epoch
     pub mtime: u64,
     pub is_dir: bool,
+    /// High-resolution change identity: mtime alone misses edits made by
+    /// tools that preserve timestamps, especially while the daemon is down.
+    pub fingerprint: String,
+}
+
+fn fingerprint(m: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        m.dev(),
+        m.ino(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec()
+    )
 }
 
 /// A hashed file: what the bytes on disk are right now.
@@ -156,6 +172,7 @@ impl Local {
             size: m.len(),
             mtime: m.modified().map(ms_of).unwrap_or(0),
             is_dir: m.is_dir(),
+            fingerprint: fingerprint(&m),
         })
     }
 
@@ -227,9 +244,19 @@ impl Local {
     pub fn write_atomic(&self, key: &str, bytes: &[u8]) -> Result<Hashed> {
         check_key(key)?;
         self.ensure_parent(key)?;
-        let part = self.part_path(key);
+        // A local save must not truncate the resumable download's staging
+        // inode while the network is still writing to it.
+        let target = self.path(key);
+        let name = target.file_name().unwrap().to_string_lossy();
+        let part = target.with_file_name(format!(
+            ".{name}.local-{}{PART_SUFFIX}",
+            super::operation_id()?
+        ));
         {
-            let mut f = std::fs::File::create(&part)?;
+            let mut f = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&part)?;
             f.write_all(bytes)?;
             f.sync_data()?;
         }
@@ -257,7 +284,22 @@ impl Local {
         expected_sha: &str,
         remote_mtime: u64,
     ) -> Result<Hashed, HubError> {
+        use std::os::unix::fs::MetadataExt;
+        let stamp = || match std::fs::symlink_metadata(self.path(key)) {
+            Ok(m) => Ok(Some((
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(e)),
+        };
         check_key(key).map_err(io_err)?;
+        let before = stamp()?;
         self.ensure_parent(key).map_err(io_err)?;
         let part = self.part_path(key);
         let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -273,7 +315,16 @@ impl Local {
                 hasher.update(&buf[..n]);
             }
         }
-        let (mut resp, etag) = hub.get_object(key, if have > 0 { Some(have) } else { None })?;
+        let response = hub.get_object(key, if have > 0 { Some(have) } else { None });
+        let (mut resp, etag) = match response {
+            // A crash may leave a complete part, or the remote may shrink.
+            // An unsatisfiable resume must restart from byte zero.
+            Err(HubError::Refused { status: 416, .. }) if have > 0 => {
+                std::fs::remove_file(&part).map_err(io_err)?;
+                return self.fetch(hub, key, expected_sha, remote_mtime);
+            }
+            other => other?,
+        };
         let resumed = have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         if !resumed {
             hasher = Sha256::new();
@@ -301,13 +352,12 @@ impl Local {
         out.sync_data().map_err(io_err)?;
         drop(out);
         let got = super::hex(&hasher.finalize());
-        if let Some(etag) = &etag {
-            if etag != &got {
-                let _ = std::fs::remove_file(&part);
-                return Err(HubError::Other(format!(
-                    "{key}: digest mismatch (hub says {etag}, got {got})"
-                )));
-            }
+        let verified_sha = etag.as_deref().unwrap_or(expected_sha);
+        if verified_sha != got {
+            let _ = std::fs::remove_file(&part);
+            return Err(HubError::Other(format!(
+                "{key}: digest mismatch (hub says {verified_sha}, got {got})"
+            )));
         }
         if got != expected_sha {
             log::debug!("{key}: fetched {got} while expecting {expected_sha}");
@@ -321,6 +371,12 @@ impl Local {
             }
         }
         let _g = self.lock.lock();
+        if stamp()? != before {
+            // A user save can arrive while the request is in flight. Keep
+            // that save; its queued job/inotify event takes priority next.
+            let _ = std::fs::remove_file(&part);
+            return Err(HubError::LocalChanged(key.to_string()));
+        }
         std::fs::rename(&part, self.path(key)).map_err(io_err)?;
         let mtime = std::fs::metadata(self.path(key))
             .and_then(|m| m.modified())
@@ -453,8 +509,24 @@ impl Local {
     /// depth first. Symlinks and in-progress parts are left out: the former
     /// have no meaning on the hub, the latter are not files yet.
     pub fn walk(&self) -> Vec<(String, LocalStat)> {
+        self.walk_from("")
+    }
+
+    /// Inspect only an event's path/subtree; ordinary notifications never
+    /// require walking the rest of the workspace.
+    pub fn walk_from(&self, key: &str) -> Vec<(String, LocalStat)> {
         let mut out = Vec::new();
-        let mut stack: Vec<String> = vec![String::new()];
+        if !key.is_empty() {
+            let Some(st) = self.stat(key) else {
+                return out;
+            };
+            let is_dir = st.is_dir;
+            out.push((key.to_string(), st));
+            if !is_dir {
+                return out;
+            }
+        }
+        let mut stack: Vec<String> = vec![key.to_string()];
         while let Some(dir) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(self.path(&dir)) else {
                 continue;
@@ -467,7 +539,7 @@ impl Local {
                 let Ok(ft) = entry.file_type() else {
                     continue;
                 };
-                if ft.is_symlink() {
+                if !ft.is_file() && !ft.is_dir() {
                     continue;
                 }
                 let key = if dir.is_empty() {
@@ -482,6 +554,7 @@ impl Local {
                     size: if ft.is_dir() { 0 } else { m.len() },
                     mtime: m.modified().map(ms_of).unwrap_or(0),
                     is_dir: ft.is_dir(),
+                    fingerprint: fingerprint(&m),
                 };
                 if ft.is_dir() {
                     stack.push(key.clone());
@@ -531,7 +604,14 @@ mod tests {
     #[test]
     fn write_hash_read_and_walk() {
         let (d, l) = local();
+        l.mkdir("Docs").unwrap();
+        let download_part = l.part_path("Docs/a.txt");
+        std::fs::write(&download_part, b"unfinished background download").unwrap();
         let h = l.write_atomic("Docs/a.txt", b"hello").unwrap();
+        assert_eq!(
+            std::fs::read(download_part).unwrap(),
+            b"unfinished background download"
+        );
         assert_eq!(h.sha256, super::super::sha256_hex(b"hello"));
         assert_eq!(h.size, 5);
         // The real file is where the user expects it, no indirection.
@@ -549,8 +629,9 @@ mod tests {
         assert_eq!(keys, vec!["Docs", "Docs/a.txt", "Empty"]);
         assert!(l.is_dir("Empty"));
         assert!(l.is_file("Docs/a.txt"));
-        // No leftover part file.
-        assert!(!d.path().join("Home/Docs/.a.txt.canvas-part").exists());
+        // Only the final file and the pre-existing download part remain;
+        // the local save leaves no staging file behind.
+        assert_eq!(std::fs::read_dir(l.path("Docs")).unwrap().count(), 2);
     }
 
     #[test]
