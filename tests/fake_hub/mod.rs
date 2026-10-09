@@ -54,6 +54,7 @@ type RequestHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Default)]
 pub struct HubState {
+    pub instance_id: Option<String>,
     pub objects: BTreeMap<String, Obj>,
     pub log: Vec<LogEntry>,
     pub next_seq: u64,
@@ -390,7 +391,7 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
     let resp: Response<std::io::Cursor<Vec<u8>>> = if path == "/rest/v2/ping" {
         envelope(
             200,
-            json!({ "instanceId": "fake-hub-1", "version": "0.0.0" }),
+            json!({ "instanceId": state.lock().unwrap().instance_id.as_deref().unwrap_or("fake-hub-1"), "version": "0.0.0" }),
             "pong",
             None,
         )

@@ -88,6 +88,16 @@ pub fn workspace_data_dir(remote: &str, workspace: &str) -> PathBuf {
         .join(sanitize_segment(workspace))
 }
 
+/// A mirror's ledger describes one physical folder. Sharing it merely because
+/// two mounts name the same workspace turns absent local files into deletions.
+pub fn workspace_mount_data_dir(remote: &str, workspace: &str, mountpoint: &Path) -> PathBuf {
+    workspace_data_dir(remote, workspace).join("mounts").join(
+        mount_data_dir(remote, &[], mountpoint)
+            .file_name()
+            .expect("mount state directory"),
+    )
+}
+
 fn state_file_for(mountpoint: &Path) -> PathBuf {
     // Readable prefix + short hash to avoid collisions after sanitizing
     let raw = mountpoint.to_string_lossy();

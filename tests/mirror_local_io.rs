@@ -45,7 +45,7 @@ impl Rig {
                 id: "local-device".into(),
                 name: "local".into(),
             },
-            mountpoint: dir.path().join("mnt"),
+            mountpoint: dir.path().join("Home"),
             status_path: None,
         })
         .unwrap();
@@ -491,7 +491,7 @@ fn an_unclosed_copy_survives_daemon_restart_and_is_discovered_for_upload() {
             id: "local-device".into(),
             name: "local".into(),
         },
-        mountpoint: dir.path().join("mnt"),
+        mountpoint: dir.path().join("Home"),
         status_path: None,
     })
     .unwrap();

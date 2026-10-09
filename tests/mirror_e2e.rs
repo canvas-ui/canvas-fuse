@@ -30,6 +30,14 @@ fn rig_with(url: &str, opts: MirrorOptions) -> (Arc<Mirror>, tempfile::TempDir) 
 }
 
 fn open_mirror(dir: &tempfile::TempDir, url: &str, opts: MirrorOptions) -> Arc<Mirror> {
+    try_open_mirror(dir, url, opts).unwrap()
+}
+
+fn try_open_mirror(
+    dir: &tempfile::TempDir,
+    url: &str,
+    opts: MirrorOptions,
+) -> anyhow::Result<Arc<Mirror>> {
     Mirror::open(MirrorConfig {
         tls: None,
         data_dir: dir.path().join("data"),
@@ -43,10 +51,9 @@ fn open_mirror(dir: &tempfile::TempDir, url: &str, opts: MirrorOptions) -> Arc<M
             id: "dev-a".into(),
             name: "laptop".into(),
         },
-        mountpoint: dir.path().join("mnt"),
+        mountpoint: dir.path().join("Home"),
         status_path: Some(dir.path().join("status.json")),
     })
-    .unwrap()
 }
 
 fn rig(opts: MirrorOptions) -> Rig {
@@ -945,11 +952,12 @@ fn delayed_rename_does_not_move_a_recreated_source() {
 
 // ── the folder while no daemon runs ──────────────────────────────────────────
 
-/// Files put in the folder before the first mount are the user's: pushed.
+/// Files added offline to an initialized local replica are pushed.
 #[test]
-fn a_folder_that_existed_before_the_first_mount_is_pushed() {
+fn files_added_to_an_initialized_folder_before_sync_are_pushed() {
     let hub = FakeHub::start();
     let dir = tempfile::tempdir().unwrap();
+    drop(open_mirror(&dir, &hub.url, opts()));
     std::fs::create_dir_all(dir.path().join("Home/Docs")).unwrap();
     std::fs::write(dir.path().join("Home/Docs/plan.md"), b"local plan").unwrap();
     std::fs::write(dir.path().join("Home/README"), b"readme").unwrap();
@@ -1127,11 +1135,10 @@ fn renames_move_real_files_and_directories() {
     );
 }
 
-/// Upgrading from the content-cache mirror (0.10): cached bytes move into
-/// the folder, clean files stay clean (no download, no upload), an edit
-/// that never got pushed is pushed, never-fetched keys are pulled.
+/// Old caches have no local directory identity: refuse before migration and
+/// preserve every cached byte and legacy ledger for explicit recovery.
 #[test]
-fn a_generation_1_cache_is_moved_into_the_folder() {
+fn an_unbound_generation_1_cache_is_preserved_and_refused() {
     use redb::{Database, TableDefinition};
     use serde_json::json;
     let hub = FakeHub::start();
@@ -1188,62 +1195,21 @@ fn a_generation_1_cache_is_moved_into_the_folder() {
         tx.commit().unwrap();
     }
 
-    let m = open_mirror(&dir, &hub.url, opts());
-    let home = dir.path().join("Home");
+    assert!(try_open_mirror(&dir, &hub.url, opts()).is_err());
+    assert!(hub.lock().requests.is_empty());
     assert_eq!(
-        std::fs::read(home.join("Docs/clean.txt")).unwrap(),
-        b"clean"
-    );
-    assert_eq!(
-        std::fs::read(home.join("edited.txt")).unwrap(),
+        std::fs::read(cache.join(&mine[..2]).join(&mine)).unwrap(),
         b"mine, unpushed"
     );
-    assert!(!home.join("never.txt").exists(), "was never fetched");
-    assert_eq!(m.entry("Docs/clean.txt").unwrap().state, EntryState::Clean);
-    assert_eq!(m.entry("edited.txt").unwrap().state, EntryState::Dirty);
-    assert_eq!(m.store.base("edited.txt").unwrap().sha256, old_sha);
-    assert_eq!(
-        std::fs::read(home.join("Docs/.~lock.plan.xlsx#")).unwrap(),
-        b"lock",
-        "placed locally"
-    );
-    assert_eq!(
-        m.status().pending,
-        2,
-        "the directory and edited file are queued; the excluded lock file is not pushed"
-    );
-    assert_eq!(m.status().cursor, None, "old cursor retired: full listing");
-
-    m.cycle(true);
-    assert_eq!(
-        hub.lock().bytes_of("edited.txt").unwrap(),
-        b"mine, unpushed"
-    );
-    let puts = hub.lock().entries("put");
-    assert_eq!(
-        puts.last().unwrap().if_match.as_deref(),
-        Some(old_sha.as_str()),
-        "pushed against the carried-over base"
-    );
-    assert_eq!(
-        std::fs::read(home.join("never.txt")).unwrap(),
-        b"never fetched"
-    );
-    let requests = hub.lock().requests.clone();
-    assert!(
-        !requests
-            .iter()
-            .any(|r| r.starts_with("GET ") && r.contains("Docs/clean.txt")),
-        "a clean cached file is not downloaded again: {requests:?}"
-    );
-    assert_eq!(m.entry("Docs/clean.txt").unwrap().state, EntryState::Clean);
-    assert_eq!(m.status().pending, 0);
-    assert!(m.conflicts().is_empty());
-    // The migration is one-shot: a second open finds nothing to move.
-    drop(m);
-    let m = open_mirror(&dir, &hub.url, opts());
-    assert_eq!(m.status().entries, 4);
-    assert!(hub.lock().bytes_of("Docs/.~lock.plan.xlsx#").is_none());
+    assert!(!dir.path().join("Home/.workspace.json").exists());
+    let db = Database::open(data.join("mirror.redb")).unwrap();
+    let tx = db.begin_read().unwrap();
+    assert!(tx
+        .open_table(TableDefinition::<&str, &[u8]>::new("entries_v1"))
+        .unwrap()
+        .get("edited.txt")
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -1468,6 +1434,7 @@ fn offline_additions_upload_before_the_first_remote_listing_or_download() {
     for n in 0..20 {
         hub.lock().put(&format!("remote/{n}.jpg"), b"remote photo");
     }
+    drop(open_mirror(&dir, &hub.url, opts()));
     std::fs::create_dir_all(dir.path().join("Home/Working/Empty")).unwrap();
     std::fs::write(dir.path().join("Home/Working/new.txt"), b"offline work").unwrap();
     let m = open_mirror(&dir, &hub.url, opts());

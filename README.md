@@ -163,6 +163,18 @@ opens before mounting, so the two never disagree about where bytes live.
 
 What the daemon does:
 
+- **Validate the destination (0.13.1+).** The first mount requires an empty
+  destination and creates a local `.workspace.json` before scanning. For
+  `-w Universe ~/Workspaces`, this is `~/Workspaces/Universe/.workspace.json`;
+  the surrounding `~/Workspaces` directory may contain other workspaces.
+  Subsequent mounts check the server URL, workspace UUID, backend, Home layout,
+  physical directory identities and the replica ID bound to the sync database.
+  A non-empty unmarked folder, mismatched/corrupt/copied marker, replaced Home,
+  or unrelated database is refused before reconciliation. Marker loss while
+  running pauses sync. The marker is local metadata and is never uploaded.
+  Each laptop/workstation creates its own marker and database for the same
+  remote workspace; multiple devices are supported. Do not copy markers or
+  databases between replicas. A changed hub instance ID also pauses sync.
 - **Full local mirror.** The first mount lists the hub and downloads
   everything (verified by digest, written atomically next to its target).
   Remote changes land in the folder within a second on a socket nudge
@@ -251,11 +263,24 @@ without waiting for `--poll`.
 **Identity and locations.** The device id is `deviceId` from
 `~/.canvas/device.json` (canvas-cli) or a stable hash of hostname + user;
 it is sent as `X-Canvas-Origin` so the mirror recognizes its own echoes.
-State lives in the mount's data dir (`~/.canvas/<remote>/fuse/workspaces/<ws>/`
+State lives in the mount's data dir
+(`~/.canvas/<remote>/fuse/workspaces/<ws>/mounts/<mount-path>.<hash>/`
 or `--data-dir`): `mirror.redb` (index, base ledger, cursor, jobs,
 conflicts, trash records), `trash/` and `conflicts/`. The bytes themselves
 are only ever in `Home/`. Hub document ids are never stored — keys and
 digests are the identity.
+
+**Server recovery is separate from the mirror trash.** With the server's
+default `CANVAS_RETENTION_DAYS=30`, displaced local-backend bytes are retained
+under `<workspace-home>/.stored-tmp/retained/<sha256>`. They are outside the
+indexed tree and do not appear in the mounted `Trash/`. The retention index
+maps digests to original paths; identical contents can share one blob. Inspect
+`GET /rest/v2/workspaces/<uuid>/backends/file/workspace%3Ahome/retained?limit=5000`.
+Restore individual retained versions through that endpoint's
+`/<sha256>/restore` route (POST with `key`; occupied paths are protected by
+preconditions). Preserve both the retained bytes and Stored's metadata database
+before incident recovery. Local mirror trash contains only local copies
+preserved after hub deletions, so it is not a complete server recovery archive.
 
 **Status and control.** `canvas-fuse status [--json]` shows a `mirror`
 block per mirror mount (`state` idle|syncing|offline|paused, `home`,
@@ -277,14 +302,14 @@ canvas-fuse trash list ~/Workspaces/myws
 canvas-fuse unmount ~/Workspaces/myws      # ~/Workspaces/myws/Home stays, as files
 ```
 
-Upgrading from 0.10 (the content-cache mirror): the first mount of 0.11
-moves every cached file into `Home/` and carries the ledger over — a file
-the hub already has is neither downloaded nor uploaded again, an edit that
-never got pushed is pushed, and keys that were never fetched are pulled by
-the listing that follows. The old `cache/` under the data dir is then dead
-weight (a log line says so) and can be deleted. `--pin` and
-`--cache-budget-mb` are accepted and ignored — there is nothing to pin when
-everything is local.
+**Upgrading an existing mirror to 0.13.1:** old folders and ledgers have no
+verifiable local replica binding, so they are deliberately not adopted
+automatically. Keep the old folder and its data directory (including queued
+changes, conflict copies, trash and any old content cache) for review/recovery.
+Start a new mirror at an empty destination with its own data directory, then
+reconcile any outstanding local work explicitly. Do not manufacture a marker,
+copy another device's marker, or reuse the old database to bypass this check.
+`--pin` and `--cache-budget-mb` remain accepted and ignored.
 
 Without `--mirror`, `Home/` keeps its passthrough behaviour. `mv` inside
 `Home/` uses the hub's rename route for either a file or a whole directory.

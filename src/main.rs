@@ -564,13 +564,9 @@ fn cmd_mount(
                 .to_string()
         });
         match &workspace_mount {
-            Some(ws) if selection.is_explicit() => runtime::workspace_data_dir(&remote_label, ws)
-                .join("mounts")
-                .join(
-                    runtime::mount_data_dir(&remote_label, &[], &mountpoint)
-                        .file_name()
-                        .expect("mount state directory"),
-                ),
+            Some(ws) if mirror.is_some() || selection.is_explicit() => {
+                runtime::workspace_mount_data_dir(&remote_label, ws, &mountpoint)
+            }
             Some(ws) => runtime::workspace_data_dir(&remote_label, ws),
             None => runtime::mount_data_dir(&remote_label, &contexts, &mountpoint),
         }
@@ -588,6 +584,9 @@ fn cmd_mount(
     }
 
     // Pre-flight while we can still report to the terminal
+    if mirror.is_some() && !runtime::is_mounted(&mountpoint) {
+        canvas_fuse::mirror::identity::preflight(&mountpoint)?;
+    }
     let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
     match api.ping() {
         Ok((payload, rtt)) => {

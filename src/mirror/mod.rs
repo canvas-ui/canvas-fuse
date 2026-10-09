@@ -26,6 +26,7 @@
 
 pub mod control;
 pub mod hub;
+pub mod identity;
 pub mod local;
 pub mod reconcile;
 pub mod store;

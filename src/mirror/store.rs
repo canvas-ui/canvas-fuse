@@ -291,6 +291,14 @@ fn dec<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    pub(super) fn open_bound(path: &Path, binding: &str) -> Result<Self> {
+        Self::open_inner(path, Some(binding))
+    }
+
+    fn open_inner(path: &Path, binding: Option<&str>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -301,8 +309,24 @@ impl Store {
         // ones the catalogue lists.
         let existing: HashSet<String> = tx
             .list_tables()
-            .map(|t| t.map(|d| d.name().to_string()).collect())
-            .unwrap_or_default();
+            .map(|t| t.map(|d| d.name().to_string()).collect())?;
+        // Check BEFORE migrations or any ledger mutation. A legacy database
+        // has no proof of which local directory it described and must not be
+        // applied to a new folder, even if server/workspace names match.
+        if let Some(binding) = binding {
+            let stored = if existing.contains(META.name()) {
+                tx.open_table(META)?
+                    .get(super::identity::META_BINDING)?
+                    .map(|v| v.value().to_string())
+            } else {
+                None
+            };
+            anyhow::ensure!(stored.as_deref() == Some(binding) || existing.is_empty(),
+                "mirror database {} is unbound or belongs to another local replica; refusing to reuse its sync history. Preserve the old state for recovery and use a separate data directory with a new empty destination",
+                path.display());
+            tx.open_table(META)?
+                .insert(super::identity::META_BINDING, binding)?;
+        }
         let legacy = if existing.contains("entries_v1") {
             let l = Legacy {
                 entries: read_legacy_table::<Entry>(&tx, "entries_v1"),

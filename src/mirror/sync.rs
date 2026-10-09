@@ -165,6 +165,8 @@ pub struct Mirror {
     open_writes: Mutex<HashSet<String>>,
     directory_moves: ReentrantMutex<()>,
     directory_epoch: std::sync::atomic::AtomicU64,
+    // Release destination locks after the database, local handles and watcher.
+    destination: super::identity::Destination,
 }
 
 fn ms_to_systime(ms: u64) -> SystemTime {
@@ -178,11 +180,22 @@ fn backoff_ms(attempts: u32) -> u64 {
 }
 
 impl Mirror {
+    fn verify_destination(&self) -> Result<(), HubError> {
+        self.destination
+            .verify()
+            .map_err(|e| HubError::UnsafeMirror(format!("{e:#}")))
+    }
+
     pub fn open(cfg: MirrorConfig) -> Result<Arc<Self>> {
+        // No scan, migration or queued mutation until both the physical
+        // destination and its database have proved their local replica ID.
+        let destination = super::identity::Destination::prepare(&cfg)?;
         std::fs::create_dir_all(&cfg.data_dir)
             .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
-        let store = Arc::new(Store::open(&super::store_path(&cfg.data_dir))?);
+        let store = Arc::new(destination.open_store(&cfg.data_dir)?);
+        destination.commit()?;
         let local = Arc::new(Local::open(&cfg.home_dir, &cfg.data_dir)?);
+        destination.verify_local(&local)?;
         let hub = Arc::new(HubClient::with_tls(
             &cfg.server,
             &cfg.token,
@@ -220,6 +233,7 @@ impl Mirror {
         }
 
         let mirror = Arc::new(Self {
+            destination,
             store,
             local,
             hub,
@@ -1083,6 +1097,12 @@ impl Mirror {
     }
 
     fn scan_paths(&self, paths: &[String], priority: JobPriority) -> ScanReport {
+        if let Err(e) = self.destination.verify() {
+            log::error!("mirror: refusing folder scan: {e:#}");
+            self.set_error(Some(format!("{e:#}")));
+            self.set_state(SyncState::Paused);
+            return ScanReport::default();
+        }
         let epoch = self.directory_epoch.load(Ordering::Relaxed);
         let mut report = ScanReport::default();
         let mut seen_files: HashSet<String> = HashSet::new();
@@ -1316,10 +1336,14 @@ impl Mirror {
                         self.set_error(Some(msg));
                         self.set_state(SyncState::Offline);
                     }
-                    HubError::Unauthorized => {
-                        log::error!("mirror: hub refused our credentials; pausing");
+                    HubError::Unauthorized | HubError::UnsafeMirror(_) => {
+                        log::error!("mirror: {msg}; pausing");
                         self.set_error(Some(msg));
                         self.set_state(SyncState::Paused);
+                        // Keep recovery material intact, and make no further
+                        // network requests against an untrusted destination.
+                        self.write_status(true);
+                        return;
                     }
                     _ => {
                         log::warn!("mirror cycle failed: {msg}");
@@ -1335,6 +1359,7 @@ impl Mirror {
     }
 
     fn cycle_inner(&self, full: bool) -> Result<(), HubError> {
+        self.verify_destination()?;
         self.recover_directory_moves()?;
         if full {
             // Local first: what the folder says is true whether or not the
@@ -1375,10 +1400,15 @@ impl Mirror {
     /// Instance id + exclusions, once per online cycle (cheap; both change
     /// rarely, but the exclusions decide what we refuse to queue).
     fn refresh_hub_rules(&self) -> Result<(), HubError> {
-        if self.store.meta(META_INSTANCE).is_none() {
-            if let Some(id) = self.hub.instance_id()? {
-                let _ = self.store.set_meta(META_INSTANCE, &id);
+        let instance = self.hub.instance_id()?;
+        if let Some(previous) = self.store.meta(META_INSTANCE) {
+            if instance.as_deref() != Some(previous.as_str()) {
+                return Err(HubError::UnsafeMirror("hub instance identity changed; refusing to send this replica's queued operations".into()));
             }
+        } else if let Some(id) = instance {
+            self.store
+                .set_meta(META_INSTANCE, &id)
+                .map_err(|e| HubError::Other(e.to_string()))?;
         }
         if self.store.meta("exclusions").is_none() || self.rt.lock().last_full.is_none() {
             match self.hub.exclusions() {
@@ -1986,6 +2016,7 @@ impl Mirror {
     }
 
     fn run_one(&self, job: &Job) -> Result<(), HubError> {
+        self.verify_destination()?;
         // Wait for the local syscall and ledger commit before loading a move
         // intent. Otherwise a worker could persist a stale, unapplied intent.
         let _move_guard = self.directory_moves.lock();

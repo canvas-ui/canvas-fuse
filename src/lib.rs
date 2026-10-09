@@ -154,6 +154,10 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     std::fs::create_dir_all(&opts.mountpoint)
         .with_context(|| format!("creating mountpoint {}", opts.mountpoint.display()))?;
 
+    if opts.mirror.is_some() {
+        mirror::identity::preflight(&opts.mountpoint)?;
+    }
+
     let names = Arc::new(names::NameStore::open(&opts.data_dir.join("names.redb"))?);
     let api = Arc::new(api::ApiClient::with_tls(
         &opts.server,

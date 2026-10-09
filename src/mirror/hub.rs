@@ -100,6 +100,8 @@ pub enum HubError {
     Offline(String),
     /// Credentials refused — the device was revoked or the token expired.
     Unauthorized,
+    /// Folder, ledger or server no longer names the same replica.
+    UnsafeMirror(String),
     /// `412`: the key is not what the caller's `If-Match` said. `current` is
     /// the hub's version, or None when the key is gone.
     PreconditionFailed {
@@ -135,6 +137,7 @@ impl std::fmt::Display for HubError {
         match self {
             HubError::Offline(m) => write!(f, "offline: {m}"),
             HubError::Unauthorized => write!(f, "unauthorized"),
+            HubError::UnsafeMirror(m) => write!(f, "unsafe mirror: {m}"),
             HubError::PreconditionFailed { current } => {
                 write!(f, "precondition failed (current: {current:?})")
             }

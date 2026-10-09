@@ -31,7 +31,7 @@ fn mirror(root: &Path, url: &str) -> Arc<Mirror> {
             id: "test-device".into(),
             name: "test laptop".into(),
         },
-        mountpoint: root.join("mount"),
+        mountpoint: root.join("Home"),
         status_path: None,
     })
     .unwrap()

@@ -103,6 +103,10 @@ fn io_err(e: impl std::fmt::Display) -> HubError {
 /// A key the filesystem can hold: relative, no empty or `..` segments.
 pub(super) fn check_key(key: &str) -> Result<()> {
     anyhow::ensure!(!key.is_empty(), "empty key");
+    anyhow::ensure!(
+        key.split('/').next() != Some(super::identity::MARKER),
+        ".workspace.json is reserved local mirror identity metadata"
+    );
     for seg in key.split('/') {
         anyhow::ensure!(
             !seg.is_empty() && seg != "." && seg != "..",
@@ -468,6 +472,7 @@ impl Local {
     // ── structure ────────────────────────────────────────────────────────────
 
     pub fn remove_file(&self, key: &str) -> std::io::Result<()> {
+        check_key(key).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
         let _g = self.lock.lock();
         match std::fs::remove_file(self.path(key)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -483,6 +488,7 @@ impl Local {
 
     /// Non-recursive, like POSIX. Missing is fine.
     pub fn rmdir(&self, key: &str) -> std::io::Result<()> {
+        check_key(key).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
         match std::fs::remove_dir(self.path(key)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             r => r,
@@ -595,6 +601,9 @@ impl Local {
     /// require walking the rest of the workspace.
     pub fn walk_from(&self, key: &str) -> Vec<(String, LocalStat)> {
         let mut out = Vec::new();
+        if key.split('/').next() == Some(super::identity::MARKER) {
+            return out;
+        }
         if !key.is_empty() {
             let Some(st) = self.stat(key) else {
                 return out;
@@ -612,7 +621,9 @@ impl Local {
             };
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(PART_SUFFIX) {
+                if name.ends_with(PART_SUFFIX)
+                    || (dir.is_empty() && name == super::identity::MARKER)
+                {
                     continue;
                 }
                 let Ok(ft) = entry.file_type() else {
