@@ -198,6 +198,18 @@ What the daemon does:
   namespace locks while waiting. A delayed download rechecks the file identity,
   open handles and queued moves before replacing anything. Upload results
   follow local renames and do not mark newer edits as synced.
+- **Directories appear before file downloads.** Initial sync and full resync
+  first collect the paged file metadata, then create its parent directories on
+  disk and in the mounted Home view. You can save into any of those folders
+  while the file backlog downloads; new uploads take priority between requests.
+  This adds no per-folder network requests. Exclusions and pending local moves
+  are respected, and unfinished downloads never count as locally deleted files.
+  Empty remote folders are not included in the current objects listing.
+  Folder removal uses an empty-directory-only server operation, so a folder
+  that looks empty while downloads are pending cannot erase unseen remote
+  files. This operation requires canvas-server 2.17.4 or runtime-core 0.2.4;
+  older hubs leave folder removals pending rather than falling back to a
+  recursive delete.
 - **Folder moves are one operation.** Renaming a synced folder sends one
   directory rename request. The local folder and the hub folder each use a
   native filesystem rename; file contents and inodes stay in place. The

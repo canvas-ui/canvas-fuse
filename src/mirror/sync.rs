@@ -35,7 +35,7 @@ use anyhow::{Context as _, Result};
 use fuser::ReplyData;
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -1429,8 +1429,85 @@ impl Mirror {
         Ok(())
     }
 
-    /// No cursor (first run) or 410: list everything, reconcile every key
-    /// we or the hub know, and tail from the listing's head.
+    /// Create the listing's parent directories before transferring any file
+    /// contents. Only directories enter the ledger here: recording absent files
+    /// as local entries/bases would turn an interrupted download into a delete.
+    fn prepare_listing_directories(
+        &self,
+        remote: &BTreeMap<String, RemoteStat>,
+        touched: &HashSet<String>,
+        epoch: u64,
+    ) -> Result<(), HubError> {
+        let mut dirs = BTreeSet::new();
+        for key in remote.keys() {
+            if self.is_ignored(key)
+                || super::local::check_key(key).is_err()
+                || touched.iter().any(|path| super::store::under(key, path))
+                || self
+                    .store
+                    .entry(key)
+                    .is_some_and(|e| e.state == EntryState::Tombstone)
+            {
+                continue;
+            }
+            let mut parent = super::parent_key(key);
+            while !parent.is_empty() {
+                dirs.insert(parent.to_string());
+                parent = super::parent_key(parent);
+            }
+        }
+        let mut blocked = HashSet::new();
+        let mut first_error = None;
+        // Lexical order puts every parent before its descendants. Release the
+        // namespace lock between folders so local filesystem work can proceed.
+        for dir in dirs {
+            let _guard = self.directory_moves.lock();
+            if self.directory_epoch.load(Ordering::Relaxed) != epoch {
+                break; // A local move invalidated this snapshot; the next pass re-lists.
+            }
+            if self.is_ignored(&dir)
+                || blocked.contains(super::parent_key(&dir))
+                || self.pending_path_move(&dir)
+                || self.store.jobs().iter().any(|job| {
+                    matches!(&job.kind, JobKind::Rmdir { key } if super::store::under(&dir, key))
+                })
+            {
+                blocked.insert(dir);
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                // Do not follow a local symlink or replace a file occupying a
+                // remote directory name. Parents were checked in this same pass.
+                match std::fs::symlink_metadata(self.local.path(&dir)) {
+                    Ok(meta) => anyhow::ensure!(meta.is_dir(), "local path is not a directory"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(self.local.path(&dir))?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                if !self.store.has_dir(&dir) {
+                    self.store.add_dir(&dir)?;
+                }
+                self.view_ensure_dir(&dir);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                // A blocked path must not hide unrelated folders. Leave its
+                // local contents intact and retry without advancing the cursor.
+                let message = format!("{dir}: could not prepare mirror directory: {error:#}");
+                log::warn!("{message}");
+                first_error.get_or_insert(HubError::Other(message));
+                blocked.insert(dir);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// No cursor (first run) or 410: list everything, prepare the directory
+    /// structure, reconcile every key, and tail from the listing's head.
     fn rebuild_from_listing(&self) -> Result<(), HubError> {
         log::info!("mirror: full listing pass");
         let epoch = self.directory_epoch.load(Ordering::Relaxed);
@@ -1459,6 +1536,7 @@ impl Mirror {
                 None => break,
             }
         }
+        self.prepare_listing_directories(&remote, &touched, epoch)?;
         let mut keys: HashSet<String> = remote.keys().cloned().collect();
         keys.extend(self.store.entries("").into_iter().map(|(k, _)| k));
         keys.extend(self.store.bases("").into_iter().map(|(k, _)| k));
@@ -2132,10 +2210,7 @@ impl Mirror {
                 Ok(()) | Err(HubError::Refused { status: 409, .. }) => Ok(()),
                 Err(e) => Err(e),
             },
-            JobKind::Rmdir { key } => match self.hub.rmdir(key) {
-                Ok(()) | Err(HubError::NotFound) => Ok(()),
-                Err(e) => Err(e),
-            },
+            JobKind::Rmdir { key } => self.hub.rmdir(key),
         }
     }
 

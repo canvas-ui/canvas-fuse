@@ -1540,6 +1540,94 @@ fn uploads_during_a_listing_preempt_downloads_without_using_stale_metadata() {
 }
 
 #[test]
+fn directory_preparation_respects_exclusions_and_preserves_local_path_conflicts() {
+    use std::os::unix::fs::symlink;
+    let mut options = opts();
+    options.ignore.push("Excluded/**".into());
+    let r = rig(options);
+    let outside = r._dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, r.mirror.local.path("Link")).unwrap();
+    r.mirror.commit_write("Blocked", b"local file").unwrap();
+    {
+        let mut hub = r.hub.lock();
+        for key in [
+            "Blocked/nested/a.txt",
+            "Link/nested/a.txt",
+            "Excluded/nested/a.txt",
+            "Visible/Deep/a.txt",
+        ] {
+            hub.put(key, b"remote");
+        }
+    }
+    r.mirror.cycle(true);
+    assert_eq!(r.home_read("Blocked").unwrap(), b"local file");
+    assert!(
+        !outside.join("nested").exists(),
+        "must not follow a local symlink"
+    );
+    assert!(!r.mirror.local.path("Excluded").exists());
+    assert!(r.mirror.local.path("Visible/Deep").is_dir());
+    assert!(!r.mirror.store.has_dir("Blocked"));
+    assert!(!r.mirror.store.has_dir("Link"));
+    assert!(
+        r.mirror.store.cursor().is_none(),
+        "failed preparation must be retryable"
+    );
+}
+
+#[test]
+fn restart_after_failed_initial_download_preserves_the_skeleton_without_deleting_remote_files() {
+    let hub = FakeHub::start();
+    hub.lock().put("Architecture/photo.jpg", b"photo");
+    hub.lock().put("Timesheets/2026/data.txt", b"data");
+    hub.lock()
+        .corrupt_downloads
+        .insert("Architecture/photo.jpg".into());
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let m = open_mirror(&dir, &hub.url, opts());
+        m.cycle(true);
+        assert!(m.store.entries("").is_empty());
+        assert!(m.local.path("Timesheets/2026").is_dir());
+    }
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert_eq!(
+        m.local.read_all("Architecture/photo.jpg").unwrap(),
+        b"photo"
+    );
+    assert_eq!(
+        m.local.read_all("Timesheets/2026/data.txt").unwrap(),
+        b"data"
+    );
+    assert!(hub.lock().mkdirs.is_empty());
+    assert!(!hub.lock().requests.iter().any(|q| q.starts_with("DELETE ")));
+    assert_eq!(m.status().pending, 0);
+}
+
+#[test]
+fn an_old_hub_never_receives_a_recursive_delete_as_a_rmdir_fallback() {
+    let r = rig(opts());
+    r.mirror.mkdir_local("Empty").unwrap();
+    r.mirror.cycle(true);
+    r.hub
+        .lock()
+        .failures
+        .push(("POST /rest/v2/workspaces/ws1/home/rmdir".into(), 404));
+    assert!(r.mirror.rmdir_local("Empty").unwrap());
+    r.mirror.cycle(false);
+    assert_eq!(r.mirror.status().failed, 1);
+    assert_eq!(r.mirror.status().pending, 1);
+    assert!(!r
+        .hub
+        .lock()
+        .requests
+        .iter()
+        .any(|q| q.starts_with("DELETE ")));
+}
+
+#[test]
 fn a_save_during_a_background_download_is_preserved_and_uploaded_next() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let r = rig(opts());

@@ -787,6 +787,16 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
             .mkdirs
             .push(b["path"].as_str().unwrap_or("").to_string());
         envelope(200, Value::Null, "created", None)
+    } else if path == "/rest/v2/workspaces/ws1/home/rmdir" && method == Method::Post {
+        let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let key = b["path"].as_str().unwrap_or("");
+        let mut st = state.lock().unwrap();
+        if st.objects.keys().any(|k| k.starts_with(&format!("{key}/"))) {
+            envelope(409, Value::Null, "directory is not empty", None)
+        } else {
+            st.rmdirs.push(key.into());
+            envelope(200, Value::Null, "deleted", None)
+        }
     } else if let Some(p) = path.strip_prefix("/rest/v2/workspaces/ws1/home/") {
         state.lock().unwrap().rmdirs.push(url_decode(p));
         envelope(200, Value::Null, "deleted", None)

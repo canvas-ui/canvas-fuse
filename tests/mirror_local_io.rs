@@ -27,6 +27,10 @@ struct Rig {
 
 impl Rig {
     fn new(files: &[(&str, &[u8])]) -> Self {
+        Self::with_initial_sync(files, true)
+    }
+
+    fn with_initial_sync(files: &[(&str, &[u8])], sync: bool) -> Self {
         let hub = FakeHub::start();
         for (key, bytes) in files {
             hub.lock().put(key, bytes);
@@ -49,7 +53,9 @@ impl Rig {
             status_path: None,
         })
         .unwrap();
-        mirror.cycle(true);
+        if sync {
+            mirror.cycle(true);
+        }
         let mut tree = Tree::workspace_rooted("ws1".into(), "ws1".into());
         tree.set_home_mirrored(true);
         mirror.snapshot_into(&mut tree);
@@ -155,6 +161,158 @@ fn while_request_stalled(
     io.join().unwrap();
     r.hub.lock().on_request = None;
     assert!(completed, "local filesystem operation waited for the hub");
+}
+
+#[test]
+fn moving_an_unhydrated_folder_moves_remote_children_without_resurrecting_the_old_path() {
+    let r = Rig::with_initial_sync(
+        &[
+            ("Architecture/first.jpg", b"photo"),
+            ("Z/plan.txt", b"plan"),
+        ],
+        false,
+    );
+    let mirror = r.mirror.clone();
+    while_stalled_work(
+        &r,
+        "GET ",
+        "/objects/Architecture/first.jpg",
+        move || mirror.cycle(true),
+        |writes, tree| {
+            assert!(tree.read().home_ino_for_key("Z").is_some());
+            assert!(tree.read().home_ino_for_key("Z/plan.txt").is_none());
+            writes.rename(HOME_INO, "Z", HOME_INO, "Kitchen").unwrap();
+            let parent = tree.read().home_ino_for_key("Kitchen").unwrap();
+            save(&writes, parent, "new.txt", b"new work");
+        },
+    );
+    r.settle();
+    assert!(!r.dir.path().join("Home/Z").exists());
+    assert_eq!(r.read("Kitchen/plan.txt"), b"plan");
+    assert_eq!(r.read("Kitchen/new.txt"), b"new work");
+    assert_eq!(
+        r.hub.lock().directory_renames,
+        vec![("Z".into(), "Kitchen".into())]
+    );
+}
+
+#[test]
+fn removing_an_unhydrated_folder_cannot_delete_remote_children() {
+    let r = Rig::with_initial_sync(
+        &[
+            ("Architecture/first.jpg", b"photo"),
+            ("Z/plan.txt", b"plan"),
+        ],
+        false,
+    );
+    let mirror = r.mirror.clone();
+    while_stalled_work(
+        &r,
+        "GET ",
+        "/objects/Architecture/first.jpg",
+        move || mirror.cycle(true),
+        |writes, _| {
+            writes.rmdir(HOME_INO, "Z").unwrap();
+        },
+    );
+    r.settle();
+    assert_eq!(r.hub.lock().bytes_of("Z/plan.txt").unwrap(), b"plan");
+    assert_eq!(r.read("Z/plan.txt"), b"plan");
+    assert!(!r
+        .hub
+        .lock()
+        .requests
+        .iter()
+        .any(|q| q.starts_with("DELETE ")));
+}
+
+#[test]
+fn paged_listing_exposes_all_folders_and_accepts_uploads_before_downloads_finish() {
+    // Exercise both a fresh mount and an explicit resync of an existing mirror.
+    for initial_sync in [false, true] {
+        let r = Rig::with_initial_sync(&[], initial_sync);
+        {
+            let mut hub = r.hub.lock();
+            for n in 0..2001 {
+                hub.put(&format!("Architecture/Photos/{n:04}.jpg"), b"photo");
+            }
+            hub.put("Timesheets/2026/October.xlsx", b"timesheet");
+            hub.put("Žehňa/Kitchen/plan.txt", b"plan");
+            // Stop this pass after two transfers, with most files still pending.
+            hub.corrupt_downloads
+                .insert("Architecture/Photos/0001.jpg".into());
+        }
+        let mirror = r.mirror.clone();
+        let check_mirror = r.mirror.clone();
+        let home = r.dir.path().join("Home");
+        while_stalled_work(
+            &r,
+            "GET ",
+            "/objects/Architecture/Photos/0000.jpg",
+            move || mirror.cycle(true),
+            move |writes, tree| {
+                for path in ["Architecture/Photos", "Timesheets/2026", "Žehňa/Kitchen"] {
+                    assert!(home.join(path).is_dir(), "missing real folder {path}");
+                    assert!(
+                        tree.read().home_ino_for_key(path).is_some(),
+                        "missing view folder {path}"
+                    );
+                    assert!(check_mirror.store.has_dir(path));
+                }
+                assert!(check_mirror.store.entries("").is_empty());
+                assert!(check_mirror.store.bases("").is_empty());
+                assert!(!home.join("Timesheets/2026/October.xlsx").exists());
+                let parent = tree.read().home_ino_for_key("Timesheets/2026").unwrap();
+                save(&writes, parent, "new.txt", b"working during initial sync");
+                assert_eq!(
+                    std::fs::read(home.join("Timesheets/2026/new.txt")).unwrap(),
+                    b"working during initial sync"
+                );
+            },
+        );
+        let hub = r.hub.lock();
+        assert_eq!(
+            hub.bytes_of("Timesheets/2026/new.txt").unwrap(),
+            b"working during initial sync"
+        );
+        let upload = hub
+            .requests
+            .iter()
+            .position(|q| q.starts_with("PUT ") && q.ends_with("/new.txt"))
+            .unwrap();
+        let second_download = hub
+            .requests
+            .iter()
+            .position(|q| q.starts_with("GET ") && q.ends_with("/0001.jpg"))
+            .unwrap();
+        assert!(upload < second_download);
+        assert!(
+            hub.mkdirs.is_empty(),
+            "remote folders must not echo back as local mkdirs"
+        );
+        assert!(!hub.requests.iter().any(|q| q.starts_with("DELETE ")));
+        drop(hub);
+        assert!(r
+            .mirror
+            .store
+            .entry("Timesheets/2026/October.xlsx")
+            .is_none());
+        assert!(r
+            .mirror
+            .store
+            .base("Timesheets/2026/October.xlsx")
+            .is_none());
+        r.mirror.scan_local();
+        assert!(
+            !r.mirror.store.jobs().iter().any(|j| matches!(
+                j.kind,
+                canvas_fuse::mirror::store::JobKind::Delete { .. }
+                    | canvas_fuse::mirror::store::JobKind::Rmdir { .. }
+                    | canvas_fuse::mirror::store::JobKind::Mkdir { .. }
+            )),
+            "unfinished downloads must not become local deletions or new folders"
+        );
+    }
 }
 
 #[test]

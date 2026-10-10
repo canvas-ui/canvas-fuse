@@ -692,13 +692,23 @@ impl HubClient {
 
     pub fn rmdir(&self, key: &str) -> Result<(), HubError> {
         let url = format!(
-            "{}/rest/v2/workspaces/{}/home/{}",
+            "{}/rest/v2/workspaces/{}/home/rmdir",
             self.base,
             encode_segment(&self.ws),
-            encode_key(key)
         );
-        let resp = self.with_retries(|| Ok(self.http.delete(&url).timeout(JSON_TIMEOUT)))?;
-        Self::json_ok(resp).map(|_| ())
+        let body = serde_json::json!({ "path": key });
+        let resp =
+            self.with_retries(|| Ok(self.http.post(&url).timeout(JSON_TIMEOUT).json(&body)))?;
+        Self::json_ok(resp)
+            .map(|_| ())
+            .map_err(|error| match error {
+                // No recursive DELETE fallback: the local folder can be empty
+                // while its remote children are still waiting to download.
+                HubError::NotFound => HubError::Other(
+                    "hub does not support safe empty-directory removal; update the server".into(),
+                ),
+                other => other,
+            })
     }
 
     // ── status ───────────────────────────────────────────────────────────────
