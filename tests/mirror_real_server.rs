@@ -40,6 +40,7 @@ fn mirror(root: &Path, url: &str) -> Arc<Mirror> {
 #[test]
 #[ignore = "requires Node and the sibling canvas-server dependencies"]
 fn real_server_daily_workflows_and_index_lifecycle() {
+    let _ = env_logger::try_init();
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -116,6 +117,7 @@ fn real_server_daily_workflows_and_index_lifecycle() {
     m.commit_write("Docs/empty.txt", b"").unwrap();
     m.commit_write("Docs/draft.txt", b"first draft").unwrap();
     m.cycle(false);
+    assert!(m.status().last_error.is_none(), "{:?}", m.status());
     assert_eq!(get("Docs/empty.txt"), b"");
     assert_eq!(get("Docs/draft.txt"), b"first draft");
     m.commit_write("editor.tmp", b"editor save").unwrap();
