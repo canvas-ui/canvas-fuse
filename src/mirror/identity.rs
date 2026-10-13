@@ -206,6 +206,81 @@ pub fn preflight(mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Locate the original ledger when switching between --server and --remote.
+/// Search only the standard per-mount paths; neither move history nor adopt a
+/// workspace/name match as proof of replica identity. Destination/open_store
+/// still validate the physical folder and binding under their locks afterward.
+pub(crate) fn find_data_dir(
+    mountpoint: &Path,
+    server: &str,
+    default: &Path,
+    canvas_home: &Path,
+) -> Result<PathBuf> {
+    let Some(marker) = read_marker(mountpoint)? else {
+        return Ok(default.to_path_buf());
+    };
+    anyhow::ensure!(
+        marker.format == "canvas-fuse-mirror"
+            && marker.version == 1
+            && marker.server == server_identity(server)?,
+        "{MARKER} does not match the requested server or supported mirror format"
+    );
+    let binding = serde_json::to_string(&marker)?;
+    let mount_name = default
+        .file_name()
+        .context("invalid mirror state directory")?;
+    let mut candidates = vec![default.to_path_buf()];
+    for remote in child_directories(canvas_home)? {
+        for workspace in child_directories(&remote.join("fuse/workspaces"))? {
+            candidates.push(workspace.join("mounts").join(mount_name));
+        }
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        if !super::store_path(&candidate).try_exists()? {
+            continue;
+        }
+        let candidate = std::fs::canonicalize(candidate)?;
+        if !visited.insert(candidate.clone()) {
+            continue;
+        }
+        if Store::replica_binding(&super::store_path(&candidate))?.as_deref() == Some(&binding) {
+            matches.push(candidate);
+        }
+    }
+    match matches.as_slice() {
+        [found] => Ok(found.clone()),
+        [] => anyhow::bail!(
+            "cannot find the original mirror sync history for {}; default state directory is {}. Use --data-dir to select the original directory containing mirror.redb. --accept-device-change requires the original marker/database pair; do not delete or edit either file",
+            mountpoint.display(), default.display()
+        ),
+        _ => anyhow::bail!(
+            "multiple state directories match this mirror; use --data-dir to select its original sync history: {}",
+            matches.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+fn child_directories(path: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("looking for mirror history in {}", path.display()))
+        }
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 /// Resolve an existing replica locally, before any network request. The cache
 /// supplies only a display name: the marker is authoritative for server and UUID,
 /// and Destination still verifies the physical directories and bound ledger.

@@ -208,6 +208,11 @@ What the daemon does:
   existing persistent identity mismatch. Subsequent remounts need no flag.
   Do not delete or edit `.workspace.json` or reset the sync database to work
   around an identity error.
+- **Startup progress (0.13.7+).** Preparation logs each phase and, while waiting,
+  reports elapsed time, files checked and bytes read every five seconds. The
+  initial scan checks for offline changes before mounting; a device-number
+  change invalidates saved file fingerprints and can require hashing the local
+  files again. These messages also go to the daemon log with `--detach`.
 - **Full local mirror.** The first mount lists the hub and downloads
   everything (verified by digest, written atomically next to its target).
   Remote changes land in the folder within a second on a socket nudge
@@ -309,11 +314,18 @@ without waiting for `--poll`.
 `~/.canvas/device.json` (canvas-cli) or a stable hash of hostname + user;
 it is sent as `X-Canvas-Origin` so the mirror recognizes its own echoes.
 State lives in the mount's data dir
-(`~/.canvas/<remote>/fuse/workspaces/<ws>/mounts/<mount-path>.<hash>/`
+(`~/.canvas/<server-host>/fuse/workspaces/<ws>/mounts/<mount-path>.<hash>/`
 or `--data-dir`): `mirror.redb` (index, base ledger, cursor, jobs,
 conflicts, trash records), `trash/` and `conflicts/`. The bytes themselves
 are only ever in `Home/`. Hub document ids are never stored — keys and
 digests are the identity.
+
+Starting with 0.13.7, switching between `--server` and `--remote` reuses the
+same mirror history. Older state directories under a remote alias are located
+by their exact `.workspace.json` binding and reused in place, including their
+queued work, trash and workspace-name cache. Missing or ambiguous history
+requires an explicit `--data-dir`; it is never silently replaced. If you use
+a custom `--data-dir`, keep supplying it on every mount.
 
 **Server recovery is separate from the mirror trash.** With the server's
 default `CANVAS_RETENTION_DAYS=30`, displaced local-backend bytes are retained

@@ -187,9 +187,21 @@ impl Mirror {
     }
 
     pub fn open(cfg: MirrorConfig) -> Result<Arc<Self>> {
+        let progress = super::startup::StartupProgress::start()?;
+        let mirror = Self::open_with_progress(cfg, &progress)?;
+        progress.finish();
+        Ok(mirror)
+    }
+
+    pub(crate) fn open_with_progress(
+        cfg: MirrorConfig,
+        progress: &super::startup::StartupProgress,
+    ) -> Result<Arc<Self>> {
         // No scan, migration or queued mutation until both the physical
         // destination and its database have proved their local replica ID.
         let destination = super::identity::Destination::prepare(&cfg)?;
+        progress.phase("opening and validating mirror sync history");
+        log::info!("mirror state directory: {}", cfg.data_dir.display());
         std::fs::create_dir_all(&cfg.data_dir)
             .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
         let store = Arc::new(destination.open_store(&cfg.data_dir)?);
@@ -223,6 +235,7 @@ impl Mirror {
         }
         patterns.extend(cfg.opts.ignore.iter().cloned());
         if let Some(legacy) = store.take_legacy() {
+            progress.phase("upgrading legacy local mirror state");
             migrate_legacy(
                 &store,
                 &local,
@@ -264,6 +277,7 @@ impl Mirror {
         // startup cannot fall between scanning and starting observation.
         let changes = mirror.local_changes.clone();
         let engine_tx = mirror.engine_tx.clone();
+        progress.phase("installing local directory watches");
         *mirror.watcher.lock() = Some(super::watch::Watcher::start(
             mirror.local.clone(),
             mirror.ignore.clone(),
@@ -286,7 +300,8 @@ impl Mirror {
         // What happened to the folder while no daemon was looking is the
         // first thing to know — before the view is built, before the hub
         // is asked anything.
-        let report = mirror.scan_local();
+        let report =
+            mirror.scan_paths_reporting(&[String::new()], JobPriority::Discovered, Some(progress));
         if report != ScanReport::default() {
             log::info!(
                 "mirror: folder scan found {} new, {} changed, {} removed since the last run",
@@ -1109,6 +1124,15 @@ impl Mirror {
     }
 
     fn scan_paths(&self, paths: &[String], priority: JobPriority) -> ScanReport {
+        self.scan_paths_reporting(paths, priority, None)
+    }
+
+    fn scan_paths_reporting(
+        &self,
+        paths: &[String],
+        priority: JobPriority,
+        progress: Option<&super::startup::StartupProgress>,
+    ) -> ScanReport {
         if let Err(e) = self.destination.verify() {
             log::error!("mirror: refusing folder scan: {e:#}");
             self.set_error(Some(format!("{e:#}")));
@@ -1124,7 +1148,16 @@ impl Mirror {
                 .iter()
                 .any(|p| p.is_empty() || super::store::under(key, p))
         };
-        for (key, st) in paths.iter().flat_map(|p| self.local.walk_from(p)) {
+        for (key, st) in paths.iter().flat_map(|p| {
+            if let Some(progress) = progress {
+                progress.phase("discovering local files and directories");
+            }
+            let files = self.local.walk_from(p);
+            if let Some(progress) = progress {
+                progress.phase("checking local files for offline changes");
+            }
+            files
+        }) {
             let guard = self.directory_moves.lock();
             if self.directory_epoch.load(Ordering::Relaxed) != epoch {
                 return report;
@@ -1141,6 +1174,9 @@ impl Mirror {
                     }
                 }
                 continue;
+            }
+            if let Some(progress) = progress {
+                progress.checked();
             }
             seen_files.insert(key.clone());
             if self.pending_directory_move(&key) {
@@ -1162,7 +1198,14 @@ impl Mirror {
                 continue;
             }
             drop(guard);
-            let Ok(h) = self.local.hash(&key) else {
+            if let Some(progress) = progress {
+                progress.hashing();
+            }
+            let Ok(h) = self.local.hash_with_progress(&key, |bytes| {
+                if let Some(progress) = progress {
+                    progress.read(bytes);
+                }
+            }) else {
                 continue;
             };
             let _guard = self.directory_moves.lock();
@@ -1223,6 +1266,9 @@ impl Mirror {
         let _guard = self.directory_moves.lock();
         if self.directory_epoch.load(Ordering::Relaxed) != epoch {
             return report;
+        }
+        if let Some(progress) = progress {
+            progress.phase("checking for locally removed files and directories");
         }
         for (key, e) in self.store.entries("") {
             if !affected(&key)

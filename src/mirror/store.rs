@@ -299,6 +299,21 @@ fn dec<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
 }
 
 impl Store {
+    /// Inspect an existing ledger without creating tables or running migrations.
+    /// Database::open also holds redb's exclusive lock during this read.
+    pub(super) fn replica_binding(path: &Path) -> Result<Option<String>> {
+        let db = Database::open(path)
+            .with_context(|| format!("inspecting mirror history {}", path.display()))?;
+        let tx = db.begin_read()?;
+        if !tx.list_tables()?.any(|table| table.name() == META.name()) {
+            return Ok(None);
+        }
+        let table = tx.open_table(META)?;
+        Ok(table
+            .get(super::identity::META_BINDING)?
+            .map(|v| v.value().to_string()))
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_inner(path, None)
     }
@@ -358,6 +373,9 @@ impl Store {
                 Some(stored) => anyhow::ensure!(stored == binding.directories,
                     "mirror directory identity changed: filesystem, inode or creation time differs from the bound replica; refusing to reuse sync history"),
                 None => {
+                    anyhow::ensure!(binding.legacy_matches || stored.as_deref() == Some(binding.marker),
+                        "cannot accept mirror device-number change without the original marker/database pair: {} has no matching replica binding. Select the original state directory with --data-dir; --accept-device-change cannot create replacement sync history. Do not delete or edit the marker or database",
+                        path.display());
                     anyhow::ensure!(binding.legacy_matches
                         || (binding.accept_device_change && stored.as_deref() == Some(binding.marker)),
                         "mirror device number changed, but this older replica has no persistent filesystem identity yet. If this is the original folder after a reboot or disk remount (not a copy or replacement), mount once with --accept-device-change. The original marker/database pair and both directory inodes must still match; do not delete or edit the marker or database");

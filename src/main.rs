@@ -556,10 +556,47 @@ fn cmd_mount(
         .with_context(|| format!("creating mountpoint {}", mountpoint.display()))?;
     let mountpoint = mountpoint.canonicalize()?;
 
+    // Refuse before inspecting ledgers: a live mount covers the marker and
+    // already owns its database lock.
+    if let Some(state) = runtime::read_state(&mountpoint) {
+        if runtime::pid_alive(state.pid) && runtime::is_mounted(&mountpoint) {
+            anyhow::bail!(
+                "{} is already mounted by pid {} (canvas-fuse unmount first)",
+                mountpoint.display(),
+                state.pid
+            );
+        }
+    }
+    if mirror.is_some() {
+        eprintln!(
+            "preparing local mirror at {}; locating sync history",
+            mountpoint.display()
+        );
+        // Discovery must see the real marker under a crashed FUSE mount.
+        // The live-daemon check above has already ruled out an active mount.
+        if runtime::is_mounted(&mountpoint) {
+            let output = std::process::Command::new("fusermount3")
+                .arg("-uz")
+                .arg(&mountpoint)
+                .output()
+                .context("clearing stale mirror mount before locating sync history")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "cannot clear stale mirror mount {}: {}",
+                mountpoint.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
     // Per-mount state dir (own sticky-name redb). Explicit --data-dir wins;
-    // otherwise derive from remote + context so concurrent mounts don't share
-    // (and lock) one redb. Remote label: --remote name, else the server host.
-    let data_dir = data_dir.unwrap_or_else(|| {
+    // mirrors reuse the exact replica binding regardless of auth alias. Live
+    // views retain their historical remote/context-based state paths.
+    let data_dir = if let Some(data_dir) = data_dir {
+        data_dir
+    } else if let Some(ws) = workspace_mount.as_deref().filter(|_| mirror.is_some()) {
+        runtime::mirror_data_dir(&endpoint.server, ws, &mountpoint)?
+    } else {
         let remote_label = connect.remote.clone().unwrap_or_else(|| {
             endpoint
                 .server
@@ -572,24 +609,13 @@ fn cmd_mount(
                 .to_string()
         });
         match &workspace_mount {
-            Some(ws) if mirror.is_some() || selection.is_explicit() => {
+            Some(ws) if selection.is_explicit() => {
                 runtime::workspace_mount_data_dir(&remote_label, ws, &mountpoint)
             }
             Some(ws) => runtime::workspace_data_dir(&remote_label, ws),
             None => runtime::mount_data_dir(&remote_label, &contexts, &mountpoint),
         }
-    });
-
-    // Refuse to steal a mountpoint from a live daemon
-    if let Some(state) = runtime::read_state(&mountpoint) {
-        if runtime::pid_alive(state.pid) && runtime::is_mounted(&mountpoint) {
-            anyhow::bail!(
-                "{} is already mounted by pid {} (canvas-fuse unmount first)",
-                mountpoint.display(),
-                state.pid
-            );
-        }
-    }
+    };
 
     // Pre-flight while we can still report to the terminal
     if mirror.is_some() && !runtime::is_mounted(&mountpoint) {

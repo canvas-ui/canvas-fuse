@@ -240,6 +240,14 @@ impl Local {
 
     /// Digest + stat of the file as it is on disk now.
     pub fn hash(&self, key: &str) -> std::io::Result<Hashed> {
+        self.hash_with_progress(key, |_| {})
+    }
+
+    pub(super) fn hash_with_progress(
+        &self,
+        key: &str,
+        mut progress: impl FnMut(usize),
+    ) -> std::io::Result<Hashed> {
         let path = self.path(key);
         let mut f = std::fs::File::open(&path)?;
         let m = f.metadata()?;
@@ -251,6 +259,7 @@ impl Local {
                 break;
             }
             hasher.update(&buf[..n]);
+            progress(n);
         }
         Ok(Hashed {
             sha256: super::hex(&hasher.finalize()),

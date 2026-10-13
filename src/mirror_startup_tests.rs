@@ -72,6 +72,218 @@ fn simulate_legacy_reboot(opts: &MountOptions) -> String {
     original_marker
 }
 
+fn standard_state_dir(root: &std::path::Path, remote: &str) -> std::path::PathBuf {
+    root.join(".canvas")
+        .join(remote)
+        .join("fuse/workspaces/Augmentd/mounts/local-replica")
+}
+
+#[test]
+fn remote_alias_changes_reuse_original_history_and_cache_offline() {
+    for original_remote in ["canvas.example", "alice@canvas.example"] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = "http://127.0.0.1:9";
+        let mut opts = old_named_replica(dir.path(), server);
+        let original = standard_state_dir(dir.path(), original_remote);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::rename(&opts.data_dir, &original).unwrap();
+        opts.data_dir = original.clone();
+        mirror::identity::cache_workspace(
+            &original,
+            "Augmentd",
+            &api::WorkspaceInfo {
+                id: "ws1".into(),
+                name: "Augmentd".into(),
+            },
+        )
+        .unwrap();
+        std::fs::write(original.join("trash/retained.txt"), b"keep recovery bytes").unwrap();
+        let marker = simulate_legacy_reboot(&opts);
+        let store = Store::open(&original.join("mirror.redb")).unwrap();
+        let jobs = store.jobs();
+        drop(store);
+
+        // Reproduce the empty database left by a failed mount using the other
+        // spelling. Merely preferring a directory that exists would be wrong.
+        let other = standard_state_dir(
+            dir.path(),
+            if original_remote == "canvas.example" {
+                "alice@canvas.example"
+            } else {
+                "canvas.example"
+            },
+        );
+        std::fs::create_dir_all(&other).unwrap();
+        drop(redb::Database::create(other.join("mirror.redb")).unwrap());
+
+        let default = standard_state_dir(dir.path(), "canvas.example");
+        opts.data_dir = mirror::identity::find_data_dir(
+            &opts.mountpoint,
+            server,
+            &default,
+            &dir.path().join(".canvas"),
+        )
+        .unwrap();
+        assert_eq!(opts.data_dir, original);
+        let store = Store::open(&original.join("mirror.redb")).unwrap();
+        assert_eq!(store.jobs(), jobs, "discovery must not scan or alter jobs");
+        assert!(store.meta("local-replica-directories").is_none());
+        drop(store);
+        opts.mirror.as_mut().unwrap().accept_device_change = true;
+        let mut mounted = false;
+        let result = mount_with_session(opts, |fs, _| {
+            mounted = true;
+            assert!(fs.test_tree().read().ws_id().is_some());
+            anyhow::bail!("test stops at kernel boundary")
+        });
+        assert!(mounted, "{:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Augmentd/.workspace.json")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            std::fs::read(original.join("trash/retained.txt")).unwrap(),
+            b"keep recovery bytes"
+        );
+        let store = Store::open(&original.join("mirror.redb")).unwrap();
+        assert!(store.meta("local-replica-directories").is_some());
+        assert!(jobs.iter().all(|job| store.jobs().contains(job)));
+        assert_eq!(store.entry("flight.txt").unwrap().state, EntryState::Dirty);
+        drop(store);
+        // Selection still uses the same migrated history on later remounts.
+        assert_eq!(
+            mirror::identity::find_data_dir(
+                &dir.path().join("Augmentd"),
+                server,
+                &default,
+                &dir.path().join(".canvas"),
+            )
+            .unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
+fn history_discovery_refuses_missing_duplicate_mismatched_and_unreadable_ledgers() {
+    for failure in [
+        "missing",
+        "duplicate",
+        "wrong-binding",
+        "corrupt",
+        "locked",
+        "wrong-server",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = "http://127.0.0.1:9";
+        let opts = old_named_replica(dir.path(), server);
+        let default = standard_state_dir(dir.path(), "canvas.example");
+        std::fs::create_dir_all(&default).unwrap();
+        if failure != "missing" {
+            std::fs::copy(
+                opts.data_dir.join("mirror.redb"),
+                default.join("mirror.redb"),
+            )
+            .unwrap();
+        }
+        let held = if failure == "locked" {
+            Some(Store::open(&default.join("mirror.redb")).unwrap())
+        } else {
+            None
+        };
+        match failure {
+            "duplicate" => {
+                let duplicate = standard_state_dir(dir.path(), "alice@canvas.example");
+                std::fs::create_dir_all(&duplicate).unwrap();
+                std::fs::copy(default.join("mirror.redb"), duplicate.join("mirror.redb")).unwrap();
+            }
+            "wrong-binding" => {
+                let store = Store::open(&default.join("mirror.redb")).unwrap();
+                store
+                    .set_meta("local-replica-binding", "another replica")
+                    .unwrap();
+            }
+            "corrupt" => std::fs::write(default.join("mirror.redb"), b"broken database").unwrap(),
+            _ => {}
+        }
+        let result = mirror::identity::find_data_dir(
+            &opts.mountpoint,
+            if failure == "wrong-server" {
+                "http://another.example"
+            } else {
+                server
+            },
+            &default,
+            &dir.path().join(".canvas"),
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains(match failure {
+                "duplicate" => "multiple state directories",
+                "corrupt" | "locked" => "inspecting mirror history",
+                "wrong-server" => "does not match",
+                _ => "original mirror sync history",
+            }),
+            "{failure}: {message}"
+        );
+        drop(held);
+        assert!(!default.join("workspace.json").exists());
+        let original = Store::open(&opts.data_dir.join("mirror.redb")).unwrap();
+        assert_eq!(original.jobs().len(), 1);
+        assert!(original.entry("flight.txt").is_none());
+        if failure == "missing" {
+            assert!(!default.join("mirror.redb").exists());
+        }
+    }
+}
+
+#[test]
+fn history_discovery_leaves_fresh_mirrors_and_explicit_state_paths_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mountpoint = dir.path().join("Fresh");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let default = standard_state_dir(dir.path(), "canvas.example");
+    assert_eq!(
+        mirror::identity::find_data_dir(
+            &mountpoint,
+            "http://127.0.0.1:9",
+            &default,
+            &dir.path().join(".canvas"),
+        )
+        .unwrap(),
+        default
+    );
+    assert!(!default.exists());
+    // Library callers and explicit --data-dir keep their exact selection even
+    // when copies of history exist under the standard locations.
+    let opts = old_named_replica(dir.path(), "http://127.0.0.1:9");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::copy(
+        opts.data_dir.join("mirror.redb"),
+        default.join("mirror.redb"),
+    )
+    .unwrap();
+    mirror::identity::cache_workspace(
+        &opts.data_dir,
+        "Augmentd",
+        &api::WorkspaceInfo {
+            id: "ws1".into(),
+            name: "Augmentd".into(),
+        },
+    )
+    .unwrap();
+    let mut mounted = false;
+    let result = mount_with_session(opts, |_, _| {
+        mounted = true;
+        anyhow::bail!("test stops at kernel boundary")
+    });
+    assert!(mounted, "{:?}", result.err());
+    assert!(Store::open(&default.join("mirror.redb"))
+        .unwrap()
+        .entry("flight.txt")
+        .is_none());
+}
+
 #[test]
 fn legacy_name_cache_is_repaired_online_then_remounts_without_network() {
     for cache in [

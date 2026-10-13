@@ -98,6 +98,24 @@ pub fn workspace_mount_data_dir(remote: &str, workspace: &str, mountpoint: &Path
     )
 }
 
+/// Mirror history belongs to the local replica, not the authentication alias.
+/// Keep the historical host-based default and find older alias-based ledgers by
+/// their exact marker binding. Explicit --data-dir bypasses this discovery.
+pub fn mirror_data_dir(server: &str, workspace: &str, mountpoint: &Path) -> Result<PathBuf> {
+    let host = server
+        .rsplit("://")
+        .next()
+        .unwrap_or(server)
+        .split('/')
+        .next()
+        .unwrap_or("server");
+    let default = workspace_mount_data_dir(host, workspace, mountpoint);
+    let canvas_home = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".canvas");
+    crate::mirror::identity::find_data_dir(mountpoint, server, &default, &canvas_home)
+}
+
 fn state_file_for(mountpoint: &Path) -> PathBuf {
     // Readable prefix + short hash to avoid collisions after sanitizing
     let raw = mountpoint.to_string_lossy();

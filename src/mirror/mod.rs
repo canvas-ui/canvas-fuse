@@ -29,6 +29,7 @@ pub mod hub;
 pub mod identity;
 pub mod local;
 pub mod reconcile;
+pub(crate) mod startup;
 pub mod store;
 pub mod sync;
 mod watch;

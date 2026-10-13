@@ -163,6 +163,11 @@ fn mount_with_session(
     if opts.mirror.is_some() && (opts.workspace.is_none() || !opts.selection.includes_home()) {
         anyhow::bail!("mirror mode requires the workspace:home backend");
     }
+    let startup = opts
+        .mirror
+        .as_ref()
+        .map(|_| mirror::startup::StartupProgress::start())
+        .transpose()?;
     // Clear a stale mount left behind by a previous crash, then ensure the dir
     let _ = std::process::Command::new("fusermount3")
         .arg("-uz")
@@ -215,6 +220,9 @@ fn mount_with_session(
     // network or an expired login must never delay access to local files.
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
         let (ws, resumed_mirror) = if mirror_mode {
+            if let Some(progress) = &startup {
+                progress.phase("resolving mirror workspace identity");
+            }
             mirror::identity::resolve_workspace(
                 &opts.mountpoint,
                 &opts.data_dir,
@@ -275,20 +283,25 @@ fn mount_with_session(
             } else {
                 opts.mountpoint.join("Home")
             };
-            let m = mirror::sync::Mirror::open(mirror::sync::MirrorConfig {
-                data_dir: opts.data_dir.clone(),
-                home_dir: home_dir.clone(),
-                server: opts.server.clone(),
-                token: opts.token.clone(),
-                tls: opts.tls.clone(),
-                workspace_id: ws_id,
-                backend: mirror::DEFAULT_BACKEND.to_string(),
-                opts: mopts.clone(),
-                device,
-                mountpoint: opts.mountpoint.clone(),
-                status_path: Some(runtime::status_file_for(&opts.mountpoint)),
-            })?;
+            let progress = startup.as_ref().expect("mirror startup progress");
+            let m = mirror::sync::Mirror::open_with_progress(
+                mirror::sync::MirrorConfig {
+                    data_dir: opts.data_dir.clone(),
+                    home_dir: home_dir.clone(),
+                    server: opts.server.clone(),
+                    token: opts.token.clone(),
+                    tls: opts.tls.clone(),
+                    workspace_id: ws_id,
+                    backend: mirror::DEFAULT_BACKEND.to_string(),
+                    opts: mopts.clone(),
+                    device,
+                    mountpoint: opts.mountpoint.clone(),
+                    status_path: Some(runtime::status_file_for(&opts.mountpoint)),
+                },
+                progress,
+            )?;
             {
+                progress.phase("building the local filesystem view");
                 let mut t = tree.write();
                 t.set_home_mirrored(true);
                 m.snapshot_into(&mut t);
@@ -352,7 +365,13 @@ fn mount_with_session(
         api.clone(),
         mirror.clone(),
     );
+    if let Some(progress) = &startup {
+        progress.phase("mounting the local filesystem view");
+    }
     let session = start_session(fs, &opts.mountpoint)?;
+    if let Some(progress) = startup {
+        progress.finish();
+    }
     log::info!("mounted canvas at {}", opts.mountpoint.display());
 
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
