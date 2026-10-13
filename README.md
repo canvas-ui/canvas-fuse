@@ -356,6 +356,8 @@ Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
 | [`x86_64-unknown-linux-gnu`](../../releases/latest/download/canvas-fuse-x86_64-unknown-linux-gnu.tar.gz) | dynamic glibc |
 | [`aarch64-unknown-linux-gnu`](../../releases/latest/download/canvas-fuse-aarch64-unknown-linux-gnu.tar.gz) | dynamic glibc, arm64 |
 
+The release becomes Latest after all three builds and their archive checksums pass.
+
 ```sh
 curl -L https://github.com/canvas-ui/canvas-fuse/releases/latest/download/canvas-fuse-x86_64-unknown-linux-musl.tar.gz \
   | tar xz --strip-components=1 -C ~/.local/bin canvas-fuse-x86_64-unknown-linux-musl/canvas-fuse
