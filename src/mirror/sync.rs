@@ -42,6 +42,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "recovery.rs"]
+mod recovery;
+
 const LIST_PAGE: usize = 1000;
 const CHANGES_PAGE: usize = 1000;
 const TRASH_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
@@ -86,6 +89,11 @@ pub struct MirrorStatus {
     pub entries: u64,
     #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
+    pub protected: bool,
+    /// Historical observations available with `sync blocked`, not a replay queue.
+    #[serde(default)]
+    pub blocked: u64,
 }
 
 pub enum EngineMsg {
@@ -137,6 +145,7 @@ struct Runtime {
     /// Keys whose remote change was deferred because a write handle was
     /// open; re-checked against the hub on the next cycle.
     recheck: HashSet<String>,
+    protected_jobs: HashSet<u64>,
 }
 
 /// What a folder scan found and did.
@@ -165,6 +174,8 @@ pub struct Mirror {
     open_writes: Mutex<HashSet<String>>,
     directory_moves: ReentrantMutex<()>,
     directory_epoch: std::sync::atomic::AtomicU64,
+    /// Recovery pushes exclude background synchronization, but never local I/O.
+    cycle_gate: Mutex<()>,
     // Release destination locks after the database, local handles and watcher.
     destination: super::identity::Destination,
 }
@@ -180,6 +191,96 @@ fn backoff_ms(attempts: u32) -> u64 {
 }
 
 impl Mirror {
+    fn block_action(&self, action: &str, key: &str, to: Option<&str>, remote: Option<&str>) {
+        let record = super::protection::BlockedAction {
+            action: action.into(),
+            key: key.into(),
+            destination: to.map(str::to_string),
+            local_sha256: self.store.entry(key).map(|e| e.sha256),
+            remote_sha256: remote.map(str::to_string),
+            observed_at: super::now_ms(),
+        };
+        match self.store.record_blocked(&record) {
+            Ok(false) => {}
+            result => {
+                log::warn!(
+                    "protected: would {action}: {key}{}; left unchanged",
+                    to.map(|to| format!(" → {to}")).unwrap_or_default()
+                );
+                if let Err(e) = result {
+                    log::error!("cannot persist protected action: {e:#}");
+                }
+            }
+        }
+    }
+
+    fn protect_job(&self, job: &Job) -> Result<(), HubError> {
+        if !self.opts.protected {
+            return Ok(());
+        }
+        let action = match &job.kind {
+            JobKind::Delete { key, .. } => Some(("delete upstream file", key.as_str(), None)),
+            JobKind::Rmdir { key } => Some(("remove upstream directory", key.as_str(), None)),
+            JobKind::Rename { from, to } => {
+                Some(("rename upstream file", from.as_str(), Some(to.as_str())))
+            }
+            JobKind::RenameDir {
+                from,
+                to,
+                remote: true,
+                ..
+            } => Some((
+                "rename upstream directory",
+                from.as_str(),
+                Some(to.as_str()),
+            )),
+            JobKind::Conflict { key, .. } => Some((
+                "resolve conflict and replace local file",
+                key.as_str(),
+                None,
+            )),
+            _ => None,
+        };
+        if let Some((action, key, to)) = action {
+            self.block_action(action, key, to, None);
+            return Err(HubError::Protected(key.into()));
+        }
+        Ok(())
+    }
+
+    fn clear_obsolete_trash(&self, key: &str) {
+        if self.store.trashed(key).is_none() {
+            return;
+        }
+        if self.opts.protected {
+            self.block_action("discard retained trash copy", key, None, None);
+        } else {
+            let _ = self.store.remove_trashed(key);
+            self.local.trash_remove(key);
+        }
+    }
+
+    /// Additive downloads require a genuinely absent path. Local::stat skips
+    /// symlinks, so it cannot distinguish an empty slot from a link we must
+    /// preserve. Also refuse to create files through a symlinked parent.
+    fn protected_download_allowed(&self, key: &str) -> bool {
+        if super::local::check_key(key).is_err()
+            || !matches!(std::fs::symlink_metadata(self.local.path(key)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return false;
+        }
+        let mut parent = super::parent_key(key);
+        while !parent.is_empty() {
+            match std::fs::symlink_metadata(self.local.path(parent)) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return false,
+            }
+            parent = super::parent_key(parent);
+        }
+        true
+    }
+
     fn verify_destination(&self) -> Result<(), HubError> {
         self.destination
             .verify()
@@ -200,6 +301,9 @@ impl Mirror {
         // No scan, migration or queued mutation until both the physical
         // destination and its database have proved their local replica ID.
         let destination = super::identity::Destination::prepare(&cfg)?;
+        if cfg.opts.protected {
+            log::warn!("protected mirror: automatic deletes, overwrites and renames are deferred on both sides; local editing and additive sync remain enabled");
+        }
         progress.phase("opening and validating mirror sync history");
         log::info!("mirror state directory: {}", cfg.data_dir.display());
         std::fs::create_dir_all(&cfg.data_dir)
@@ -264,6 +368,7 @@ impl Mirror {
                 last_report: None,
                 skipped: HashMap::new(),
                 recheck: HashSet::new(),
+                protected_jobs: HashSet::new(),
             }),
             engine_tx: Arc::new(Mutex::new(None)),
             local_changes: Arc::new(Mutex::new(super::watch::Changes::default())),
@@ -272,6 +377,7 @@ impl Mirror {
             open_writes: Mutex::new(HashSet::new()),
             directory_moves: ReentrantMutex::new(()),
             directory_epoch: std::sync::atomic::AtomicU64::new(0),
+            cycle_gate: Mutex::new(()),
         });
         // Watches are live before the initial scan, so changes made during
         // startup cannot fall between scanning and starting observation.
@@ -525,10 +631,7 @@ impl Mirror {
         };
         self.store.put_entry(key, &entry)?;
         self.record_dirs_for(key);
-        if self.store.trashed(key).is_some() {
-            let _ = self.store.remove_trashed(key);
-            self.local.trash_remove(key);
-        }
+        self.clear_obsolete_trash(key);
         if self.is_ignored(key) {
             self.rt.lock().skipped.insert(
                 key.to_string(),
@@ -704,10 +807,7 @@ impl Mirror {
                 ..c
             })?;
         }
-        if self.store.trashed(to).is_some() {
-            let _ = self.store.remove_trashed(to);
-            self.local.trash_remove(to);
-        }
+        self.clear_obsolete_trash(to);
         let has_base = self.store.base(to).is_some();
         let may_be_uploaded =
             has_base || self.store.meta(&format!("upload-pending:{from}")).is_some();
@@ -913,6 +1013,25 @@ impl Mirror {
     fn recover_directory_moves(&self) -> Result<(), HubError> {
         let _guard = self.directory_moves.lock();
         for job in self.store.jobs() {
+            if self.opts.protected {
+                if let JobKind::RenameDir {
+                    from,
+                    to,
+                    local_applied: false,
+                    ..
+                } = &job.kind
+                {
+                    if self.local.is_dir(from) {
+                        self.block_action(
+                            "complete pending local directory rename",
+                            from,
+                            Some(to),
+                            None,
+                        );
+                        continue;
+                    }
+                }
+            }
             self.finish_directory_move(&job)
                 .map_err(|e| HubError::Other(e.to_string()))?;
         }
@@ -992,6 +1111,10 @@ impl Mirror {
     /// arrives as ordinary changes on the feed.
     pub fn conflict_resolved(&self, key: &str) {
         if let Some(c) = self.store.conflict(key) {
+            if self.opts.protected {
+                self.block_action("discard resolved conflict snapshot", key, None, None);
+                return;
+            }
             let _ = self.store.remove_conflict(key);
             self.local.conflict_remove(&c.local_sha256);
             log::info!("{key}: conflict resolved on the hub");
@@ -1024,6 +1147,8 @@ impl Mirror {
             last_error: rt.last_error.clone(),
             entries: self.store.entry_count(),
             device_id: self.device.id.clone(),
+            protected: self.opts.protected,
+            blocked: self.store.blocked_actions().len() as u64,
         }
     }
 
@@ -1244,10 +1369,7 @@ impl Mirror {
                 state: EntryState::Dirty,
             };
             let _ = self.store.put_entry(&key, &new);
-            if self.store.trashed(&key).is_some() {
-                let _ = self.store.remove_trashed(&key);
-                self.local.trash_remove(&key);
-            }
+            self.clear_obsolete_trash(&key);
             if self.is_ignored(&key) {
                 self.rt.lock().skipped.insert(
                     key.clone(),
@@ -1368,6 +1490,8 @@ impl Mirror {
     /// One pass: observe local changes, upload first, then catch up and report.
     /// Public so tests drive it without a thread.
     pub fn cycle(&self, full: bool) {
+        let _cycle = self.cycle_gate.lock();
+        self.rt.lock().protected_jobs.clear();
         let before = self.rt.lock().state;
         if before == SyncState::Paused && !full {
             return;
@@ -1417,6 +1541,9 @@ impl Mirror {
     }
 
     fn cycle_inner(&self, full: bool) -> Result<(), HubError> {
+        let resume_protected =
+            !self.opts.protected && self.store.meta(super::protection::RECHECK).is_some();
+        let full = full || resume_protected;
         self.verify_destination()?;
         self.recover_directory_moves()?;
         if full {
@@ -1451,6 +1578,9 @@ impl Mirror {
         self.drain_jobs(64)?;
         if self.store.meta("directory-refresh").as_deref() == Some("1") {
             self.rebuild_from_listing()?;
+        }
+        if resume_protected {
+            let _ = self.store.remove_meta(super::protection::RECHECK);
         }
         Ok(())
     }
@@ -1697,6 +1827,10 @@ impl Mirror {
     /// semantics), so it stays put and pushes as new.
     fn apply_remote_rename(&self, from: &str, to: &str, seq: u64) -> Result<(), HubError> {
         let _guard = self.directory_moves.lock();
+        if self.opts.protected && (self.local.exists(from) || self.store.entry(from).is_some()) {
+            self.block_action("rename local file", from, Some(to), None);
+            return Ok(());
+        }
         if self.pending_directory_move(from) || self.pending_directory_move(to) {
             return Ok(());
         }
@@ -1785,6 +1919,22 @@ impl Mirror {
             base.as_ref().map(|b| &b.sha256),
             remote.map(|r| &r.sha256)
         );
+        if self.opts.protected {
+            let blocked = match &action {
+                Action::TrashLocal => Some("trash local file"),
+                Action::Pull { .. } if !self.protected_download_allowed(key) => {
+                    Some("replace local file")
+                }
+                Action::Conflict { .. } => Some("resolve conflict and replace local file"),
+                Action::DeleteRemote { .. } => Some("delete upstream file"),
+                Action::Push { if_match: Some(_) } => Some("replace upstream file"),
+                _ => None,
+            };
+            if let Some(action) = blocked {
+                self.block_action(action, key, None, remote.map(|r| r.sha256.as_str()));
+                return Ok(());
+            }
+        }
         match action {
             Action::Nothing => {}
             Action::Push { if_match } => {
@@ -1792,6 +1942,7 @@ impl Mirror {
                     // Hub deleted it under us: the old base is void, push
                     // as a new object.
                     let _ = self.store.remove_base(key);
+                    self.rt.lock().protected_jobs.clear();
                 }
                 if let Some(mut e) = entry.clone() {
                     if e.state != EntryState::Dirty {
@@ -1898,6 +2049,10 @@ impl Mirror {
             return Ok(());
         }
         let stamp = self.local.stat(key);
+        if self.opts.protected && !self.protected_download_allowed(key) {
+            self.block_action("replace local file", key, None, Some(&r.sha256));
+            return Ok(());
+        }
         let epoch = self.directory_epoch.load(Ordering::Relaxed);
         drop(guard);
         let landing = || {
@@ -1907,6 +2062,7 @@ impl Mirror {
                 || self.store.entry(key) != expected
                 || self.is_open_for_write(key)
                 || self.pending_path_move(key)
+                || (self.opts.protected && !self.protected_download_allowed(key))
             {
                 return Err(HubError::LocalChanged(key.into()));
             }
@@ -1947,10 +2103,7 @@ impl Mirror {
             },
         );
         self.record_dirs_for(key);
-        if self.store.trashed(key).is_some() {
-            let _ = self.store.remove_trashed(key);
-            self.local.trash_remove(key);
-        }
+        self.clear_obsolete_trash(key);
         let _ = self.store.remove_jobs_for(key);
         self.view_upsert(key, h.size, h.mtime);
         Ok(())
@@ -2127,6 +2280,7 @@ impl Mirror {
                     job = prior;
                 }
                 if job.not_before > now
+                    || self.rt.lock().protected_jobs.contains(&job.seq)
                     || job
                         .kind
                         .keys()
@@ -2143,10 +2297,12 @@ impl Mirror {
             };
             // Creating an empty folder does not invalidate the listing of
             // existing remote children under that name.
-            if !matches!(job.kind, JobKind::Mkdir { .. } | JobKind::Rmdir { .. }) {
+            self.run_one(&job)?;
+            if !self.rt.lock().protected_jobs.contains(&job.seq)
+                && !matches!(job.kind, JobKind::Mkdir { .. } | JobKind::Rmdir { .. })
+            {
                 touched.extend(job.kind.keys().into_iter().map(str::to_string));
             }
-            self.run_one(&job)?;
         }
         Ok(touched)
     }
@@ -2169,7 +2325,7 @@ impl Mirror {
             return Ok(());
         }
         drop(_move_guard);
-        let result = self.run_job(job);
+        let result = self.protect_job(job).and_then(|()| self.run_job(job));
         let _move_guard = self.directory_moves.lock();
         if !self
             .store
@@ -2180,6 +2336,9 @@ impl Mirror {
             return result;
         }
         match result {
+            Err(HubError::Protected(_)) => {
+                self.rt.lock().protected_jobs.insert(job.seq);
+            }
             Ok(()) => {
                 let _ = self.store.remove_job(job.seq);
                 drop(_move_guard);
@@ -2306,6 +2465,18 @@ impl Mirror {
         }
         let base = self.store.base(key);
         let epoch = self.directory_epoch.load(Ordering::Relaxed);
+        // Known local edits can be deferred without copying/hashing large
+        // files into upload staging on every poll. Check again after snapshot
+        // preparation below in case the file changes outside the mount.
+        if self.opts.protected && base.as_ref().is_some_and(|b| b.sha256 != entry.sha256) {
+            self.block_action(
+                "replace upstream file",
+                key,
+                None,
+                base.as_ref().map(|b| b.sha256.as_str()),
+            );
+            return Err(HubError::Protected(key.into()));
+        }
         drop(guard);
         // Hash/copy on the engine thread, without blocking local operations.
         let snapshot = self
@@ -2329,6 +2500,15 @@ impl Mirror {
             mtime: snapshot.hashed.mtime,
             state: EntryState::Dirty,
         };
+        if self.opts.protected && base.as_ref().is_some_and(|b| b.sha256 != entry.sha256) {
+            self.block_action(
+                "replace upstream file",
+                key,
+                None,
+                base.as_ref().map(|b| b.sha256.as_str()),
+            );
+            return Err(HubError::Protected(key.into()));
+        }
         self.store
             .put_entry(key, &entry)
             .map_err(|e| HubError::Other(e.to_string()))?;
@@ -2388,6 +2568,16 @@ impl Mirror {
             }
             Err(HubError::PreconditionFailed { current }) => {
                 drop(guard);
+                if self.opts.protected && current.as_ref().is_some_and(|r| r.sha256 != entry.sha256)
+                {
+                    self.block_action(
+                        "replace upstream file",
+                        key,
+                        None,
+                        current.as_ref().map(|r| r.sha256.as_str()),
+                    );
+                    return Err(HubError::Protected(key.into()));
+                }
                 // A queued move will refresh its destination after it commits.
                 if landed_key != key {
                     return Err(HubError::PreconditionFailed { current });
@@ -2657,6 +2847,10 @@ impl Mirror {
         let now = super::now_ms();
         for (key, t) in self.store.trash() {
             if now.saturating_sub(t.ts) > TRASH_TTL_MS {
+                if self.opts.protected {
+                    self.block_action("expire local trash copy", &key, None, None);
+                    continue;
+                }
                 let _ = self.store.remove_trashed(&key);
                 self.local.trash_remove(&key);
             }
@@ -2686,6 +2880,10 @@ impl Mirror {
                     })
                     .unwrap_or(0);
                 if old > TRASH_TTL_MS {
+                    if self.opts.protected {
+                        self.block_action("expire conflict snapshot", &name, None, None);
+                        continue;
+                    }
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

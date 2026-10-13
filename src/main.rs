@@ -164,6 +164,10 @@ enum Command {
         #[arg(long, requires = "mirror")]
         accept_device_change: bool,
 
+        /// Log and defer sync deletions, overwrites and renames on both sides
+        #[arg(long, requires = "mirror")]
+        protected: bool,
+
         /// Accepted for older configs; the mirror keeps every file, so
         /// there is nothing to pin.
         #[arg(long = "pin", value_name = "GLOB", requires = "mirror", hide = true)]
@@ -256,6 +260,21 @@ enum SyncCommand {
         /// Mountpoint of a --mirror mount
         mountpoint: PathBuf,
     },
+    /// Recover upstream files from local contents; keep remote-only files (--protected mount)
+    Push {
+        mountpoint: PathBuf,
+        /// Preview uploads and replacements without changing files or sync history
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recorded destructive actions deferred by --protected
+    Blocked {
+        mountpoint: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -312,6 +331,7 @@ fn main() -> Result<()> {
             blob_cache_mb,
             mirror,
             accept_device_change,
+            protected,
             pins,
             cache_budget_mb,
             conflicts,
@@ -348,6 +368,7 @@ fn main() -> Result<()> {
                 );
             }
             let mirror_opts = mirror.then_some(MirrorOptions {
+                protected,
                 accept_device_change,
                 conflicts: match conflicts {
                     ConflictsArg::Prompt => ConflictMode::Prompt,
@@ -380,6 +401,17 @@ fn main() -> Result<()> {
         Command::Sync {
             what: SyncCommand::Now { mountpoint },
         } => cmd_sync_now(&mountpoint),
+        Command::Sync {
+            what:
+                SyncCommand::Push {
+                    mountpoint,
+                    dry_run,
+                    json,
+                },
+        } => cmd_sync_push(&mountpoint, dry_run, json),
+        Command::Sync {
+            what: SyncCommand::Blocked { mountpoint, json },
+        } => cmd_sync_blocked(&mountpoint, json),
         Command::Conflicts { mountpoint, json } => cmd_conflicts(&mountpoint, json),
         Command::Trash { what } => match what {
             TrashCommand::List { mountpoint, json } => cmd_trash_list(&mountpoint, json),
@@ -823,7 +855,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
         if s.mirror {
             match runtime::read_mirror_status(&s.mountpoint) {
                 Some(m) => println!(
-                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}{}",
+                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}  protected {}  recorded blocks {}{}",
                     m.state,
                     m.cursor.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     m.head.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
@@ -833,6 +865,8 @@ fn cmd_status(as_json: bool) -> Result<()> {
                     m.skipped,
                     m.entries,
                     m.home,
+                    m.protected,
+                    m.blocked,
                     m.last_error.as_ref().map(|e| format!("  error: {e}")).unwrap_or_default(),
                 ),
                 None => println!("          mirror: (no status yet)"),
@@ -872,7 +906,7 @@ fn cmd_sync_now(mountpoint: &Path) -> Result<()> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     println!(
-        "{}: state {}, cursor {}, pending {}, conflicts {}{}",
+        "{}: state {}, cursor {}, pending {}, conflicts {}, protected {}, recorded blocks {}{}",
         if finished {
             "synced"
         } else {
@@ -884,11 +918,83 @@ fn cmd_sync_now(mountpoint: &Path) -> Result<()> {
             .unwrap_or_else(|| "-".into()),
         m.get("pending").and_then(Value::as_u64).unwrap_or(0),
         m.get("conflicts").and_then(Value::as_u64).unwrap_or(0),
+        m.get("protected").and_then(Value::as_bool).unwrap_or(false),
+        m.get("blocked").and_then(Value::as_u64).unwrap_or(0),
         m.get("lastError")
             .and_then(Value::as_str)
             .map(|e| format!(" (last error: {e})"))
             .unwrap_or_default()
     );
+    Ok(())
+}
+
+fn cmd_sync_push(mountpoint: &Path, dry_run: bool, as_json: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    if !as_json {
+        eprintln!(
+            "{} local files; progress is written to the mount's log",
+            if dry_run {
+                "previewing recovery from"
+            } else {
+                "recovering upstream from"
+            }
+        );
+    }
+    let resp = control::request(&sock, &json!({"cmd": "push", "dryRun": dry_run}))?;
+    let report: canvas_fuse::mirror::protection::PushReport =
+        serde_json::from_value(resp["report"].clone())?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for item in &report.items {
+            println!(
+                "{}{}: {}{}",
+                if dry_run { "would " } else { "" },
+                item.action,
+                item.key,
+                item.detail
+                    .as_ref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            );
+        }
+        println!("{}: {} create, {} replace, {} unchanged, {} skipped, {} failed; remote-only files kept",
+            if dry_run { "preview" } else { "recovery push" }, report.created, report.replaced, report.unchanged, report.skipped, report.failed);
+    }
+    anyhow::ensure!(
+        report.failed == 0,
+        "recovery {} encountered {} failed files; inspect the report before retrying",
+        if dry_run { "preview" } else { "push" },
+        report.failed
+    );
+    Ok(())
+}
+
+fn cmd_sync_blocked(mountpoint: &Path, as_json: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({"cmd": "blocked"}))?;
+    let records: Vec<canvas_fuse::mirror::protection::BlockedAction> =
+        serde_json::from_value(resp["actions"].clone())?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&records)?);
+    } else {
+        for action in &records {
+            println!(
+                "would {}: {}{}",
+                action.action,
+                action.key,
+                action
+                    .destination
+                    .as_ref()
+                    .map(|to| format!(" → {to}"))
+                    .unwrap_or_default()
+            );
+        }
+        println!(
+            "{} recorded blocks (history, not queued commands)",
+            records.len()
+        );
+    }
     Ok(())
 }
 
@@ -1055,6 +1161,50 @@ fn cmd_contexts(connect: ConnectArgs, as_json: bool) -> Result<()> {
 mod root_selector_tests {
     use super::{resolve_root, Cli};
     use clap::Parser;
+
+    #[test]
+    fn protected_mount_and_recovery_commands_parse_explicitly() {
+        assert!(Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "--workspace",
+            "ws",
+            "--protected",
+            "/tmp/mirror"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "canvas-fuse",
+            "mount",
+            "--workspace",
+            "ws",
+            "--mirror",
+            "--protected",
+            "/tmp/mirror",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Command::Mount {
+                protected: true,
+                ..
+            }
+        ));
+        for dry_run in [true, false] {
+            let mut args = vec!["canvas-fuse", "sync", "push", "/tmp/mirror", "--json"];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(cli.command, super::Command::Sync { what: super::SyncCommand::Push { dry_run: value, json: true, .. } } if value == dry_run)
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["canvas-fuse", "sync", "blocked", "/tmp/mirror", "--json"])
+                .is_ok()
+        );
+    }
 
     #[test]
     fn accepting_a_legacy_device_change_requires_mirror_mode() {

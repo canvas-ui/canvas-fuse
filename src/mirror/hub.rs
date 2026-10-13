@@ -130,6 +130,8 @@ pub enum HubError {
     Other(String),
     /// The user changed the destination while a background download ran.
     LocalChanged(String),
+    /// Protected mode deferred this job without executing or acknowledging it.
+    Protected(String),
 }
 
 impl std::fmt::Display for HubError {
@@ -158,6 +160,7 @@ impl std::fmt::Display for HubError {
             HubError::Retryable { status, message } => write!(f, "HTTP {status}: {message}"),
             HubError::Other(m) => write!(f, "{m}"),
             HubError::LocalChanged(key) => write!(f, "{key}: changed locally during download"),
+            HubError::Protected(key) => write!(f, "{key}: deferred by protected mirror mode"),
         }
     }
 }

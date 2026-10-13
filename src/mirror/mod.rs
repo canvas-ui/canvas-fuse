@@ -28,6 +28,7 @@ pub mod control;
 pub mod hub;
 pub mod identity;
 pub mod local;
+pub mod protection;
 pub mod reconcile;
 pub(crate) mod startup;
 pub mod store;
@@ -80,6 +81,8 @@ pub fn operation_id() -> anyhow::Result<String> {
 
 #[derive(Debug, Clone)]
 pub struct MirrorOptions {
+    /// Allow additive sync, but only report destructive automatic actions.
+    pub protected: bool,
     /// One-time migration of an older replica after device renumbering. Never
     /// overrides inode, marker/ledger or existing persistent identity checks.
     pub accept_device_change: bool,
@@ -92,6 +95,7 @@ pub struct MirrorOptions {
 impl Default for MirrorOptions {
     fn default() -> Self {
         Self {
+            protected: false,
             accept_device_change: false,
             conflicts: ConflictMode::default(),
             deletes: DeleteMode::Propagate,

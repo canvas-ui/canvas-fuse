@@ -302,6 +302,57 @@ What the daemon does:
   <glob>`s. Such files stay in the folder and count as `skipped` in the
   status.
 
+**Protected sync and recovery (0.14.0+).** Add `--protected` to a `--mirror`
+mount when upstream automation or local changes need review. New files can
+still transfer in either direction, and direct local edits keep working.
+Automatic file replacements, deletions (including moves to trash), file and
+directory renames, conflict resolution, and expiry of retained trash/conflict
+bytes are deferred. This includes destructive jobs queued before the mount
+started. Protection covers mirror synchronization of Home; it does not make
+the filesystem read-only or restrict your explicit local edits or virtual-tree
+operations.
+
+Every blocked action is logged and recorded in the local sync database.
+Inspect the durable audit with:
+
+```sh
+canvas-fuse sync now ~/Canvas/Workspaces/Universe
+canvas-fuse sync blocked ~/Canvas/Workspaces/Universe
+canvas-fuse sync blocked ~/Canvas/Workspaces/Universe --json
+```
+
+`status` also shows whether protection is active and the number of recorded
+blocks. The audit is history, not a list of executable commands: old records
+remain visible after a problem is repaired. Repeated identical observations
+do not generate repeated log entries. Supply `--protected` on every mount
+while investigating; remounting without it resumes ordinary synchronization
+after checking current state afresh, rather than replaying blocked observations.
+
+To recover upstream from the local files, use a protected mount and preview:
+
+```sh
+canvas-fuse sync push ~/Canvas/Workspaces/Universe --dry-run
+canvas-fuse sync push ~/Canvas/Workspaces/Universe
+```
+
+Both commands support `--json`. Recovery uploads missing files and replaces
+different upstream contents at the same paths with local contents. Remote-only
+files remain untouched, including those named by pending delete/rename jobs.
+Only files currently in the local Home folder participate; empty directories,
+trash, conflict snapshots, symlinks and excluded files are not uploaded.
+Restore desired trash items explicitly before recovery.
+
+The preview reads local contents and remote metadata without uploading,
+downloading or changing sync history. During recovery the daemon suspends
+ordinary background sync while local editing stays available. Each upload
+uses an immutable snapshot and a precondition against the freshly observed
+upstream version; a concurrent upstream change is reported as a failure for
+review instead of being overwritten blindly. Newer local edits remain pending.
+The command prints per-file results, returns nonzero for failed files, and
+stops further uploads if connectivity or authentication is lost. Progress goes
+to the mount's log. After completion the mount remains protected, including
+its deferred delete and rename jobs.
+
 **Offline.** The mount stays up (it also *mounts* without the hub, once it
 has seen the workspace once), and every file reads and writes normally —
 there is no cache to miss. Reconnect (socket re-auth, the poll, or
@@ -512,6 +563,7 @@ for `unmount` and `sync` commands.
 | `--data-dir <path>` | `~/.canvas/<remote>/fuse/…` | Per-mount state directory (sticky filename map). Also `CANVAS_FUSE_DATA_DIR`. |
 | `--blob-cache-mb <n>` | 256 | In-memory cache budget for file content. |
 | `--mirror` | false | Keep `Home/` as a real folder mirrored with the hub (see [Mirror mode](#mirror-mode---mirror)). |
+| `--protected` | false | Mirror: log and defer automatic deletes, overwrites, renames and retention cleanup on both sides; additive sync and local editing continue. |
 | `--conflicts prompt\|rename` | rename | Mirror: inbox (hub keeps the name) or Dropbox-style conflict copy. |
 | `--deletes propagate\|keep` | propagate | Mirror: whether a local `rm` deletes on the hub. |
 | `--ignore <glob>` | - | Mirror: never upload matching keys; repeatable. |

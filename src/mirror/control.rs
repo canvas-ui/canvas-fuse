@@ -9,7 +9,8 @@
 //! store itself; it asks.
 //!
 //! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
-//! `{"cmd":"status"}`. Responses: `{"ok":true, …}` or
+//! `{"cmd":"status"}`, `{"cmd":"blocked"}`, `{"cmd":"push","dryRun":true}`.
+//! Responses: `{"ok":true, …}` or
 //! `{"ok":false,"error":"…"}`.
 
 use super::sync::Mirror;
@@ -106,6 +107,13 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     match cmd {
         "status" => json!({ "ok": true, "mirror": mirror.status() }),
+        "blocked" => json!({"ok": true, "actions": mirror.store.blocked_actions()}),
+        "push" => {
+            match mirror.push_local(req.get("dryRun").and_then(Value::as_bool).unwrap_or(true)) {
+                Ok(report) => json!({"ok": true, "report": report}),
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
         "sync" => {
             let finished = mirror.sync_now(Duration::from_secs(600));
             json!({ "ok": true, "finished": finished, "mirror": mirror.status() })
@@ -154,7 +162,13 @@ pub fn request(path: &Path, req: &Value) -> Result<Value> {
             path.display()
         )
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(660)))?;
+    // Recovery of a large workspace can exceed ten minutes. Request/transfer
+    // timeouts still apply inside the daemon; do not abandon its final report.
+    stream.set_read_timeout(if req.get("cmd").and_then(Value::as_str) == Some("push") {
+        None
+    } else {
+        Some(Duration::from_secs(660))
+    })?;
     writeln!(stream, "{req}")?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;

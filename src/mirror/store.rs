@@ -31,6 +31,7 @@ const BASE: TableDefinition<&str, &[u8]> = TableDefinition::new("base_v2");
 const CURSOR: TableDefinition<&str, u64> = TableDefinition::new("cursor_v2");
 /// Small named strings: hub instance id, backend, exclusions snapshot.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta_v2");
+const BLOCKED: TableDefinition<&str, &[u8]> = TableDefinition::new("protected_v1");
 /// `seq → Job`: the durable write-back queue, in submission order.
 const JOBS: TableDefinition<u64, &[u8]> = TableDefinition::new("jobs_v2");
 /// `key → Conflict`: conflicts recorded on this device.
@@ -407,6 +408,7 @@ impl Store {
         tx.open_table(BASE)?;
         tx.open_table(CURSOR)?;
         tx.open_table(META)?;
+        tx.open_table(BLOCKED)?;
         tx.open_table(JOBS)?;
         tx.open_table(CONFLICTS)?;
         tx.open_table(TRASH)?;
@@ -739,6 +741,51 @@ impl Store {
         let tx = self.db.begin_read().ok()?;
         let t = tx.open_table(META).ok()?;
         t.get(name).ok()?.map(|v| v.value().to_string())
+    }
+
+    pub fn blocked_actions(&self) -> Vec<super::protection::BlockedAction> {
+        let Ok(tx) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = tx.open_table(BLOCKED) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .map(|rows| rows.flatten().filter_map(|(_, v)| dec(v.value())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Return true only for a new/changed observation, keeping recurring polls
+    /// from flooding logs or fsyncing identical audit records.
+    pub fn record_blocked(&self, record: &super::protection::BlockedAction) -> Result<bool> {
+        let id = record.id();
+        let read = self.db.begin_read()?;
+        let table = read.open_table(BLOCKED)?;
+        let previous = table
+            .get(id.as_str())?
+            .and_then(|v| dec::<super::protection::BlockedAction>(v.value()));
+        let same = previous
+            .as_ref()
+            .is_some_and(|p| p.same_observation(record));
+        if same
+            && read
+                .open_table(META)?
+                .get(super::protection::RECHECK)?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        drop(table);
+        drop(read);
+        let tx = self.db.begin_write()?;
+        let bytes = serde_json::to_vec(record)?;
+        tx.open_table(BLOCKED)?
+            .insert(id.as_str(), bytes.as_slice())?;
+        tx.open_table(META)?
+            .insert(super::protection::RECHECK, "1")?;
+        tx.commit()?;
+        Ok(!same)
     }
 
     pub fn set_meta(&self, name: &str, value: &str) -> Result<()> {
