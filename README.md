@@ -348,7 +348,7 @@ Without `--mirror`, `Home/` keeps its passthrough behaviour. `mv` inside
 ## Install
 
 Prebuilt binaries are attached to each [GitHub Release](../../releases) (tag
-`v*`):
+`v*`). The download links below always resolve to the latest published release:
 
 | Target | Notes |
 | --- | --- |
