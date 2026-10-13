@@ -52,6 +52,14 @@ change what it is. Its folders are derived from the schema ids themselves, so a
 schema this build has never heard of still gets its own folder rather than
 falling into a catch-all.
 
+Context selectors accept IDs or display names, ignoring letter case. For example,
+`--context mbag/KT ~/Contexts/` mounts at `~/Contexts/KT/` while using the
+server's canonical context ID (such as `kt`) for reads, writes and live updates.
+A bare `--context KT` also works when it identifies one accessible context.
+IDs take precedence over display names; a missing or ambiguous selector fails
+before mounting. Use `--workspace mbag` or `mbag/KT` to disambiguate workspaces,
+and `canvas-fuse contexts --json` to inspect their context IDs and display names.
+
 Every document is rendered as the thing it already is, byte for byte the same as
 the WebDAV mount serves it:
 

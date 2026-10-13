@@ -1,6 +1,7 @@
 pub mod api;
 pub mod blobs;
 pub mod config;
+mod context_selection;
 pub mod events;
 pub mod fsimpl;
 pub mod mirror;
@@ -15,7 +16,6 @@ pub mod writes;
 
 use anyhow::{Context as _, Result};
 use parking_lot::RwLock;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -187,6 +187,30 @@ fn mount_with_session(
     // `workspace:<id>` ws channel (every tree/document change is forwarded there).
     let workspace_mode = opts.workspace.is_some();
     let mirror_mode = workspace_mode && opts.mirror.is_some();
+    // Resolve selectors before constructing the root and worker filter. The
+    // CLI's mountpoint keeps the requested spelling; remote operations use IDs.
+    let context_workspace_id = match (&opts.context_workspace, workspace_mode) {
+        (Some(name), false) => Some(
+            api.get_workspace(name)
+                .with_context(|| format!("resolving context workspace {name}"))?
+                .id,
+        ),
+        _ => None,
+    };
+    let context_selection = if workspace_mode {
+        context_selection::ContextSelection {
+            filter: None,
+            root: None,
+            workspace_id: None,
+        }
+    } else {
+        context_selection::ContextSelection::resolve(
+            &api,
+            opts.contexts.as_deref(),
+            opts.context_root.as_deref(),
+            context_workspace_id,
+        )?
+    };
     // Existing mirrors resolve their UUID locally. Slow DNS, a blackholed
     // network or an expired login must never delay access to local files.
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
@@ -223,27 +247,15 @@ fn mount_with_session(
         }
         state::Tree::workspace_selected(ws.id, ws.name, opts.selection.clone())
     } else {
-        match &opts.context_root {
+        match &context_selection.root {
             Some(id) => state::Tree::context_rooted(id.clone()),
             None if opts.contexts_at_root => state::Tree::context_collection(),
             None => state::Tree::new(),
         }
     }));
     let enable_ws = opts.enable_ws;
-    let context_filter: Option<HashSet<String>> = if workspace_mode {
-        None
-    } else {
-        opts.contexts.as_ref().map(|c| c.iter().cloned().collect())
-    };
-    // Fail closed: an unavailable workspace must never expose other workspaces.
-    let context_workspace_id: Option<String> = match (&opts.context_workspace, workspace_mode) {
-        (Some(name), false) => Some(
-            api.get_workspace(name)
-                .with_context(|| format!("resolving context workspace {name}"))?
-                .id,
-        ),
-        _ => None,
-    };
+    let context_filter = context_selection.filter;
+    let context_workspace_id = context_selection.workspace_id;
 
     // Mirror: the real Home folder sits UNDER the mountpoint — the FUSE
     // view covers it while the daemon runs and the files are simply there
@@ -463,3 +475,6 @@ fn mount_with_session(
 
 #[cfg(test)]
 mod mirror_startup_tests;
+
+#[cfg(test)]
+mod context_startup_tests;

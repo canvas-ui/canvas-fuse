@@ -33,6 +33,11 @@ pub struct CanvasFs {
 }
 
 impl CanvasFs {
+    #[cfg(test)]
+    pub(crate) fn test_tree(&self) -> &Arc<RwLock<Tree>> {
+        &self.tree
+    }
+
     pub fn new(
         tree: Arc<RwLock<Tree>>,
         blobs: Arc<BlobStore>,

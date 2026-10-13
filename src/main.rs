@@ -87,8 +87,8 @@ enum Command {
         )]
         root: Option<String>,
 
-        /// Mount a context view, as <workspace>/<context> (or a bare context id
-        /// alongside -w). Repeatable; a single -c roots the mount at it.
+        /// Mount a context view by ID or display name, optionally qualified as
+        /// <workspace>/<context>. Repeatable; a single -c roots the mount at it.
         #[arg(short = 'c', long = "context")]
         contexts: Vec<String>,
 
@@ -1394,6 +1394,19 @@ mod root_selector_tests {
         assert_eq!(
             resolved(None, Some("myws"), &["foo"]),
             (Some("myws".into()), vec!["foo".to_string()])
+        );
+    }
+
+    #[test]
+    fn context_selector_spelling_is_preserved_for_the_local_mountpoint() {
+        assert_eq!(resolved(None, None, &["KT"]), (None, vec!["KT".into()]));
+        assert_eq!(
+            resolved(None, None, &["mbag/KT"]),
+            (Some("mbag".into()), vec!["KT".into()])
+        );
+        assert_eq!(
+            resolved(None, Some("mbag"), &["KT"]),
+            (Some("mbag".into()), vec!["KT".into()])
         );
     }
 

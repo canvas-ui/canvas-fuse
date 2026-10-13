@@ -214,14 +214,34 @@ impl Worker {
     }
 
     pub fn refresh_context(&self, ctx_id: &str) {
-        // Refresh .context.json first so a URL switch is immediately readable
-        if let Ok(ctx) = self.api.get_context(ctx_id) {
-            let inv = {
-                let mut tree = self.tree.write();
-                tree.update_context_meta(&ctx)
-            };
-            self.notify(inv);
+        if self
+            .context_filter
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(ctx_id))
+        {
+            return;
         }
+        // Refresh .context.json first so a URL switch is immediately readable
+        let ctx = match self.api.get_context(ctx_id) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                log::warn!("context {ctx_id}: metadata fetch failed: {e:#}");
+                return;
+            }
+        };
+        if ctx.id != ctx_id
+            || self
+                .context_workspace_id
+                .as_ref()
+                .is_some_and(|workspace| ctx.workspace_id.as_ref() != Some(workspace))
+        {
+            log::warn!(
+                "context {ctx_id}: identity or workspace changed; skipping document refresh"
+            );
+            return;
+        }
+        let inv = self.tree.write().update_context_meta(&ctx);
+        self.notify(inv);
         // Fetch inside the lock: a list fetched before a concurrent write but
         // applied after it would diff against a stale view.
         let _guard = self.refresh_lock.as_ref().map(|l| l.lock());
