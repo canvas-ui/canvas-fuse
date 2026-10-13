@@ -69,8 +69,12 @@ impl PersistentDirectoryId {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|t| (t.as_secs(), t.subsec_nanos()));
+        // libc's f_type varies with the target ABI; persist the same i64 on
+        // glibc and musl, including targets where this cast is a no-op.
+        #[allow(clippy::unnecessary_cast)]
+        let filesystem_type = stat.f_type as i64;
         Ok(Self {
-            filesystem_type: stat.f_type as i64,
+            filesystem_type,
             filesystem_id,
             device_fallback: (filesystem_id == [0, 0]).then_some(metadata.dev()),
             inode: metadata.ino(),
