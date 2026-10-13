@@ -394,3 +394,267 @@ fn state_directory_cannot_be_inside_the_mounted_folder_even_through_a_symlink() 
         assert!(!dir.path().join(path).exists());
     }
 }
+
+// Simulate the mount-time device number that an earlier boot wrote, keeping
+// the marker and its exact ledger binding together as a real remount would.
+fn previous_device(root: &Path, legacy: bool) -> Value {
+    let mut json = marker(root);
+    for field in ["rootDirectory", "homeDirectory"] {
+        json[field]["device"] = (json[field]["device"].as_u64().unwrap() + 123).into();
+    }
+    let raw = serde_json::to_string(&json).unwrap();
+    std::fs::write(root.join("Universe").join(MARKER), &raw).unwrap();
+    let store = Store::open(&root.join("state/mirror.redb")).unwrap();
+    store.set_meta("local-replica-binding", &raw).unwrap();
+    if legacy {
+        store.remove_meta("local-replica-directories").unwrap();
+    }
+    json
+}
+
+#[test]
+fn persistent_identity_survives_device_renumbering_without_resetting_history() {
+    for home_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = FakeHub::start();
+        hub.lock().put("keep.txt", b"keep");
+        hub.lock().put("remove.txt", b"remove offline");
+        let make_config = || {
+            let mut cfg = config(dir.path(), &hub.url);
+            if home_only {
+                cfg.home_dir = cfg.mountpoint.clone();
+            }
+            cfg
+        };
+        let m = Mirror::open(make_config()).unwrap();
+        m.cycle(true);
+        let cursor = m.store.cursor();
+        m.commit_write("queued.txt", b"queued before shutdown")
+            .unwrap();
+        drop(m);
+        let marker_before = previous_device(dir.path(), false);
+        let home = make_config().home_dir;
+        std::fs::remove_file(home.join("remove.txt")).unwrap();
+        std::fs::write(home.join("flight.txt"), b"flight notes").unwrap();
+        hub.lock().requests.clear();
+
+        let m = Mirror::open(make_config()).unwrap();
+        assert!(
+            hub.lock().requests.is_empty(),
+            "opening must be entirely local"
+        );
+        assert_eq!(m.store.cursor(), cursor);
+        assert!(m.store.base("keep.txt").is_some());
+        assert_eq!(
+            marker(dir.path()),
+            marker_before,
+            "no two-file marker migration"
+        );
+        assert_eq!(m.entry("flight.txt").unwrap().state, EntryState::Dirty);
+        assert_eq!(
+            m.store.entry("remove.txt").unwrap().state,
+            EntryState::Tombstone
+        );
+        m.cycle(true);
+        assert_eq!(hub.lock().bytes_of("flight.txt").unwrap(), b"flight notes");
+        assert_eq!(
+            hub.lock().bytes_of("queued.txt").unwrap(),
+            b"queued before shutdown"
+        );
+        assert_eq!(hub.lock().bytes_of("keep.txt").unwrap(), b"keep");
+        assert!(hub.lock().bytes_of("remove.txt").is_none());
+    }
+}
+
+#[test]
+fn legacy_device_change_requires_explicit_migration_then_reopens_normally_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "http://127.0.0.1:9";
+    let m = Mirror::open(config(dir.path(), url)).unwrap();
+    m.commit_write("notes.txt", b"offline work").unwrap();
+    let jobs = m.store.jobs();
+    drop(m);
+    let old = previous_device(dir.path(), true);
+    rejected(
+        Mirror::open(config(dir.path(), url)),
+        "--accept-device-change",
+    );
+    let store = Store::open(&dir.path().join("state/mirror.redb")).unwrap();
+    assert_eq!(store.jobs(), jobs);
+    assert!(store.meta("local-replica-directories").is_none());
+    drop(store);
+    let mut cfg = config(dir.path(), url);
+    cfg.opts.accept_device_change = true;
+    let m = Mirror::open(cfg).unwrap();
+    assert_eq!(m.store.jobs(), jobs);
+    assert!(m.store.meta("local-replica-directories").is_some());
+    assert_eq!(marker(dir.path()), old);
+    drop(m);
+    let m = Mirror::open(config(dir.path(), url)).unwrap();
+    assert_eq!(m.local.read_all("notes.txt").unwrap(), b"offline work");
+}
+
+#[test]
+fn legacy_replica_upgrades_automatically_when_original_directory_ids_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "http://127.0.0.1:9";
+    let m = Mirror::open(config(dir.path(), url)).unwrap();
+    m.store.remove_meta("local-replica-directories").unwrap();
+    let old = marker(dir.path());
+    drop(m);
+    let m = Mirror::open(config(dir.path(), url)).unwrap();
+    assert!(m.store.meta("local-replica-directories").is_some());
+    assert_eq!(marker(dir.path()), old);
+}
+
+#[test]
+fn device_migration_cannot_override_a_persistent_filesystem_or_birth_time_mismatch() {
+    for field in ["filesystemId", "created"] {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:9";
+        let m = Mirror::open(config(dir.path(), url)).unwrap();
+        m.commit_write("important.txt", b"keep").unwrap();
+        let jobs = m.store.jobs();
+        let mut saved: Value =
+            serde_json::from_str(&m.store.meta("local-replica-directories").unwrap()).unwrap();
+        saved[1][field] = serde_json::json!([123456789, 123456789]);
+        m.store
+            .set_meta("local-replica-directories", &saved.to_string())
+            .unwrap();
+        drop(m);
+        let mut cfg = config(dir.path(), url);
+        cfg.opts.accept_device_change = true;
+        rejected(Mirror::open(cfg), "mirror directory identity changed");
+        let store = Store::open(&dir.path().join("state/mirror.redb")).unwrap();
+        assert_eq!(store.jobs(), jobs);
+        assert_eq!(
+            store.meta("local-replica-directories").unwrap(),
+            saved.to_string()
+        );
+    }
+}
+
+#[test]
+fn device_migration_still_rejects_copied_markers_replaced_home_and_wrong_databases() {
+    for mode in ["copied", "replaced", "wrong-database", "missing-database"] {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:9";
+        drop(Mirror::open(config(first.path(), url)).unwrap());
+        previous_device(first.path(), true);
+        let mut cfg = config(first.path(), url);
+        cfg.opts.accept_device_change = true;
+        match mode {
+            "copied" => {
+                std::fs::create_dir_all(second.path().join("Universe/Home")).unwrap();
+                std::fs::copy(
+                    first.path().join("Universe").join(MARKER),
+                    second.path().join("Universe").join(MARKER),
+                )
+                .unwrap();
+                cfg.mountpoint = second.path().join("Universe");
+                cfg.home_dir = cfg.mountpoint.join("Home");
+            }
+            "replaced" => {
+                std::fs::rename(&cfg.home_dir, first.path().join("saved")).unwrap();
+                std::fs::create_dir(&cfg.home_dir).unwrap();
+            }
+            "wrong-database" => {
+                drop(Mirror::open(config(second.path(), url)).unwrap());
+                cfg.data_dir = second.path().join("state");
+            }
+            _ => cfg.data_dir = second.path().join("state"),
+        }
+        assert!(Mirror::open(cfg).is_err(), "{mode}");
+    }
+}
+
+#[test]
+fn offline_workspace_resolution_requires_a_matching_marker_uuid_server_and_name() {
+    use canvas_fuse::mirror::identity::cached_workspace;
+    let dir = tempfile::tempdir().unwrap();
+    let url = "http://127.0.0.1:9";
+    let cfg = config(dir.path(), url);
+    assert!(
+        cached_workspace(&cfg.mountpoint, &cfg.data_dir, url, "Universe")
+            .unwrap()
+            .is_none()
+    );
+    drop(Mirror::open(config(dir.path(), url)).unwrap());
+    let resolve =
+        |server: &str, name: &str| cached_workspace(&cfg.mountpoint, &cfg.data_dir, server, name);
+    // The UUID works even if the name cache is missing/corrupted.
+    assert_eq!(resolve(url, "ws1").unwrap().unwrap().id, "ws1");
+    assert!(resolve(url, "Universe").is_err());
+    std::fs::write(
+        cfg.data_dir.join("workspace.json"),
+        r#"{"id":"ws1","name":"Universe","selector":"universe"}"#,
+    )
+    .unwrap();
+    assert_eq!(resolve(url, "Universe").unwrap().unwrap().id, "ws1");
+    assert_eq!(resolve(url, "universe").unwrap().unwrap().name, "Universe");
+    assert!(resolve("http://other.example", "Universe").is_err());
+    assert!(resolve(url, "Augmentd").is_err());
+    // A stale/wrong data directory cannot route a mirror to another workspace.
+    std::fs::write(
+        cfg.data_dir.join("workspace.json"),
+        r#"{"id":"different","name":"Universe"}"#,
+    )
+    .unwrap();
+    assert!(resolve(url, "Universe").is_err());
+    assert_eq!(resolve(url, "ws1").unwrap().unwrap().id, "ws1");
+}
+
+#[test]
+fn interrupted_directory_moves_recover_after_device_renumbering() {
+    use canvas_fuse::mirror::store::JobKind;
+    use std::os::unix::fs::MetadataExt;
+    for legacy_job in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = FakeHub::start();
+        hub.lock().put("old/a.txt", b"keep photo");
+        let m = Mirror::open(config(dir.path(), &hub.url)).unwrap();
+        m.cycle(true);
+        let st = std::fs::metadata(m.local.path("old")).unwrap();
+        // Obtain the real persistent identity written by a normal directory move.
+        m.rename_dir_local("old", "new").unwrap();
+        let job = m
+            .store
+            .jobs()
+            .into_iter()
+            .find(|j| matches!(j.kind, JobKind::RenameDir { .. }))
+            .unwrap();
+        let JobKind::RenameDir {
+            directory_identity, ..
+        } = job.kind
+        else {
+            unreachable!()
+        };
+        m.store.remove_job(job.seq).unwrap();
+        // Restore the pre-commit ledger to simulate a crash between rename(2)
+        // and committing the ledger transaction.
+        m.store.rekey("new/a.txt", "old/a.txt").unwrap();
+        m.store.remove_dir("new").unwrap();
+        m.store.add_dir("old").unwrap();
+        m.store
+            .enqueue(JobKind::RenameDir {
+                from: "old".into(),
+                to: "new".into(),
+                operation_id: "reboot-recovery".into(),
+                dev: st.dev() + 123,
+                ino: st.ino(),
+                directory_identity: if legacy_job { None } else { directory_identity },
+                local_applied: false,
+                remote: true,
+            })
+            .unwrap();
+        drop(m);
+        previous_device(dir.path(), false);
+        let m = Mirror::open(config(dir.path(), &hub.url)).unwrap();
+        m.cycle(true);
+        assert!(m.store.jobs().is_empty(), "{:?}", m.status());
+        assert!(m.store.entry("old/a.txt").is_none());
+        assert_eq!(m.local.read_all("new/a.txt").unwrap(), b"keep photo");
+        assert_eq!(hub.lock().bytes_of("new/a.txt").unwrap(), b"keep photo");
+    }
+}

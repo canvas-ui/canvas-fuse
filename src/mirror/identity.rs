@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pub const MARKER: &str = ".workspace.json";
 pub(super) const META_BINDING: &str = "local-replica-binding";
+pub(super) const META_DIRECTORIES: &str = "local-replica-directories";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -35,6 +36,55 @@ impl DirectoryId {
             inode: metadata.ino(),
         })
     }
+}
+
+/// st_dev is a mount-time identifier (notably for ZFS and Btrfs). Persist
+/// filesystem identity instead, together with inode and birth time when
+/// available. Keep st_dev only as a fail-closed fallback for zero fsids.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentDirectoryId {
+    filesystem_type: i64,
+    filesystem_id: [i32; 2],
+    device_fallback: Option<u64>,
+    inode: u64,
+    created: Option<(u64, u32)>,
+}
+
+impl PersistentDirectoryId {
+    fn read(file: &File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // fstatfs fills the entire structure on success. Linux fsid_t consists
+        // of two 32-bit words; libc keeps those fields private on some targets.
+        let rc = unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading mirror filesystem identity");
+        }
+        let stat = unsafe { stat.assume_init() };
+        let filesystem_id: [i32; 2] = unsafe { std::mem::transmute(stat.f_fsid) };
+        let created = metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| (t.as_secs(), t.subsec_nanos()));
+        Ok(Self {
+            filesystem_type: stat.f_type as i64,
+            filesystem_id,
+            device_fallback: (filesystem_id == [0, 0]).then_some(metadata.dev()),
+            inode: metadata.ino(),
+            created,
+        })
+    }
+}
+
+pub(super) fn persistent_directory_identity(path: &Path) -> Result<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    Ok(serde_json::to_string(&PersistentDirectoryId::read(&file)?)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +109,10 @@ pub(super) struct Destination {
     path: PathBuf,
     marker: Marker,
     fresh: bool,
+    root_directory: DirectoryId,
+    home_directory: DirectoryId,
+    persistent_directories: String,
+    accept_device_change: bool,
 }
 
 fn server_identity(raw: &str) -> Result<String> {
@@ -148,7 +202,83 @@ pub fn preflight(mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve an existing replica locally, before any network request. The cache
+/// supplies only a display name: the marker is authoritative for server and UUID,
+/// and Destination still verifies the physical directories and bound ledger.
+pub fn cached_workspace(
+    mountpoint: &Path,
+    data_dir: &Path,
+    server: &str,
+    requested: &str,
+) -> Result<Option<crate::api::WorkspaceInfo>> {
+    let Some(marker) = read_marker(mountpoint)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        marker.format == "canvas-fuse-mirror"
+            && marker.version == 1
+            && marker.server == server_identity(server)?,
+        "{MARKER} does not match the requested server or supported mirror format"
+    );
+    let cache = std::fs::read(data_dir.join("workspace.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let cached = cache
+        .as_ref()
+        .filter(|v| v.get("id").and_then(|v| v.as_str()) == Some(marker.workspace_id.as_str()));
+    let name = cached.and_then(|v| v.get("name")?.as_str());
+    let selector = cached.and_then(|v| v.get("selector")?.as_str());
+    anyhow::ensure!(
+        requested == marker.workspace_id || name == Some(requested) || selector == Some(requested),
+        "cannot verify workspace name `{requested}` against {MARKER}; this mirror belongs to workspace UUID {}. Mount using that UUID with the same destination and --data-dir, or restore its workspace.json name cache",
+        marker.workspace_id
+    );
+    Ok(Some(crate::api::WorkspaceInfo {
+        id: marker.workspace_id,
+        name: name.unwrap_or(requested).to_string(),
+    }))
+}
+
+/// Persist the name/selector mapping after the destination has been validated.
+/// Atomic publication and fsync make the first online mount usable after reboot.
+pub(crate) fn cache_workspace(
+    data_dir: &Path,
+    requested: &str,
+    workspace: &crate::api::WorkspaceInfo,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "id": workspace.id, "name": workspace.name, "selector": requested,
+    }))?;
+    let target = data_dir.join("workspace.json");
+    if std::fs::read(&target).ok().as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
+    }
+    let temporary = data_dir.join(format!("workspace.{}.tmp", super::operation_id()?));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &target)?;
+        File::open(data_dir)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result.context("persisting mirror workspace name for offline startup")
+}
+
 impl Destination {
+    /// Old directory-move intents only recorded st_dev. They can follow the
+    /// verified Home filesystem across renumbering, never an unrelated mount.
+    pub(super) fn matches_legacy_device(&self, recorded: u64, current: u64) -> bool {
+        recorded == current
+            || (recorded == self.marker.home_directory.device
+                && current == self.home_directory.device)
+    }
+
     pub(super) fn prepare(cfg: &MirrorConfig) -> Result<Self> {
         let home = if cfg.home_dir == cfg.mountpoint {
             "."
@@ -206,15 +336,28 @@ impl Destination {
             root_directory: root_directory.clone(),
             home_directory: home_directory.clone(),
         });
-        anyhow::ensure!(marker.root_directory == root_directory && marker.home_directory == home_directory,
-            "mirror directory identity changed at {}; a copied marker or replaced directory cannot reuse sync history",
-            cfg.mountpoint.display());
+        // Inodes are checked before even opening the database. Device numbers
+        // may differ across boots: open_store checks their persistent replacement
+        // against the original ledger before allowing scans or queued mutations.
+        anyhow::ensure!(marker.root_directory.inode == root_directory.inode
+            && marker.home_directory.inode == home_directory.inode,
+            "mirror directory identity changed at {} (root inode {} -> {}, Home inode {} -> {}); a copied marker or replaced directory cannot reuse sync history",
+            cfg.mountpoint.display(), marker.root_directory.inode, root_directory.inode,
+            marker.home_directory.inode, home_directory.inode);
+        let persistent_directories = serde_json::to_string(&(
+            PersistentDirectoryId::read(&root)?,
+            PersistentDirectoryId::read(home_file.as_ref().unwrap_or(&root))?,
+        ))?;
         let mut destination = Self {
             root,
             _home: home_file,
             path,
             marker,
             fresh,
+            root_directory,
+            home_directory,
+            persistent_directories,
+            accept_device_change: cfg.opts.accept_device_change,
         };
         if fresh {
             destination.marker.mirror_id = super::operation_id()?;
@@ -226,6 +369,10 @@ impl Destination {
         Store::open_bound(
             &super::store_path(data_dir),
             &serde_json::to_string(&self.marker)?,
+            &self.persistent_directories,
+            self.marker.root_directory == self.root_directory
+                && self.marker.home_directory == self.home_directory,
+            self.accept_device_change,
         )
     }
 
@@ -258,14 +405,14 @@ impl Destination {
     pub(super) fn verify(&self) -> Result<()> {
         anyhow::ensure!(self.root.metadata()?.nlink() > 0
             && read_marker(&self.path)?.as_ref() == Some(&self.marker)
-            && DirectoryId::read(&self.path.join(&self.marker.home))? == self.marker.home_directory,
+            && DirectoryId::read(&self.path.join(&self.marker.home))? == self.home_directory,
             "mirror identity is missing or changed; refusing to reconcile or send queued operations");
         Ok(())
     }
 
     pub(super) fn verify_local(&self, local: &super::local::Local) -> Result<()> {
         anyhow::ensure!(
-            DirectoryId::read(&local.path("."))? == self.marker.home_directory,
+            DirectoryId::read(&local.path("."))? == self.home_directory,
             "mirror Home changed while opening it; refusing to sync"
         );
         self.verify()

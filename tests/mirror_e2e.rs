@@ -1374,6 +1374,7 @@ fn interrupted_local_directory_move_recovers_its_ledger_after_restart() {
                 operation_id: "local-recovery".into(),
                 dev: st.dev(),
                 ino: st.ino(),
+                directory_identity: None,
                 local_applied: false,
                 remote: true,
             })

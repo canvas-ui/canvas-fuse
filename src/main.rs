@@ -158,6 +158,12 @@ enum Command {
         #[arg(long)]
         mirror: bool,
 
+        /// Upgrade an older mirror after reboot/remount changed only its device
+        /// number. Use only for the original folder, never a copied/replaced one.
+        /// Matching directory inodes and the original marker/database are required.
+        #[arg(long, requires = "mirror")]
+        accept_device_change: bool,
+
         /// Accepted for older configs; the mirror keeps every file, so
         /// there is nothing to pin.
         #[arg(long = "pin", value_name = "GLOB", requires = "mirror", hide = true)]
@@ -305,6 +311,7 @@ fn main() -> Result<()> {
             data_dir,
             blob_cache_mb,
             mirror,
+            accept_device_change,
             pins,
             cache_budget_mb,
             conflicts,
@@ -341,6 +348,7 @@ fn main() -> Result<()> {
                 );
             }
             let mirror_opts = mirror.then_some(MirrorOptions {
+                accept_device_change,
                 conflicts: match conflicts {
                     ConflictsArg::Prompt => ConflictMode::Prompt,
                     ConflictsArg::Rename => ConflictMode::Rename,
@@ -587,23 +595,27 @@ fn cmd_mount(
     if mirror.is_some() && !runtime::is_mounted(&mountpoint) {
         canvas_fuse::mirror::identity::preflight(&mountpoint)?;
     }
-    let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
-    match api.ping() {
-        Ok((payload, rtt)) => {
-            let version = payload
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            eprintln!(
-                "server {} (v{version}, {} ms, auth via {})",
-                endpoint.server,
-                rtt.as_millis(),
-                endpoint.source
-            );
+    // Mirror startup must not wait for ping/DNS/TLS timeouts. First mounts
+    // resolve the workspace in mount(); established replicas need no network.
+    if mirror.is_none() {
+        let api = ApiClient::with_tls(&endpoint.server, &endpoint.token, endpoint.tls.as_ref())?;
+        match api.ping() {
+            Ok((payload, rtt)) => {
+                let version = payload
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                eprintln!(
+                    "server {} (v{version}, {} ms, auth via {})",
+                    endpoint.server,
+                    rtt.as_millis(),
+                    endpoint.source
+                );
+            }
+            Err(e) => eprintln!(
+                "warning: server not reachable yet ({e:#}); mounting anyway, resync will recover"
+            ),
         }
-        Err(e) => eprintln!(
-            "warning: server not reachable yet ({e:#}); mounting anyway, resync will recover"
-        ),
     }
 
     let log_file = if detach {
@@ -1017,6 +1029,29 @@ fn cmd_contexts(connect: ConnectArgs, as_json: bool) -> Result<()> {
 mod root_selector_tests {
     use super::{resolve_root, Cli};
     use clap::Parser;
+
+    #[test]
+    fn accepting_a_legacy_device_change_requires_mirror_mode() {
+        let args = [
+            "canvas-fuse",
+            "mount",
+            "--workspace",
+            "Universe",
+            "/tmp/workspaces",
+            "--accept-device-change",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+        let mut args = args.to_vec();
+        args.push("--mirror");
+        let super::Command::Mount {
+            accept_device_change,
+            ..
+        } = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("mount expected")
+        };
+        assert!(accept_device_change);
+    }
 
     fn resolved(
         selector: Option<&str>,

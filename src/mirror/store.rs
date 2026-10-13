@@ -132,6 +132,8 @@ pub enum JobKind {
         operation_id: String,
         dev: u64,
         ino: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory_identity: Option<String>,
         local_applied: bool,
         remote: bool,
     },
@@ -263,6 +265,13 @@ pub struct Store {
     legacy: parking_lot::Mutex<Option<Legacy>>,
 }
 
+struct Binding<'a> {
+    marker: &'a str,
+    directories: &'a str,
+    legacy_matches: bool,
+    accept_device_change: bool,
+}
+
 fn read_legacy_table<T: DeserializeOwned>(
     tx: &redb::WriteTransaction,
     name: &str,
@@ -294,11 +303,25 @@ impl Store {
         Self::open_inner(path, None)
     }
 
-    pub(super) fn open_bound(path: &Path, binding: &str) -> Result<Self> {
-        Self::open_inner(path, Some(binding))
+    pub(super) fn open_bound(
+        path: &Path,
+        marker: &str,
+        directories: &str,
+        legacy_matches: bool,
+        accept_device_change: bool,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            Some(Binding {
+                marker,
+                directories,
+                legacy_matches,
+                accept_device_change,
+            }),
+        )
     }
 
-    fn open_inner(path: &Path, binding: Option<&str>) -> Result<Self> {
+    fn open_inner(path: &Path, binding: Option<Binding<'_>>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -321,11 +344,32 @@ impl Store {
             } else {
                 None
             };
-            anyhow::ensure!(stored.as_deref() == Some(binding) || existing.is_empty(),
+            anyhow::ensure!(stored.as_deref() == Some(binding.marker) || existing.is_empty(),
                 "mirror database {} is unbound or belongs to another local replica; refusing to reuse its sync history. Preserve the old state for recovery and use a separate data directory with a new empty destination",
                 path.display());
+            let directories = if existing.contains(META.name()) {
+                tx.open_table(META)?
+                    .get(super::identity::META_DIRECTORIES)?
+                    .map(|v| v.value().to_string())
+            } else {
+                None
+            };
+            match directories {
+                Some(stored) => anyhow::ensure!(stored == binding.directories,
+                    "mirror directory identity changed: filesystem, inode or creation time differs from the bound replica; refusing to reuse sync history"),
+                None => {
+                    anyhow::ensure!(binding.legacy_matches
+                        || (binding.accept_device_change && stored.as_deref() == Some(binding.marker)),
+                        "mirror device number changed, but this older replica has no persistent filesystem identity yet. If this is the original folder after a reboot or disk remount (not a copy or replacement), mount once with --accept-device-change. The original marker/database pair and both directory inodes must still match; do not delete or edit the marker or database");
+                    if !binding.legacy_matches {
+                        log::warn!("accepting legacy mirror device-number change; recording persistent directory identities");
+                    }
+                }
+            }
             tx.open_table(META)?
-                .insert(super::identity::META_BINDING, binding)?;
+                .insert(super::identity::META_BINDING, binding.marker)?;
+            tx.open_table(META)?
+                .insert(super::identity::META_DIRECTORIES, binding.directories)?;
         }
         let legacy = if existing.contains("entries_v1") {
             let l = Legacy {

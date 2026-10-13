@@ -175,6 +175,25 @@ What the daemon does:
   Each laptop/workstation creates its own marker and database for the same
   remote workspace; multiple devices are supported. Do not copy markers or
   databases between replicas. A changed hub instance ID also pauses sync.
+- **Offline remounts (0.13.3+).** An established mirror resolves its workspace
+  UUID from the local marker and name cache, scans local changes, and exposes
+  Home before contacting the server. Ping, tree refresh and synchronization
+  cannot hold up the mount on a slow or unavailable network. A first-ever mount
+  still needs the hub to resolve the workspace. Only files already downloaded
+  are available offline.
+  Directory checks use the filesystem ID, inode and creation time (when
+  available), recorded transactionally in the existing sync database. A changed
+  mount-time device number after reboot, as on ZFS/Btrfs, no longer invalidates
+  an established binding. The marker and sync history are retained.
+  Older replicas upgrade automatically when their original device/inode checks
+  still match. If the device number has **already** changed, use the same mount
+  command once with `--accept-device-change`, only for the original folder after
+  reboot/remount. This acknowledges the missing filesystem identity in older
+  versions; matching root/Home inodes and the original marker/database pair
+  remain mandatory. The option cannot override a replaced directory or an
+  existing persistent identity mismatch. Subsequent remounts need no flag.
+  Do not delete or edit `.workspace.json` or reset the sync database to work
+  around an identity error.
 - **Full local mirror.** The first mount lists the hub and downloads
   everything (verified by digest, written atomically next to its target).
   Remote changes land in the folder within a second on a socket nudge

@@ -801,6 +801,9 @@ impl Mirror {
             operation_id: super::operation_id()?,
             dev: st.dev(),
             ino: st.ino(),
+            directory_identity: Some(super::identity::persistent_directory_identity(
+                &self.local.path(from),
+            )?),
             local_applied: false,
             remote: !local_only,
         })?;
@@ -850,6 +853,7 @@ impl Mirror {
             to,
             dev,
             ino,
+            directory_identity,
             local_applied: false,
             ..
         } = &job.kind
@@ -857,8 +861,16 @@ impl Mirror {
             return Ok(());
         };
         let is_original = |key: &str| {
-            std::fs::metadata(self.local.path(key))
-                .is_ok_and(|st| st.is_dir() && st.dev() == *dev && st.ino() == *ino)
+            let path = self.local.path(key);
+            std::fs::symlink_metadata(&path).is_ok_and(|st| {
+                st.is_dir()
+                    && st.ino() == *ino
+                    && match directory_identity {
+                        Some(expected) => super::identity::persistent_directory_identity(&path)
+                            .is_ok_and(|actual| actual == *expected),
+                        None => self.destination.matches_legacy_device(*dev, st.dev()),
+                    }
+            })
         };
         if is_original(from) {
             self.local.rename(from, to)?;

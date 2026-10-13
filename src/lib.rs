@@ -138,6 +138,23 @@ impl Drop for MountHandle {
 }
 
 pub fn mount(opts: MountOptions) -> Result<MountHandle> {
+    mount_with_session(opts, |fs, mountpoint| {
+        fuser::spawn_mount2(
+            fs,
+            mountpoint,
+            &[
+                fuser::MountOption::FSName("canvas".to_string()),
+                fuser::MountOption::Subtype("canvasfs".to_string()),
+            ],
+        )
+        .with_context(|| format!("mounting {}", mountpoint.display()))
+    })
+}
+
+fn mount_with_session(
+    opts: MountOptions,
+    start_session: impl FnOnce(fsimpl::CanvasFs, &std::path::Path) -> Result<fuser::BackgroundSession>,
+) -> Result<MountHandle> {
     if (opts.selection.is_explicit() || opts.selection.include_backends)
         && (opts.workspace.is_none() || opts.context_root.is_some() || opts.contexts.is_some())
     {
@@ -170,48 +187,31 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     // `workspace:<id>` ws channel (every tree/document change is forwarded there).
     let workspace_mode = opts.workspace.is_some();
     let mirror_mode = workspace_mode && opts.mirror.is_some();
-    // A mirror must mount without the hub: the workspace id it learned on
-    // its first online mount is kept in the data dir for that.
-    let ws_id_file = opts.data_dir.join("workspace.json");
+    // Existing mirrors resolve their UUID locally. Slow DNS, a blackholed
+    // network or an expired login must never delay access to local files.
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
-        let ws = match api.get_workspace(ws_name) {
-            Ok(ws) => {
-                if mirror_mode {
-                    let _ = std::fs::create_dir_all(&opts.data_dir);
-                    let _ = std::fs::write(
-                        &ws_id_file,
-                        serde_json::json!({ "id": ws.id, "name": ws.name }).to_string(),
-                    );
-                }
-                ws
-            }
-            Err(e) if mirror_mode => {
-                let cached = std::fs::read_to_string(&ws_id_file)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                    .and_then(|v| {
-                        Some(api::WorkspaceInfo {
-                            id: v.get("id")?.as_str()?.to_string(),
-                            name: v.get("name")?.as_str()?.to_string(),
-                        })
-                    });
-                match cached {
-                    Some(ws) => {
-                        log::warn!(
-                            "workspace {ws_name}: hub unreachable ({e:#}); mounting the mirror offline"
-                        );
-                        ws
-                    }
-                    None => {
-                        return Err(e).with_context(|| {
-                            format!("resolving workspace {ws_name} (no offline record yet)")
-                        })
-                    }
-                }
-            }
-            Err(e) => return Err(e).with_context(|| format!("resolving workspace {ws_name}")),
+        let cached = if mirror_mode {
+            mirror::identity::cached_workspace(
+                &opts.mountpoint,
+                &opts.data_dir,
+                &opts.server,
+                ws_name,
+            )?
+        } else {
+            None
         };
-        if !opts.selection.trees.is_empty() {
+        let resumed_mirror = cached.is_some();
+        let ws = match cached {
+            Some(ws) => ws,
+            None => api.get_workspace(ws_name).with_context(|| {
+                if mirror_mode {
+                    format!("resolving workspace {ws_name} (first mirror mount requires the hub)")
+                } else {
+                    format!("resolving workspace {ws_name}")
+                }
+            })?,
+        };
+        if !resumed_mirror && !opts.selection.trees.is_empty() {
             match api.list_trees(&ws.id) {
                 Ok(available) => {
                     for name in &opts.selection.trees {
@@ -293,13 +293,26 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
                 home_dir.display(),
                 m.device.id
             );
+            // Cache only after marker/ledger validation succeeded. The record
+            // carries no credentials and is never a substitute for the marker.
+            let t = tree.read();
+            if let Some(requested) = opts.workspace.as_deref() {
+                mirror::identity::cache_workspace(
+                    &opts.data_dir,
+                    requested,
+                    &api::WorkspaceInfo {
+                        id: t.ws_id().unwrap(),
+                        name: t.ws_name().unwrap_or_else(|| requested.to_string()),
+                    },
+                )?;
+            }
             Some(m)
         }
         _ => None,
     };
 
-    // Populate before mounting so the first readdir is already correct.
-    // Server being down is not fatal: the resync loop recovers.
+    // Live mounts populate from the server before mounting. Mirrors already
+    // have their local snapshot; remote-only views load after the mount exists.
     let bootstrap = worker::Worker {
         api: api.clone(),
         tree: tree.clone(),
@@ -315,7 +328,9 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         mirror_invalidations: None,
         mirror: None,
     };
-    bootstrap.refresh_all();
+    if !mirror_mode {
+        bootstrap.refresh_all();
+    }
 
     let blobs = blobs::BlobStore::new(api.clone(), opts.blob_cache_bytes, 4);
     let write_store = Arc::new(writes::WriteStore::new(
@@ -331,15 +346,7 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         api.clone(),
         mirror.clone(),
     );
-    let session = fuser::spawn_mount2(
-        fs,
-        &opts.mountpoint,
-        &[
-            fuser::MountOption::FSName("canvas".to_string()),
-            fuser::MountOption::Subtype("canvasfs".to_string()),
-        ],
-    )
-    .with_context(|| format!("mounting {}", opts.mountpoint.display()))?;
+    let session = start_session(fs, &opts.mountpoint)?;
     log::info!("mounted canvas at {}", opts.mountpoint.display());
 
     let (job_tx, job_rx) = std::sync::mpsc::channel::<worker::Job>();
@@ -397,6 +404,10 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
     std::thread::Builder::new()
         .name("canvas-fuse-worker".into())
         .spawn(move || worker.run(job_rx))?;
+    if mirror_mode {
+        // Remote trees and Trash load in the background after Home is usable.
+        let _ = job_tx.send(worker::Job::RefreshAll);
+    }
 
     // ws supervisor: retries the initial connect until it succeeds, then holds
     // the (auto-reconnecting) client until stop. Survives a server/workspace
@@ -455,3 +466,6 @@ pub fn mount(opts: MountOptions) -> Result<MountHandle> {
         mirror,
     })
 }
+
+#[cfg(test)]
+mod mirror_startup_tests;
