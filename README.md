@@ -181,6 +181,12 @@ What the daemon does:
   cannot hold up the mount on a slow or unavailable network. A first-ever mount
   still needs the hub to resolve the workspace. Only files already downloaded
   are available offline.
+  If an older replica has no usable workspace-name cache, 0.13.5+ verifies the
+  name with the hub once and requires the returned UUID to match `.workspace.json`.
+  It repairs the cache only after the directory and sync-history checks pass;
+  later mounts by the same name work offline. Keep the same mount command and
+  data directory for this upgrade. `--accept-device-change` only acknowledges
+  device renumbering; it does not bypass workspace verification.
   Directory checks use the filesystem ID, inode and creation time (when
   available), recorded transactionally in the existing sync database. A changed
   mount-time device number after reboot, as on ZFS/Btrfs, no longer invalidates

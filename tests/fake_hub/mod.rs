@@ -55,6 +55,7 @@ type RequestHook = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Default)]
 pub struct HubState {
     pub instance_id: Option<String>,
+    pub workspaces: BTreeMap<String, Value>,
     pub objects: BTreeMap<String, Obj>,
     pub log: Vec<LogEntry>,
     pub next_seq: u64,
@@ -395,6 +396,11 @@ fn handle(mut req: Request, state: &Arc<Mutex<HubState>>) {
             "pong",
             None,
         )
+    } else if let Some(workspace) = path
+        .strip_prefix("/rest/v2/workspaces/")
+        .and_then(|selector| state.lock().unwrap().workspaces.get(selector).cloned())
+    {
+        envelope(200, workspace, "OK", None)
     } else if path == "/rest/v2/workspaces/ws1" {
         envelope(200, json!({ "id": "ws1", "name": "ws1" }), "OK", None)
     } else if path == backend_prefix {

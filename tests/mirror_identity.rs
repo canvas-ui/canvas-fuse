@@ -585,7 +585,7 @@ fn offline_workspace_resolution_requires_a_matching_marker_uuid_server_and_name(
         |server: &str, name: &str| cached_workspace(&cfg.mountpoint, &cfg.data_dir, server, name);
     // The UUID works even if the name cache is missing/corrupted.
     assert_eq!(resolve(url, "ws1").unwrap().unwrap().id, "ws1");
-    assert!(resolve(url, "Universe").is_err());
+    assert!(resolve(url, "Universe").unwrap().is_none());
     std::fs::write(
         cfg.data_dir.join("workspace.json"),
         r#"{"id":"ws1","name":"Universe","selector":"universe"}"#,
@@ -594,14 +594,14 @@ fn offline_workspace_resolution_requires_a_matching_marker_uuid_server_and_name(
     assert_eq!(resolve(url, "Universe").unwrap().unwrap().id, "ws1");
     assert_eq!(resolve(url, "universe").unwrap().unwrap().name, "Universe");
     assert!(resolve("http://other.example", "Universe").is_err());
-    assert!(resolve(url, "Augmentd").is_err());
+    assert!(resolve(url, "Augmentd").unwrap().is_none());
     // A stale/wrong data directory cannot route a mirror to another workspace.
     std::fs::write(
         cfg.data_dir.join("workspace.json"),
         r#"{"id":"different","name":"Universe"}"#,
     )
     .unwrap();
-    assert!(resolve(url, "Universe").is_err());
+    assert!(resolve(url, "Universe").unwrap().is_none());
     assert_eq!(resolve(url, "ws1").unwrap().unwrap().id, "ws1");
 }
 

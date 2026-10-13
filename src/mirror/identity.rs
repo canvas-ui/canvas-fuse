@@ -232,15 +232,46 @@ pub fn cached_workspace(
         .filter(|v| v.get("id").and_then(|v| v.as_str()) == Some(marker.workspace_id.as_str()));
     let name = cached.and_then(|v| v.get("name")?.as_str());
     let selector = cached.and_then(|v| v.get("selector")?.as_str());
-    anyhow::ensure!(
-        requested == marker.workspace_id || name == Some(requested) || selector == Some(requested),
-        "cannot verify workspace name `{requested}` against {MARKER}; this mirror belongs to workspace UUID {}. Mount using that UUID with the same destination and --data-dir, or restore its workspace.json name cache",
-        marker.workspace_id
-    );
+    if requested != marker.workspace_id && name != Some(requested) && selector != Some(requested) {
+        // Older replicas can have a valid marker and ledger but no name cache.
+        // This is a cache miss, not permission to trust the directory's name.
+        return Ok(None);
+    }
     Ok(Some(crate::api::WorkspaceInfo {
         id: marker.workspace_id,
         name: name.unwrap_or(requested).to_string(),
     }))
+}
+
+/// Prefer local resolution, but recover a missing/stale display-name cache by
+/// checking the hub. A remote name must resolve to the marker's exact UUID;
+/// Destination still validates the directory/ledger before scans or cache writes.
+pub(crate) fn resolve_workspace(
+    mountpoint: &Path,
+    data_dir: &Path,
+    server: &str,
+    requested: &str,
+    lookup: impl FnOnce(&str) -> Result<crate::api::WorkspaceInfo>,
+) -> Result<(crate::api::WorkspaceInfo, bool)> {
+    if let Some(workspace) = cached_workspace(mountpoint, data_dir, server, requested)? {
+        return Ok((workspace, true));
+    }
+    let marker = read_marker(mountpoint)?;
+    let workspace = lookup(requested).with_context(|| match &marker {
+        Some(marker) => format!(
+            "cannot verify workspace name `{requested}` for existing mirror UUID {}: the workspace.json name cache is missing or does not match. Reconnect to the hub and retry the same mount command to repair the cache; keep {MARKER} and the original sync database",
+            marker.workspace_id
+        ),
+        None => format!("resolving workspace {requested} (first mirror mount requires the hub)"),
+    })?;
+    if let Some(marker) = &marker {
+        anyhow::ensure!(
+            workspace.id == marker.workspace_id,
+            "workspace name `{requested}` resolves to UUID {}, but {MARKER} belongs to UUID {}; refusing to sync {}",
+            workspace.id, marker.workspace_id, mountpoint.display()
+        );
+    }
+    Ok((workspace, marker.is_some()))
 }
 
 /// Persist the name/selector mapping after the destination has been validated.

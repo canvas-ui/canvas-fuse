@@ -190,26 +190,20 @@ fn mount_with_session(
     // Existing mirrors resolve their UUID locally. Slow DNS, a blackholed
     // network or an expired login must never delay access to local files.
     let tree = Arc::new(RwLock::new(if let Some(ws_name) = &opts.workspace {
-        let cached = if mirror_mode {
-            mirror::identity::cached_workspace(
+        let (ws, resumed_mirror) = if mirror_mode {
+            mirror::identity::resolve_workspace(
                 &opts.mountpoint,
                 &opts.data_dir,
                 &opts.server,
                 ws_name,
+                |name| api.get_workspace(name),
             )?
         } else {
-            None
-        };
-        let resumed_mirror = cached.is_some();
-        let ws = match cached {
-            Some(ws) => ws,
-            None => api.get_workspace(ws_name).with_context(|| {
-                if mirror_mode {
-                    format!("resolving workspace {ws_name} (first mirror mount requires the hub)")
-                } else {
-                    format!("resolving workspace {ws_name}")
-                }
-            })?,
+            (
+                api.get_workspace(ws_name)
+                    .with_context(|| format!("resolving workspace {ws_name}"))?,
+                false,
+            )
         };
         if !resumed_mirror && !opts.selection.trees.is_empty() {
             match api.list_trees(&ws.id) {
