@@ -570,3 +570,84 @@ fn additive_downloads_preserve_symlinks_and_do_not_follow_linked_parents() {
     assert!(!hub.lock().requests.iter().any(|r| r.starts_with("GET ")
         && (r.ends_with("/objects/link.txt") || r.ends_with("/objects/linked-dir/new.txt"))));
 }
+
+#[test]
+fn recovery_pull_restores_remote_only_files_and_never_replaces_local_ones() {
+    let hub = FakeHub::start();
+    for key in ["same.txt", "deleted.txt", "move.txt", "edited.txt"] {
+        hub.lock().put(key, b"base");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let m = open(&dir, &hub, false);
+    m.cycle(true);
+    drop(m);
+    let m = open(&dir, &hub, true);
+    m.delete_local("deleted.txt").unwrap();
+    m.rename_local("move.txt", "moved.txt").unwrap();
+    m.commit_write("edited.txt", b"local edit").unwrap();
+    hub.lock().put("edited.txt", b"remote edit");
+    m.cycle(true);
+    settle(&m);
+    assert!(m.push_local(false).unwrap().failed == 0);
+    assert!(!m.store.blocked_actions().is_empty());
+    std::fs::write(m.local.path(".ignored"), b"private").unwrap();
+    hub.lock().put(".ignored", b"remote private");
+
+    let entries = m.store.entries("");
+    let jobs = m.store.jobs();
+    let preview = m.pull_remote(true).unwrap();
+    assert_eq!(preview.downloaded, 2, "{:?}", preview.items);
+    assert_eq!(m.store.entries(""), entries);
+    assert_eq!(m.store.jobs(), jobs);
+    assert!(!m.local.exists("deleted.txt"));
+
+    let report = m.pull_remote(false).unwrap();
+    assert_eq!(
+        (
+            report.downloaded,
+            report.kept,
+            report.skipped,
+            report.failed
+        ),
+        (2, 3, 1, 0),
+        "{:?}",
+        report.items
+    );
+    assert_eq!(m.local.read_all("deleted.txt").unwrap(), b"base");
+    assert_eq!(m.local.read_all("move.txt").unwrap(), b"base");
+    assert_eq!(m.local.read_all("moved.txt").unwrap(), b"base");
+    assert_eq!(m.local.read_all("edited.txt").unwrap(), b"local edit");
+    assert_eq!(m.local.read_all(".ignored").unwrap(), b"private");
+    assert!(m.store.jobs().iter().all(|j| !matches!(
+        &j.kind,
+        JobKind::Delete { key, .. } | JobKind::Rename { from: key, .. }
+            if key == "deleted.txt" || key == "move.txt"
+    )));
+    assert!(m
+        .store
+        .blocked_actions()
+        .iter()
+        .all(|a| a.key != "deleted.txt" && a.key != "move.txt"));
+
+    // Resuming ordinary sync must not undo the union upstream.
+    drop(m);
+    let m = open(&dir, &hub, false);
+    m.cycle(true);
+    settle(&m);
+    for key in ["same.txt", "deleted.txt", "move.txt", "moved.txt"] {
+        assert_eq!(hub.lock().objects[key].bytes, b"base", "{key}");
+        assert_eq!(m.local.read_all(key).unwrap(), b"base", "{key}");
+    }
+}
+
+#[test]
+fn recovery_pull_requires_protection() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    let m = open(&dir, &hub, false);
+    assert!(m
+        .pull_remote(true)
+        .unwrap_err()
+        .to_string()
+        .contains("--protected"));
+}

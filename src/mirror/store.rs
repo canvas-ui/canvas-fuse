@@ -788,6 +788,27 @@ impl Store {
         Ok(!same)
     }
 
+    /// Forget the audit for a key once recovery settled it on both sides.
+    pub fn remove_blocked_for(&self, key: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(BLOCKED)?;
+            let ids: Vec<String> = t
+                .iter()?
+                .flatten()
+                .filter(|(_, v)| {
+                    dec::<super::protection::BlockedAction>(v.value()).is_some_and(|a| a.key == key)
+                })
+                .map(|(id, _)| id.value().to_string())
+                .collect();
+            for id in ids {
+                t.remove(id.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_meta(&self, name: &str, value: &str) -> Result<()> {
         let tx = self.db.begin_write()?;
         {

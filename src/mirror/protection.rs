@@ -40,7 +40,38 @@ pub struct PushReport {
     pub unchanged: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Pull only: remote-only files fetched, and remote files left alone
+    /// because a local file exists at that path.
+    #[serde(default)]
+    pub downloaded: u64,
+    #[serde(default)]
+    pub kept: u64,
     pub items: Vec<PushItem>,
+}
+
+impl PushReport {
+    pub(crate) fn record(&mut self, item: PushItem) {
+        match item.action.as_str() {
+            "create" => self.created += 1,
+            "replace" => self.replaced += 1,
+            "unchanged" => self.unchanged += 1,
+            "download" => self.downloaded += 1,
+            "kept" => self.kept += 1,
+            "skipped" => self.skipped += 1,
+            _ => self.failed += 1,
+        }
+        log::info!(
+            "mirror recovery{}: {} {}{}",
+            if self.dry_run { " preview" } else { "" },
+            item.action,
+            item.key,
+            item.detail
+                .as_ref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        );
+        self.items.push(item);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

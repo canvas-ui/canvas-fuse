@@ -269,6 +269,15 @@ enum SyncCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Download remote-only files without replacing or removing local ones (--protected mount)
+    Pull {
+        mountpoint: PathBuf,
+        /// Preview downloads without changing files or sync history
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// List recorded destructive actions deferred by --protected
     Blocked {
         mountpoint: PathBuf,
@@ -409,6 +418,14 @@ fn main() -> Result<()> {
                     json,
                 },
         } => cmd_sync_push(&mountpoint, dry_run, json),
+        Command::Sync {
+            what:
+                SyncCommand::Pull {
+                    mountpoint,
+                    dry_run,
+                    json,
+                },
+        } => cmd_sync_pull(&mountpoint, dry_run, json),
         Command::Sync {
             what: SyncCommand::Blocked { mountpoint, json },
         } => cmd_sync_blocked(&mountpoint, json),
@@ -970,6 +987,56 @@ fn cmd_sync_push(mountpoint: &Path, dry_run: bool, as_json: bool) -> Result<()> 
     Ok(())
 }
 
+fn cmd_sync_pull(mountpoint: &Path, dry_run: bool, as_json: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    if !as_json {
+        eprintln!(
+            "{} remote-only files; progress is written to the mount's log",
+            if dry_run { "previewing" } else { "downloading" }
+        );
+    }
+    let resp = control::request(&sock, &json!({"cmd": "pull", "dryRun": dry_run}))?;
+    let report: canvas_fuse::mirror::protection::PushReport =
+        serde_json::from_value(resp["report"].clone())?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        // Files already present locally are the bulk; list only what moved
+        // or needs a look.
+        for item in report
+            .items
+            .iter()
+            .filter(|i| i.action != "kept" || i.detail.is_some())
+        {
+            println!(
+                "{}{}: {}{}",
+                if dry_run { "would " } else { "" },
+                item.action,
+                item.key,
+                item.detail
+                    .as_ref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            );
+        }
+        println!(
+            "{}: {} download, {} kept local, {} skipped, {} failed; local files never replaced",
+            if dry_run { "preview" } else { "recovery pull" },
+            report.downloaded,
+            report.kept,
+            report.skipped,
+            report.failed
+        );
+    }
+    anyhow::ensure!(
+        report.failed == 0,
+        "recovery {} encountered {} failed files; inspect the report before retrying",
+        if dry_run { "preview" } else { "pull" },
+        report.failed
+    );
+    Ok(())
+}
+
 fn cmd_sync_blocked(mountpoint: &Path, as_json: bool) -> Result<()> {
     let sock = mirror_socket(mountpoint)?;
     let resp = control::request(&sock, &json!({"cmd": "blocked"}))?;
@@ -1200,6 +1267,18 @@ mod root_selector_tests {
                 matches!(cli.command, super::Command::Sync { what: super::SyncCommand::Push { dry_run: value, json: true, .. } } if value == dry_run)
             );
         }
+        assert!(matches!(
+            Cli::try_parse_from(["canvas-fuse", "sync", "pull", "/tmp/mirror", "--dry-run"])
+                .unwrap()
+                .command,
+            super::Command::Sync {
+                what: super::SyncCommand::Pull {
+                    dry_run: true,
+                    json: false,
+                    ..
+                }
+            }
+        ));
         assert!(
             Cli::try_parse_from(["canvas-fuse", "sync", "blocked", "/tmp/mirror", "--json"])
                 .is_ok()

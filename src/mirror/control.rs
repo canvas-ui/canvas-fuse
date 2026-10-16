@@ -9,7 +9,7 @@
 //! store itself; it asks.
 //!
 //! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
-//! `{"cmd":"status"}`, `{"cmd":"blocked"}`, `{"cmd":"push","dryRun":true}`.
+//! `{"cmd":"status"}`, `{"cmd":"blocked"}`, `{"cmd":"push","dryRun":true}`, `{"cmd":"pull","dryRun":true}`.
 //! Responses: `{"ok":true, …}` or
 //! `{"ok":false,"error":"…"}`.
 
@@ -110,6 +110,12 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
         "blocked" => json!({"ok": true, "actions": mirror.store.blocked_actions()}),
         "push" => {
             match mirror.push_local(req.get("dryRun").and_then(Value::as_bool).unwrap_or(true)) {
+                Ok(report) => json!({"ok": true, "report": report}),
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            }
+        }
+        "pull" => {
+            match mirror.pull_remote(req.get("dryRun").and_then(Value::as_bool).unwrap_or(true)) {
                 Ok(report) => json!({"ok": true, "report": report}),
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             }

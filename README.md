@@ -353,6 +353,21 @@ stops further uploads if connectivity or authentication is lost. Progress goes
 to the mount's log. After completion the mount remains protected, including
 its deferred delete and rename jobs.
 
+The opposite direction downloads remote files that are absent locally and
+never replaces or removes a local file:
+
+```sh
+canvas-fuse sync pull ~/Canvas/Workspaces/Universe --dry-run
+canvas-fuse sync pull ~/Canvas/Workspaces/Universe
+```
+
+This includes files the sync history remembers as deleted or renamed away
+locally; restoring them drops the pending upstream delete or file rename for
+that path. Paths under a pending directory rename, symlinks and excluded files
+are skipped. Running `push` then `pull` leaves both sides with the union, so
+the only differences left to review are files edited on both sides. Either
+command also clears the `sync blocked` records of every path it settled.
+
 **Offline.** The mount stays up (it also *mounts* without the hub, once it
 has seen the workspace once), and every file reads and writes normally —
 there is no cache to miss. Reconnect (socket re-auth, the poll, or
