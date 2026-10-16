@@ -211,11 +211,25 @@ pub fn connect(
                 .unwrap_or(false);
             let msg = val
                 .as_ref()
-                .and_then(|v| v.get("message"))
-                .and_then(Value::as_str)
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| v.get("error").and_then(Value::as_str))
+                        .or_else(|| v.as_str())
+                })
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{payload:?}"));
-            if retryable {
+            // Workspace services also emit `error` (e.g. an IMAP connection
+            // failure). The server relays it over this healthy socket; it is
+            // not a FUSE transport failure. Keep the warning and its origin.
+            let source = val
+                .as_ref()
+                .and_then(|v| Some((v.get("workspaceId")?.as_str()?, v.get("source")?.as_str()?)));
+            if let Some((workspace, source)) = source {
+                log::warn!(
+                    "workspace source error (workspace={workspace}, source={source}): {msg}"
+                );
+            } else if retryable {
                 log::debug!("ws not-ready (will retry): {msg}");
             } else {
                 log::warn!("ws error: {msg}");
