@@ -57,14 +57,12 @@ pub struct Document {
     /// `resolve_display_name`). None when nothing names it and the renderer
     /// must derive one.
     pub display_name: Option<String>,
-    /// Whether the server says this document is filed AT the path being listed,
-    /// rather than showing through from a path below it (a context path lists
-    /// its whole subtree). Decides who keeps the plain filename when two
-    /// documents in one folder answer to the same name.
-    ///
-    /// True when the server said nothing — an older server, or a listing with
-    /// no placement to report. That is the old behaviour: everything counts as
-    /// filed here, and id order breaks the tie.
+    /// Whether the document is filed AT the path being listed, rather than
+    /// showing through from a path below it (a context path lists its whole
+    /// subtree): the listing's `filedHere` ids. Decides who keeps the plain
+    /// filename when two documents in one folder answer to the same name.
+    /// A listing without `filedHere` (a directory tree, node-exact already)
+    /// counts everything as filed here.
     pub linked_here: bool,
     /// metadata.size — getattr size for blob-backed docs
     pub size: Option<u64>,
@@ -291,11 +289,11 @@ impl ApiClient {
         let mut offset = 0usize;
         loop {
             let body = self.get_json(&format!(
-                "/rest/v2/contexts/{context_id}/documents?limit={PAGE_SIZE}&offset={offset}"
+                "/rest/v2/contexts/{context_id}/documents?placement=true&limit={PAGE_SIZE}&offset={offset}"
             ))?;
             let batch = extract_documents(&body);
             let batch_len = batch.len();
-            docs.extend(batch.iter().filter_map(parse_document));
+            docs.extend(placed(&body, batch.iter().filter_map(parse_document)));
             let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             offset += batch_len;
             if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
@@ -391,7 +389,7 @@ impl ApiClient {
         let mut offset = 0usize;
         loop {
             let body = self.get_json(&format!(
-                "/rest/v2/workspaces/{}/documents?treeNameOrTreeId={}&treeType={}&context={}&limit={PAGE_SIZE}&offset={offset}",
+                "/rest/v2/workspaces/{}/documents?treeNameOrTreeId={}&treeType={}&context={}&placement=true&limit={PAGE_SIZE}&offset={offset}",
                 encode_segment(ws),
                 encode_segment(tree),
                 encode_segment(tree_type),
@@ -399,7 +397,7 @@ impl ApiClient {
             ))?;
             let batch = extract_documents(&body);
             let batch_len = batch.len();
-            docs.extend(batch.iter().filter_map(parse_document));
+            docs.extend(placed(&body, batch.iter().filter_map(parse_document)));
             let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             offset += batch_len;
             if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
@@ -899,6 +897,20 @@ fn extract_result_ids(body: &Value) -> Vec<u64> {
 
 // payload is usually the document array itself, but tolerate it being
 // wrapped in {data: [...]} or {documents: [...]} depending on ResponseObject path
+/// Mark each listed document with whether the listing's `filedHere` names it.
+fn placed(body: &Value, docs: impl Iterator<Item = Document>) -> impl Iterator<Item = Document> {
+    let filed: Option<std::collections::HashSet<u64>> = body
+        .get("filedHere")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_u64).collect());
+    docs.map(move |mut doc| {
+        if let Some(filed) = &filed {
+            doc.linked_here = filed.contains(&doc.id);
+        }
+        doc
+    })
+}
+
 fn extract_documents(body: &Value) -> Vec<Value> {
     let payload = match body.get("payload") {
         Some(p) => p,
@@ -1008,10 +1020,6 @@ fn parse_document(doc: &Value) -> Option<Document> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let display_name = resolve_display_name(doc);
-    let linked_here = doc
-        .get("linkedHere")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let raw = if crate::render::has_renderer(&schema) {
         None
     } else {
@@ -1024,7 +1032,7 @@ fn parse_document(doc: &Value) -> Option<Document> {
         data,
         updated_at,
         locations,
-        linked_here,
+        linked_here: true,
         size,
         checksum,
         raw,
