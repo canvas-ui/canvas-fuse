@@ -134,14 +134,19 @@ fn bootstrap_and_refresh_only_fetch_selected_tree_paths_and_documents() {
                 let listings = |current: bool| {
                     requests
                         .iter()
-                        .filter(|url| url.contains(&format!("/documents?treeNameOrTreeId=t-{name}&")))
+                        .filter(|url| {
+                            url.contains(&format!("/documents?treeNameOrTreeId=t-{name}&"))
+                        })
                         .filter(|url| url.contains("currentPathOnly=true") == current)
                         .count()
                 };
                 assert_eq!(listings(false), if included { 2 } else { 0 });
                 // Context paths also ask which listed ids are filed at the path
                 // itself; directory trees are node-exact and do not.
-                assert_eq!(listings(true), if included && name == "context" { 2 } else { 0 });
+                assert_eq!(
+                    listings(true),
+                    if included && name == "context" { 2 } else { 0 }
+                );
             }
             assert_eq!(requests.iter().any(|url| url.ends_with("/trash")), trash);
             if expected.is_empty() {
