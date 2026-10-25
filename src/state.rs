@@ -797,8 +797,14 @@ impl Tree {
 
             // Sticky names are keyed per context AND per context URL: there
             // are no schema dirs to key by anymore, and the URL is what decides
-            // which documents are filed here (see `ctx_urls`).
-            let persisted = names.get(ctx_id, &ws_key, &name_key, doc.id);
+            // which documents are filed here (see `ctx_urls`). A sticky name
+            // keeps a document's plain-or-suffixed name stable; it stands only
+            // while it is still that document's server name (a rename made
+            // anywhere else makes it stale).
+            let persisted = names.get(ctx_id, &ws_key, &name_key, doc.id).filter(|n| {
+                *n == rendered.base_name
+                    || *n == render::with_id_suffix(&rendered.base_name, doc.id)
+            });
             let name = match persisted {
                 Some(n) if !taken.contains(&n) => n,
                 _ => {

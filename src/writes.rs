@@ -930,7 +930,15 @@ impl WriteStore {
 
         match dst_tree_ino {
             None => {
-                // Plain rename: sticky-name reassignment, doc untouched
+                // Plain rename: the document's filename changes on the server,
+                // as through WebDAV or a tree mount; the sticky name follows.
+                let existing = self
+                    .api
+                    .get_document(&ctx, src_doc)
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
+                self.api
+                    .update_documents(&ctx, vec![renamed_record(&existing, src_doc, dst_name)])
+                    .map_err(|e| WriteError::Io(format!("{e:#}")))?;
                 let ws = self.tree.read().workspace_of(&ctx).unwrap_or_default();
                 self.names
                     .put(&ctx, &ws, &dir, src_doc, dst_name)
@@ -1615,20 +1623,13 @@ impl WriteStore {
             .api
             .get_workspace_document(ws, doc_id)
             .map_err(|e| WriteError::Io(format!("{e:#}")))?;
-        let schema = existing
-            .get("schema")
-            .and_then(Value::as_str)
-            .unwrap_or("data/schema/note")
-            .to_string();
-        let mut data = existing.get("data").cloned().unwrap_or_else(|| json!({}));
-        data["filename"] = json!(filename);
         self.api
             .update_workspace_documents(
                 ws,
                 tree_id,
                 tree_type,
                 path,
-                vec![json!({ "id": doc_id, "schema": schema, "data": data })],
+                vec![renamed_record(&existing, doc_id, filename)],
             )
             .map_err(|e| WriteError::Io(format!("{e:#}")))?;
         Ok(())
@@ -1915,6 +1916,26 @@ fn ws_doc_schema(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The update that renames a document, by the server's rule (WebDAV
+/// `renamedRecord`): a File names itself in `metadata.filename`, which the
+/// server merges; every other schema in `data.filename`, and since `data` is
+/// replaced as a whole, all of it is sent.
+pub(crate) fn renamed_record(existing: &Value, doc_id: u64, filename: &str) -> Value {
+    let schema = existing
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("data/schema/note");
+    if schema == "data/schema/file" {
+        return json!({ "id": doc_id, "schema": schema, "metadata": { "filename": filename } });
+    }
+    let mut data = match existing.get("data") {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        _ => json!({}),
+    };
+    data["filename"] = json!(filename);
+    json!({ "id": doc_id, "schema": schema, "data": data })
+}
+
 /// Build a new workspace document from a filename + body. `data.filename` pins
 /// the on-disk name so re-saves round-trip to the same document.
 /// A File document for already-uploaded bytes. `data` stays empty (the server's
@@ -2014,7 +2035,25 @@ fn first_markdown_h1(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ws_document, first_markdown_h1};
+    use super::{build_ws_document, first_markdown_h1, renamed_record};
+    use serde_json::json;
+
+    #[test]
+    fn renames_follow_the_server_naming_rule() {
+        // A File names itself in metadata (merged by the server); data stays out.
+        let file = json!({ "schema": "data/schema/file", "data": {}, "metadata": { "filename": "a.mov", "size": 9 } });
+        assert_eq!(
+            renamed_record(&file, 7, "cut.mov"),
+            json!({ "id": 7, "schema": "data/schema/file", "metadata": { "filename": "cut.mov" } })
+        );
+        // Everything else names itself in data, which is replaced as a whole.
+        let note =
+            json!({ "schema": "data/schema/note", "data": { "title": "Plan", "content": "x" } });
+        assert_eq!(
+            renamed_record(&note, 8, "Roadmap.md"),
+            json!({ "id": 8, "schema": "data/schema/note", "data": { "title": "Plan", "content": "x", "filename": "Roadmap.md" } })
+        );
+    }
 
     #[test]
     fn h1_title_derivation() {

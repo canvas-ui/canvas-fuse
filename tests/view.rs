@@ -169,6 +169,22 @@ fn title_collisions_get_id_suffix_and_stick() {
 }
 
 #[test]
+fn a_rename_made_elsewhere_replaces_the_sticky_name() {
+    let (_tmp, names) = store();
+    let mut tree = Tree::new();
+    tree.apply_contexts(&[ctx("work", "/work")]);
+    tree.apply_documents("work", &[note(1, "Plan", "a")], &names);
+    assert_eq!(doc_names(&tree, "work"), vec!["Plan.note.md"]);
+
+    // Renamed through the web or WebDAV: the server's name now differs from
+    // the pinned one, which therefore no longer stands.
+    let mut renamed = note(1, "Plan", "a");
+    renamed.display_name = Some("Roadmap.md".to_string());
+    tree.apply_documents("work", &[renamed], &names);
+    assert_eq!(doc_names(&tree, "work"), vec!["Roadmap.md"]);
+}
+
+#[test]
 fn context_switch_diffs_and_keeps_inodes_stable() {
     let (_tmp, names) = store();
     let mut tree = Tree::new();
