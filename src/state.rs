@@ -26,9 +26,9 @@ use std::time::SystemTime;
 /// equal standing, and on its own it made the name `CLAUDE.md` mean whichever
 /// one happened to be created first — a different document at every path, and
 /// a different one again after a re-file. `linked_here` comes from the server,
-/// which is the only party that knows the tree (`filedHere` on the REST
-/// listings); a listing without it counts every document as filed here, and
-/// the id alone decides.
+/// which is the only party that knows the tree (`currentPathOnly` on the REST
+/// listings); in a directory tree every document counts as filed here, and the
+/// id alone decides.
 ///
 /// The server's own views (WebDAV) name documents by the same rule, because a
 /// document opened over two wires has to be one file with one name.

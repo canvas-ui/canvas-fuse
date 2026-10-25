@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 const PAGE_SIZE: usize = 500;
@@ -58,11 +59,10 @@ pub struct Document {
     /// must derive one.
     pub display_name: Option<String>,
     /// Whether the document is filed AT the path being listed, rather than
-    /// showing through from a path below it (a context path lists its whole
-    /// subtree): the listing's `filedHere` ids. Decides who keeps the plain
-    /// filename when two documents in one folder answer to the same name.
-    /// A listing without `filedHere` (a directory tree, node-exact already)
-    /// counts everything as filed here.
+    /// showing through from a deeper path (a context path also lists what is
+    /// filed at its deeper paths): the path's `currentPathOnly` ids. Decides
+    /// who keeps the plain filename when two documents in one folder answer to
+    /// the same name. Directory trees are node-exact: everything listed counts.
     pub linked_here: bool,
     /// metadata.size — getattr size for blob-backed docs
     pub size: Option<u64>,
@@ -289,18 +289,46 @@ impl ApiClient {
         let mut offset = 0usize;
         loop {
             let body = self.get_json(&format!(
-                "/rest/v2/contexts/{context_id}/documents?placement=true&limit={PAGE_SIZE}&offset={offset}"
+                "/rest/v2/contexts/{context_id}/documents?limit={PAGE_SIZE}&offset={offset}"
             ))?;
             let batch = extract_documents(&body);
             let batch_len = batch.len();
-            docs.extend(placed(&body, batch.iter().filter_map(parse_document)));
+            docs.extend(batch.iter().filter_map(parse_document));
             let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             offset += batch_len;
             if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
                 break;
             }
         }
+        let filed = self.current_path_ids(&format!("/rest/v2/contexts/{context_id}/documents?"))?;
+        mark_filed(&mut docs, &filed);
         Ok(docs)
+    }
+
+    /// Ids of the documents filed at the listed path itself, not at a deeper
+    /// one (`currentPathOnly`; a context path also lists its deeper paths).
+    /// `listing` is the listing URL up to and including `?` or `&`.
+    fn current_path_ids(&self, listing: &str) -> Result<HashSet<u64>> {
+        let mut ids = HashSet::new();
+        let mut offset = 0usize;
+        loop {
+            let body = self.get_json(&format!(
+                "{listing}currentPathOnly=true&idsOnly=true&limit={PAGE_SIZE}&offset={offset}"
+            ))?;
+            let batch: Vec<u64> = body
+                .get("payload")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default();
+            let batch_len = batch.len();
+            ids.extend(batch);
+            let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
+            offset += batch_len;
+            if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
+                break;
+            }
+        }
+        Ok(ids)
     }
 
     // ── Workspace tree mount ─────────────────────────────────────────────────
@@ -385,24 +413,30 @@ impl ApiClient {
         tree_type: &str,
         path: &str,
     ) -> Result<Vec<Document>> {
+        let listing = format!(
+            "/rest/v2/workspaces/{}/documents?treeNameOrTreeId={}&treeType={}&context={}&",
+            encode_segment(ws),
+            encode_segment(tree),
+            encode_segment(tree_type),
+            encode_component(path),
+        );
         let mut docs = Vec::new();
         let mut offset = 0usize;
         loop {
-            let body = self.get_json(&format!(
-                "/rest/v2/workspaces/{}/documents?treeNameOrTreeId={}&treeType={}&context={}&placement=true&limit={PAGE_SIZE}&offset={offset}",
-                encode_segment(ws),
-                encode_segment(tree),
-                encode_segment(tree_type),
-                encode_component(path),
-            ))?;
+            let body = self.get_json(&format!("{listing}limit={PAGE_SIZE}&offset={offset}"))?;
             let batch = extract_documents(&body);
             let batch_len = batch.len();
-            docs.extend(placed(&body, batch.iter().filter_map(parse_document)));
+            docs.extend(batch.iter().filter_map(parse_document));
             let total = body.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
             offset += batch_len;
             if batch_len < PAGE_SIZE || (total > 0 && offset >= total) {
                 break;
             }
+        }
+        // Directory trees are node-exact: everything listed is filed here.
+        if tree_type == "context" {
+            let filed = self.current_path_ids(&listing)?;
+            mark_filed(&mut docs, &filed);
         }
         Ok(docs)
     }
@@ -895,22 +929,15 @@ fn extract_result_ids(body: &Value) -> Vec<u64> {
     Vec::new()
 }
 
-// payload is usually the document array itself, but tolerate it being
-// wrapped in {data: [...]} or {documents: [...]} depending on ResponseObject path
-/// Mark each listed document with whether the listing's `filedHere` names it.
-fn placed(body: &Value, docs: impl Iterator<Item = Document>) -> impl Iterator<Item = Document> {
-    let filed: Option<std::collections::HashSet<u64>> = body
-        .get("filedHere")
-        .and_then(Value::as_array)
-        .map(|ids| ids.iter().filter_map(Value::as_u64).collect());
-    docs.map(move |mut doc| {
-        if let Some(filed) = &filed {
-            doc.linked_here = filed.contains(&doc.id);
-        }
-        doc
-    })
+/// Mark each listed document with whether it is filed at the listed path.
+fn mark_filed(docs: &mut [Document], filed: &HashSet<u64>) {
+    for doc in docs {
+        doc.linked_here = filed.contains(&doc.id);
+    }
 }
 
+// payload is usually the document array itself, but tolerate it being
+// wrapped in {data: [...]} or {documents: [...]} depending on ResponseObject path
 fn extract_documents(body: &Value) -> Vec<Value> {
     let payload = match body.get("payload") {
         Some(p) => p,
