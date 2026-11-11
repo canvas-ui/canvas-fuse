@@ -240,6 +240,24 @@ pub fn conflict_copy_key(key: &str, device: &str, at: chrono::DateTime<chrono::U
     }
 }
 
+/// `<stem> (restored <YYYY-MM-DD HHmm>).<ext>` next to the original: where a
+/// trashed copy lands when its name is taken again.
+pub fn restored_copy_key(key: &str, at: chrono::DateTime<chrono::Utc>) -> String {
+    let (dir, name) = match key.rsplit_once('/') {
+        Some((d, n)) => (Some(d), n),
+        None => (None, key),
+    };
+    let stamp = at.format("%Y-%m-%d %H%M");
+    let leaf = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} (restored {stamp}).{ext}"),
+        _ => format!("{name} (restored {stamp})"),
+    };
+    match dir {
+        Some(d) => format!("{d}/{leaf}"),
+        None => leaf,
+    }
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

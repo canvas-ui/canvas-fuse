@@ -287,10 +287,34 @@ What the daemon does:
   `canvas-fuse conflicts <mountpoint>` lists what this device recorded. A
   copy of your bytes is kept under the data dir (`conflicts/<sha256>`)
   until the conflict is resolved.
+- **Files that go missing in bulk are not deleted on the hub.** A `rm`
+  through the mount is sent at once. Files a folder scan finds missing
+  (deleted while unmounted, a rolled-back folder, a sub-folder on a drive
+  that is no longer there) are sent only when they are few: 20 or more that
+  make up a quarter of the mirror are held, `status` shows `heldDeletes` and
+  the reason, and nothing changes on the hub until you decide.
+  `canvas-fuse deletes list|approve|restore <mountpoint>`: `approve` deletes
+  them on the hub, `restore` downloads the hub's copies again. Files that
+  reappear leave the hold on their own. Files under a symlinked folder, or
+  under a mount point inside Home whose filesystem is not mounted, are never
+  treated as deleted; they are listed as skipped and stay on the hub.
+- **Moves stay moves.** A file or folder moved while nothing was mounted is
+  recognised on the next scan by its content and sent to the hub as a rename:
+  no upload, no deletion, and the hub keeps the document with its history. A
+  whole folder goes out as one directory rename. Moves made on the hub while
+  this device was offline are replayed from the hub's change log before
+  anything else syncs, so the local file is moved in place. A local edit that
+  was not uploaded yet moves with the file and is uploaded under the new
+  name. When the same file was moved to different names on both sides, both
+  names are kept.
 - **Hub deletes go to a local trash.** A file deleted on the hub leaves the
   folder but is kept for 30 days in `<data dir>/trash/<path>`:
   `canvas-fuse trash list|restore <mountpoint> [<key>]` (restore = push as a
-  new file). An edit on one side beats a delete on the other, both ways.
+  new file). Every deleted version is kept: a second deletion of the same
+  name gets its own entry, and a new file under that name does not discard
+  the old copy. When the name is taken again, restore puts the copy next to
+  it as `<name> (restored <date>)`. An edit on one side beats a delete on
+  the other, both ways.
   `--deletes keep` makes a local `rm` drop only the local copy.
   On the hub, deleting the final location removes the document from the index
   by default (server 2.16.0 / runtime-core 0.2.0). Workspace administrators can
@@ -394,7 +418,7 @@ requires an explicit `--data-dir`; it is never silently replaced. If you use
 a custom `--data-dir`, keep supplying it on every mount.
 
 **Server recovery is separate from the mirror trash.** With the server's
-default `CANVAS_RETENTION_DAYS=30`, displaced local-backend bytes are retained
+default `CANVAS_TRASH_RETENTION_DAYS=30`, displaced local-backend bytes are retained
 under `<workspace-home>/.stored-tmp/retained/<sha256>`. They are outside the
 indexed tree and do not appear in the mounted `Trash/`. The retention index
 maps digests to original paths; identical contents can share one blob. Inspect

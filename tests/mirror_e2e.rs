@@ -1736,3 +1736,302 @@ fn inotify_uploads_direct_additions_edits_and_imported_subtrees_without_polling(
     }
     assert_eq!(Arc::strong_count(&r.mirror), 1, "engine stopped");
 }
+
+fn seeded(count: usize) -> Rig {
+    let r = rig(opts());
+    for i in 0..count {
+        r.hub
+            .lock()
+            .put(&format!("Docs/f{i}.txt"), format!("data {i}").as_bytes());
+    }
+    r.hub.lock().put("keep.txt", b"keep");
+    r.mirror.cycle(true);
+    r
+}
+
+#[test]
+fn files_missing_in_bulk_are_held_until_approved() {
+    let r = seeded(30);
+    std::fs::remove_dir_all(r._dir.path().join("Home/Docs")).unwrap();
+    r.mirror.cycle(true);
+    settle(&r.mirror);
+    assert_eq!(r.mirror.status().held_deletes, 30);
+    assert!(r.mirror.status().last_error.unwrap().contains("held"));
+    assert!(r.hub.lock().entries("delete").is_empty(), "nothing sent");
+    assert!(r.hub.lock().bytes_of("Docs/f0.txt").is_some());
+
+    assert_eq!(r.mirror.approve_deletes().unwrap(), 30);
+    r.mirror.cycle(true);
+    settle(&r.mirror);
+    assert_eq!(r.hub.lock().entries("delete").len(), 30);
+    assert_eq!(r.mirror.status().held_deletes, 0);
+    assert!(r.hub.lock().bytes_of("keep.txt").is_some());
+}
+
+#[test]
+fn held_deletions_can_be_restored_from_the_hub() {
+    let r = seeded(30);
+    std::fs::remove_dir_all(r._dir.path().join("Home/Docs")).unwrap();
+    r.mirror.cycle(true);
+    assert_eq!(r.mirror.restore_deletes().unwrap(), 30);
+    r.mirror.cycle(true);
+    settle(&r.mirror);
+    assert_eq!(r.home_read("Docs/f7.txt").unwrap(), b"data 7");
+    assert!(r.hub.lock().entries("delete").is_empty());
+    assert_eq!(r.mirror.status().held_deletes, 0);
+}
+
+#[test]
+fn held_files_that_reappear_leave_the_hold_on_their_own() {
+    let r = seeded(30);
+    let docs = r._dir.path().join("Home/Docs");
+    let aside = r._dir.path().join("aside");
+    std::fs::rename(&docs, &aside).unwrap();
+    r.mirror.cycle(true);
+    assert_eq!(r.mirror.status().held_deletes, 30);
+    std::fs::rename(&aside, &docs).unwrap();
+    r.mirror.cycle(true);
+    assert_eq!(r.mirror.status().held_deletes, 0);
+    assert!(r.mirror.status().last_error.is_none());
+    assert!(r.hub.lock().entries("delete").is_empty());
+}
+
+#[test]
+fn a_few_missing_files_are_deleted_without_a_hold() {
+    let r = seeded(30);
+    std::fs::remove_file(r._dir.path().join("Home/Docs/f3.txt")).unwrap();
+    r.mirror.cycle(true);
+    settle(&r.mirror);
+    assert_eq!(r.hub.lock().entries("delete").len(), 1);
+    assert_eq!(r.mirror.status().held_deletes, 0);
+}
+
+#[test]
+fn files_under_a_dangling_link_are_never_deleted_on_the_hub() {
+    let r = seeded(3);
+    let docs = r._dir.path().join("Home/Docs");
+    let elsewhere = r._dir.path().join("elsewhere");
+    std::fs::rename(&docs, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &docs).unwrap();
+    r.mirror.cycle(true);
+    // The drive holding the link's target goes away.
+    std::fs::rename(&elsewhere, r._dir.path().join("unplugged")).unwrap();
+    r.mirror.cycle(true);
+    settle(&r.mirror);
+    assert!(r.hub.lock().entries("delete").is_empty());
+    assert!(r.hub.lock().bytes_of("Docs/f0.txt").is_some());
+    assert!(r.mirror.status().skipped >= 3);
+}
+
+fn inode(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// Seeded and synced, then the daemon is gone: the folder is just a folder.
+fn seeded_offline(count: usize) -> (FakeHub, tempfile::TempDir) {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..count {
+        hub.lock()
+            .put(&format!("Docs/f{i}.txt"), format!("data {i}").as_bytes());
+    }
+    hub.lock().put("keep.txt", b"keep");
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert_eq!(m.status().pending, 0);
+    (hub, dir)
+}
+
+#[test]
+fn a_folder_moved_while_the_daemon_was_down_is_one_move_on_the_hub() {
+    let (hub, dir) = seeded_offline(30);
+    let home = dir.path().join("Home");
+    std::fs::create_dir_all(home.join("Archive")).unwrap();
+    std::fs::rename(home.join("Docs"), home.join("Archive/Docs")).unwrap();
+    let before = hub.lock().log.len();
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    assert_eq!(m.status().held_deletes, 0, "a move is not a deletion");
+    assert_eq!(m.status().pending, 0);
+    assert_eq!(
+        hub.lock().directory_renames,
+        vec![("Docs".to_string(), "Archive/Docs".to_string())]
+    );
+    let log = hub.lock().log[before..].to_vec();
+    assert!(
+        log.iter().all(|e| e.op != "put" && e.op != "delete"),
+        "no file was uploaded or deleted"
+    );
+    assert!(hub.lock().bytes_of("Docs/f0.txt").is_none());
+    assert_eq!(
+        hub.lock().bytes_of("Archive/Docs/f29.txt").unwrap(),
+        b"data 29"
+    );
+    assert_eq!(
+        m.entry("Archive/Docs/f3.txt").unwrap().state,
+        EntryState::Clean
+    );
+    assert!(m.trash_list().is_empty());
+}
+
+#[test]
+fn a_file_moved_while_the_daemon_was_down_is_renamed_on_the_hub() {
+    let (hub, dir) = seeded_offline(3);
+    let home = dir.path().join("Home");
+    std::fs::create_dir_all(home.join("2026")).unwrap();
+    std::fs::rename(home.join("Docs/f1.txt"), home.join("2026/invoice.txt")).unwrap();
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    let renames = hub.lock().entries("rename");
+    assert_eq!(renames.len(), 1);
+    assert_eq!(renames[0].from.as_deref(), Some("Docs/f1.txt"));
+    assert_eq!(renames[0].key, "2026/invoice.txt");
+    assert_eq!(
+        renames[0].if_match.as_deref(),
+        Some(sha_hex(b"data 1").as_str())
+    );
+    assert!(hub.lock().entries("delete").is_empty());
+    assert!(hub.lock().bytes_of("Docs/f1.txt").is_none());
+    assert_eq!(hub.lock().bytes_of("2026/invoice.txt").unwrap(), b"data 1");
+    assert_eq!(m.status().pending, 0);
+}
+
+#[test]
+fn hub_moves_made_while_offline_move_the_local_files() {
+    let (hub, dir) = seeded_offline(3);
+    let home = dir.path().join("Home");
+    let moved = inode(&home.join("Docs/f0.txt"));
+    let chained = inode(&home.join("Docs/f1.txt"));
+    hub.lock().rename("Docs/f0.txt", "Filed/f0.txt");
+    hub.lock().rename("Docs/f1.txt", "Docs/step.txt");
+    hub.lock().rename("Docs/step.txt", "Filed/final.txt");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    assert_eq!(
+        inode(&home.join("Filed/f0.txt")),
+        moved,
+        "moved, not copied"
+    );
+    assert_eq!(inode(&home.join("Filed/final.txt")), chained);
+    assert!(!home.join("Docs/f0.txt").exists());
+    assert!(!home.join("Docs/f1.txt").exists());
+    assert!(!home.join("Docs/step.txt").exists());
+    assert!(m.trash_list().is_empty(), "nothing went through the trash");
+    assert_eq!(m.status().pending, 0);
+    assert!(hub.lock().entries("put").iter().all(|e| e.origin.is_none()));
+}
+
+#[test]
+fn an_offline_edit_follows_a_hub_move() {
+    let (hub, dir) = seeded_offline(3);
+    let home = dir.path().join("Home");
+    std::fs::write(home.join("Docs/f2.txt"), b"edited on the plane").unwrap();
+    hub.lock().rename("Docs/f2.txt", "Filed/f2.txt");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    assert_eq!(
+        hub.lock().bytes_of("Filed/f2.txt").unwrap(),
+        b"edited on the plane"
+    );
+    assert!(
+        hub.lock().bytes_of("Docs/f2.txt").is_none(),
+        "the old name does not come back"
+    );
+    assert_eq!(
+        std::fs::read(home.join("Filed/f2.txt")).unwrap(),
+        b"edited on the plane"
+    );
+    assert!(!home.join("Docs/f2.txt").exists());
+    let puts = hub.lock().entries("put");
+    let put = puts.iter().rev().find(|p| p.key == "Filed/f2.txt").unwrap();
+    assert_eq!(put.if_match.as_deref(), Some(sha_hex(b"data 2").as_str()));
+    assert!(m.conflicts().is_empty());
+    assert_eq!(m.status().pending, 0);
+}
+
+#[test]
+fn a_hub_move_older_than_the_change_log_is_paired_by_content() {
+    let (hub, dir) = seeded_offline(3);
+    let home = dir.path().join("Home");
+    let moved = inode(&home.join("Docs/f0.txt"));
+    hub.lock().rename("Docs/f0.txt", "Filed/renamed.txt");
+    hub.lock().put("noise.txt", b"noise");
+    hub.lock().trim_log();
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    assert_eq!(inode(&home.join("Filed/renamed.txt")), moved);
+    assert!(!home.join("Docs/f0.txt").exists());
+    assert!(m.trash_list().is_empty());
+    assert_eq!(m.status().pending, 0);
+}
+
+#[test]
+fn a_file_moved_to_different_names_on_both_sides_keeps_both_names() {
+    let (hub, dir) = seeded_offline(3);
+    let home = dir.path().join("Home");
+    std::fs::rename(home.join("Docs/f0.txt"), home.join("Docs/mine.txt")).unwrap();
+    hub.lock().rename("Docs/f0.txt", "Docs/theirs.txt");
+
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    settle(&m);
+    for name in ["Docs/mine.txt", "Docs/theirs.txt"] {
+        assert_eq!(hub.lock().bytes_of(name).unwrap(), b"data 0", "{name}");
+        assert_eq!(std::fs::read(home.join(name)).unwrap(), b"data 0", "{name}");
+    }
+    assert!(hub.lock().bytes_of("Docs/f0.txt").is_none());
+    assert!(!home.join("Docs/f0.txt").exists());
+    assert!(m.conflicts().is_empty());
+    assert_eq!(m.status().pending, 0);
+}
+
+#[test]
+fn the_local_trash_keeps_every_deleted_version_of_a_name() {
+    let r = rig(opts());
+    r.hub.lock().put("report.txt", b"first");
+    r.mirror.cycle(true);
+    r.hub.lock().delete("report.txt");
+    settle(&r.mirror);
+    assert_eq!(r.mirror.trash_list().len(), 1);
+
+    // The name is used again, synced, and deleted on the hub again.
+    r.mirror.commit_write("report.txt", b"second").unwrap();
+    settle(&r.mirror);
+    assert_eq!(r.hub.lock().bytes_of("report.txt").unwrap(), b"second");
+    assert_eq!(
+        r.mirror.trash_list().len(),
+        1,
+        "a new file keeps the old copy"
+    );
+    r.hub.lock().delete("report.txt");
+    settle(&r.mirror);
+    let trash = r.mirror.trash_list();
+    let mut kept: Vec<String> = trash.iter().map(|(_, t)| t.sha256.clone()).collect();
+    kept.sort();
+    let mut expected = vec![sha_hex(b"first"), sha_hex(b"second")];
+    expected.sort();
+    assert_eq!(kept, expected, "both versions are restorable");
+
+    // The first copy goes back to its name; the second finds it taken.
+    assert_eq!(r.mirror.trash_restore("report.txt").unwrap(), "report.txt");
+    let slot = r.mirror.trash_list()[0].0.clone();
+    let restored = r.mirror.trash_restore(&slot).unwrap();
+    assert!(restored.starts_with("report (restored "), "{restored}");
+    assert!(restored.ends_with(").txt"));
+    settle(&r.mirror);
+    assert_eq!(r.home_read("report.txt").unwrap(), b"first");
+    assert_eq!(r.home_read(&restored).unwrap(), b"second");
+    assert_eq!(r.hub.lock().bytes_of(&restored).unwrap(), b"second");
+    assert!(r.mirror.trash_list().is_empty());
+}

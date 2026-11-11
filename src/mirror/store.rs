@@ -241,6 +241,10 @@ pub struct Trashed {
     pub sha256: String,
     pub size: u64,
     pub ts: u64,
+    /// Where the file was, when the trash holds it under another name (an
+    /// older copy of the same key was already there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// What a generation-1 store held, read once on open before the tables go.

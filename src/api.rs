@@ -677,22 +677,45 @@ impl ApiClient {
     /// Permanently delete documents that are in the trash. The one call that
     /// destroys — same as "delete from trash" in a file manager.
     pub fn empty_trash(&self, ws: &str, ids: &[u64]) -> Result<()> {
-        self.send_json(
-            reqwest::Method::DELETE,
-            &format!("/rest/v2/workspaces/{}/trash", encode_segment(ws)),
-            &serde_json::json!({ "documentIds": ids }),
+        let items: Vec<String> = ids.iter().map(|id| format!("doc:{id}")).collect();
+        let body = self.send_json(
+            reqwest::Method::POST,
+            &format!(
+                "/rest/v2/workspaces/{}/trash/items/discard",
+                encode_segment(ws)
+            ),
+            &serde_json::json!({ "ids": items }),
         )?;
+        let results = body
+            .get("payload")
+            .unwrap_or(&body)
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for result in &results {
+            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                anyhow::bail!(
+                    "{}",
+                    result
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the item was not deleted")
+                );
+            }
+        }
         Ok(())
     }
 
     /// Documents sitting in the workspace trash — what a filesystem delete
     /// parked there when it removed a document's last placement.
     pub fn list_trash(&self, ws: &str) -> Result<Vec<Document>> {
-        let body = self.get_json(&format!("/rest/v2/workspaces/{}/trash", encode_segment(ws)))?;
-        Ok(extract_documents(&body)
-            .iter()
-            .filter_map(parse_document)
-            .collect())
+        self.list_tree_documents(
+            ws,
+            crate::state::TRASH_TREE_NAME,
+            "directory",
+            crate::state::TRASH_PATH,
+        )
     }
 
     /// Create a directory/context path node (mkdir).

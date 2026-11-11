@@ -196,6 +196,7 @@ fn protection_keeps_expired_trash_and_conflict_bytes_even_after_new_additions() 
                 sha256: sha_hex(b"retained"),
                 size: 8,
                 ts: 1,
+                key: None,
             },
         )
         .unwrap();

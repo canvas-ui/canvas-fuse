@@ -148,7 +148,12 @@ fn bootstrap_and_refresh_only_fetch_selected_tree_paths_and_documents() {
                     if included && name == "context" { 2 } else { 0 }
                 );
             }
-            assert_eq!(requests.iter().any(|url| url.ends_with("/trash")), trash);
+            assert_eq!(
+                requests
+                    .iter()
+                    .any(|url| url.contains("/documents?treeNameOrTreeId=directory&")),
+                trash
+            );
             if expected.is_empty() {
                 assert!(
                     requests.is_empty(),

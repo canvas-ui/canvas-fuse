@@ -218,6 +218,13 @@ enum Command {
         what: TrashCommand,
     },
 
+    /// Mirror: files that went missing from the folder in bulk, whose
+    /// deletion on the hub waits for a decision
+    Deletes {
+        #[command(subcommand)]
+        what: DeletesCommand,
+    },
+
     /// Unmount a canvas mount and stop its daemon
     #[command(alias = "umount")]
     Unmount {
@@ -284,6 +291,16 @@ enum SyncCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeletesCommand {
+    /// The files whose deletion is held
+    List { mountpoint: PathBuf },
+    /// They were deleted on purpose: delete them on the hub too
+    Approve { mountpoint: PathBuf },
+    /// They were not: download the hub's copies again
+    Restore { mountpoint: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -430,6 +447,11 @@ fn main() -> Result<()> {
             what: SyncCommand::Blocked { mountpoint, json },
         } => cmd_sync_blocked(&mountpoint, json),
         Command::Conflicts { mountpoint, json } => cmd_conflicts(&mountpoint, json),
+        Command::Deletes { what } => match what {
+            DeletesCommand::List { mountpoint } => cmd_deletes(&mountpoint, "list"),
+            DeletesCommand::Approve { mountpoint } => cmd_deletes(&mountpoint, "approve"),
+            DeletesCommand::Restore { mountpoint } => cmd_deletes(&mountpoint, "restore"),
+        },
         Command::Trash { what } => match what {
             TrashCommand::List { mountpoint, json } => cmd_trash_list(&mountpoint, json),
             TrashCommand::Restore { mountpoint, key } => cmd_trash_restore(&mountpoint, &key),
@@ -1113,6 +1135,30 @@ fn cmd_conflicts(mountpoint: &Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_deletes(mountpoint: &Path, op: &str) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let resp = control::request(&sock, &json!({ "cmd": "deletes", "op": op }))?;
+    let count = resp.get("count").and_then(Value::as_u64).unwrap_or(0);
+    match op {
+        "approve" => println!("{count} deletions will be sent to the hub"),
+        "restore" => println!("{count} files will be downloaded again"),
+        _ => {
+            let held = resp
+                .get("held")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if held.is_empty() {
+                println!("no held deletions");
+            }
+            for key in &held {
+                println!("{}", key.as_str().unwrap_or("?"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_trash_list(mountpoint: &Path, as_json: bool) -> Result<()> {
     let sock = mirror_socket(mountpoint)?;
     let resp = control::request(&sock, &json!({ "cmd": "trash", "op": "list" }))?;
@@ -1147,11 +1193,12 @@ fn cmd_trash_list(mountpoint: &Path, as_json: bool) -> Result<()> {
 
 fn cmd_trash_restore(mountpoint: &Path, key: &str) -> Result<()> {
     let sock = mirror_socket(mountpoint)?;
-    control::request(
+    let resp = control::request(
         &sock,
         &json!({ "cmd": "trash", "op": "restore", "key": key }),
     )?;
-    println!("restored {key}; it will be pushed to the hub");
+    let restored = resp.get("restored").and_then(Value::as_str).unwrap_or(key);
+    println!("restored {restored}; it will be pushed to the hub");
     Ok(())
 }
 

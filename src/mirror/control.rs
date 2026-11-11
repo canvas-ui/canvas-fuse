@@ -8,7 +8,7 @@
 //! none. The daemon owns its redb exclusively, so the CLI cannot read the
 //! store itself; it asks.
 //!
-//! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
+//! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"deletes","op":"list|approve|restore"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
 //! `{"cmd":"status"}`, `{"cmd":"blocked"}`, `{"cmd":"push","dryRun":true}`, `{"cmd":"pull","dryRun":true}`.
 //! Responses: `{"ok":true, …}` or
 //! `{"ok":false,"error":"…"}`.
@@ -125,6 +125,18 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
             json!({ "ok": true, "finished": finished, "mirror": mirror.status() })
         }
         "conflicts" => json!({ "ok": true, "conflicts": mirror.conflicts() }),
+        "deletes" => match op {
+            "list" => json!({ "ok": true, "held": mirror.held_deletes() }),
+            "approve" => match mirror.approve_deletes() {
+                Ok(count) => json!({ "ok": true, "count": count }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            },
+            "restore" => match mirror.restore_deletes() {
+                Ok(count) => json!({ "ok": true, "count": count }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            },
+            _ => json!({ "ok": false, "error": "deletes op must be list|approve|restore" }),
+        },
         "trash" => match op {
             "list" => {
                 let items: Vec<Value> = mirror
@@ -133,6 +145,7 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
                     .map(|(key, t)| {
                         json!({
                             "key": key.clone(),
+                            "original": t.key.clone().unwrap_or_else(|| key.clone()),
                             "sha256": t.sha256,
                             "size": t.size,
                             "ts": t.ts,
@@ -150,7 +163,7 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
                     return json!({ "ok": false, "error": "key required" });
                 };
                 match mirror.trash_restore(&super::normalize_key(key)) {
-                    Ok(()) => json!({ "ok": true, "restored": key }),
+                    Ok(restored) => json!({ "ok": true, "restored": restored }),
                     Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
                 }
             }

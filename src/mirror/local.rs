@@ -38,6 +38,9 @@ pub struct LocalStat {
     /// High-resolution change identity: mtime alone misses edits made by
     /// tools that preserve timestamps, especially while the daemon is down.
     pub fingerprint: String,
+    /// Filesystem the path lives on; differs from the folder's own under a
+    /// mount point inside it.
+    pub dev: u64,
 }
 
 fn fingerprint(m: &std::fs::Metadata) -> String {
@@ -202,7 +205,15 @@ impl Local {
             mtime: m.modified().map(ms_of).unwrap_or(0),
             is_dir: m.is_dir(),
             fingerprint: fingerprint(&m),
+            dev: std::os::unix::fs::MetadataExt::dev(&m),
         })
+    }
+
+    /// Filesystem of the folder itself.
+    pub fn root_dev(&self) -> Option<u64> {
+        std::fs::metadata(&self.root)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
     }
 
     pub fn exists(&self, key: &str) -> bool {
@@ -517,15 +528,16 @@ impl Local {
 
     // ── trash (hub deletes) ──────────────────────────────────────────────────
 
-    /// Move the local copy of `key` into the trash folder (replacing an older
-    /// trashed copy of the same key).
-    pub fn trash_put(&self, key: &str) -> Result<()> {
+    /// Move the local copy of `key` into the trash folder under `slot`, a
+    /// name no other trashed copy holds.
+    pub fn trash_put(&self, key: &str, slot: &str) -> Result<()> {
         check_key(key)?;
-        let dest = self.trash_path(key);
+        check_key(slot)?;
+        let dest = self.trash_path(slot);
+        anyhow::ensure!(!dest.exists(), "{slot}: the trash already holds this name");
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _ = std::fs::remove_file(&dest);
         let _g = self.lock.lock();
         match std::fs::rename(self.path(key), &dest) {
             Ok(()) => Ok(()),
@@ -542,12 +554,16 @@ impl Local {
         }
     }
 
-    /// Bring a trashed key back into the folder. The caller re-keys first
-    /// if the name is taken again.
-    pub fn trash_restore(&self, key: &str) -> Result<Hashed> {
+    /// Bring the trashed copy in `slot` back into the folder as `key`, a
+    /// name that is free.
+    pub fn trash_restore(&self, slot: &str, key: &str) -> Result<Hashed> {
         check_key(key)?;
-        let src = self.trash_path(key);
-        anyhow::ensure!(src.is_file(), "{key}: the bytes are no longer in the trash");
+        let src = self.trash_path(slot);
+        anyhow::ensure!(
+            src.is_file(),
+            "{slot}: the bytes are no longer in the trash"
+        );
+        anyhow::ensure!(!self.exists(key), "{key}: the name is taken");
         self.ensure_parent(key)?;
         let _g = self.lock.lock();
         if std::fs::rename(&src, self.path(key)).is_err() {
@@ -654,6 +670,7 @@ impl Local {
                     mtime: m.modified().map(ms_of).unwrap_or(0),
                     is_dir: ft.is_dir(),
                     fingerprint: fingerprint(&m),
+                    dev: std::os::unix::fs::MetadataExt::dev(&m),
                 };
                 if ft.is_dir() {
                     stack.push(key.clone());
@@ -741,16 +758,16 @@ mod tests {
         assert!(!l.exists("x.txt"));
         assert_eq!(l.read_all("sub/y.txt").unwrap(), b"x");
 
-        l.trash_put("sub/y.txt").unwrap();
+        l.trash_put("sub/y.txt", "sub/y.txt").unwrap();
         assert!(!l.exists("sub/y.txt"));
         assert!(d.path().join("data/trash/sub/y.txt").is_file());
         assert_eq!(l.trash_walk().len(), 1);
-        let h = l.trash_restore("sub/y.txt").unwrap();
+        let h = l.trash_restore("sub/y.txt", "sub/y.txt").unwrap();
         assert_eq!(h.sha256, super::super::sha256_hex(b"x"));
         assert!(l.trash_walk().is_empty());
         assert_eq!(l.read_all("sub/y.txt").unwrap(), b"x");
 
-        l.trash_put("sub/y.txt").unwrap();
+        l.trash_put("sub/y.txt", "sub/y.txt").unwrap();
         l.trash_remove("sub/y.txt");
         assert!(!d.path().join("data/trash/sub").exists(), "pruned");
     }

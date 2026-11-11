@@ -51,6 +51,15 @@ const TRASH_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// A full pass (folder scan + hub listing) this often even without
 /// `sync now`, so a change the feed lost is bounded.
 const FULL_PASS_EVERY: Duration = Duration::from_secs(3600);
+/// A scan that finds at least this many tracked files missing, and at least
+/// a quarter of all tracked files, holds their deletion for the user.
+const DELETE_HOLD_MIN: usize = 20;
+const DELETE_HOLD_DIVISOR: usize = 4;
+/// One-shot: the next full scan lets every missing file's deletion through.
+const META_DELETES_APPROVED: &str = "deletes-approved";
+/// `foreign-dir:<key>`: a directory that was a mount point of another
+/// filesystem when a scan last saw it.
+const META_FOREIGN_DIR: &str = "foreign-dir:";
 const STATUS_THROTTLE: Duration = Duration::from_secs(1);
 const REPORT_THROTTLE: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
@@ -94,6 +103,9 @@ pub struct MirrorStatus {
     /// Historical observations available with `sync blocked`, not a replay queue.
     #[serde(default)]
     pub blocked: u64,
+    /// Files missing from the folder whose deletion waits for `deletes approve|restore`.
+    #[serde(default)]
+    pub held_deletes: u64,
 }
 
 pub enum EngineMsg {
@@ -146,6 +158,17 @@ struct Runtime {
     /// open; re-checked against the hub on the next cycle.
     recheck: HashSet<String>,
     protected_jobs: HashSet<u64>,
+    /// Tracked files a scan found missing in bulk: an unmounted or rolled
+    /// back folder looks the same as a deliberate `rm -rf`, so nothing is
+    /// sent until the user decides. Recomputed by every scan.
+    held_deletes: BTreeSet<String>,
+}
+
+/// A file the scan found that the index does not know.
+struct NewFile {
+    key: String,
+    entry: Entry,
+    fingerprint: String,
 }
 
 /// What a folder scan found and did.
@@ -154,6 +177,8 @@ pub struct ScanReport {
     pub added: u64,
     pub changed: u64,
     pub removed: u64,
+    /// Files and folders found under a new name with the same content.
+    pub moved: u64,
 }
 
 pub struct Mirror {
@@ -246,18 +271,6 @@ impl Mirror {
             return Err(HubError::Protected(key.into()));
         }
         Ok(())
-    }
-
-    fn clear_obsolete_trash(&self, key: &str) {
-        if self.store.trashed(key).is_none() {
-            return;
-        }
-        if self.opts.protected {
-            self.block_action("discard retained trash copy", key, None, None);
-        } else {
-            let _ = self.store.remove_trashed(key);
-            self.local.trash_remove(key);
-        }
     }
 
     /// Additive downloads require a genuinely absent path. Local::stat skips
@@ -369,6 +382,7 @@ impl Mirror {
                 skipped: HashMap::new(),
                 recheck: HashSet::new(),
                 protected_jobs: HashSet::new(),
+                held_deletes: BTreeSet::new(),
             }),
             engine_tx: Arc::new(Mutex::new(None)),
             local_changes: Arc::new(Mutex::new(super::watch::Changes::default())),
@@ -410,10 +424,11 @@ impl Mirror {
             mirror.scan_paths_reporting(&[String::new()], JobPriority::Discovered, Some(progress));
         if report != ScanReport::default() {
             log::info!(
-                "mirror: folder scan found {} new, {} changed, {} removed since the last run",
+                "mirror: folder scan found {} new, {} changed, {} removed, {} moved since the last run",
                 report.added,
                 report.changed,
-                report.removed
+                report.removed,
+                report.moved
             );
         }
         Ok(mirror)
@@ -631,7 +646,6 @@ impl Mirror {
         };
         self.store.put_entry(key, &entry)?;
         self.record_dirs_for(key);
-        self.clear_obsolete_trash(key);
         if self.is_ignored(key) {
             self.rt.lock().skipped.insert(
                 key.to_string(),
@@ -807,7 +821,6 @@ impl Mirror {
                 ..c
             })?;
         }
-        self.clear_obsolete_trash(to);
         let has_base = self.store.base(to).is_some();
         let may_be_uploaded =
             has_base || self.store.meta(&format!("upload-pending:{from}")).is_some();
@@ -1076,15 +1089,24 @@ impl Mirror {
         self.store.trash()
     }
 
-    /// Bring a hub-deleted key back from the local trash: a new push.
-    pub fn trash_restore(&self, key: &str) -> Result<()> {
-        self.store
-            .trashed(key)
-            .with_context(|| format!("{key} is not in the mirror trash"))?;
-        if self.store.entry(key).is_some() {
-            anyhow::bail!("{key} exists again; restore to a different name first");
-        }
-        let h = self.local.trash_restore(key)?;
+    /// Bring a hub-deleted file back from the local trash: a new push.
+    /// `slot` is the name the trash lists. When the original name is taken
+    /// again, the copy lands next to it as `<name> (restored <date>)`.
+    /// Returns the key it was restored to.
+    pub fn trash_restore(&self, slot: &str) -> Result<String> {
+        let trashed = self
+            .store
+            .trashed(slot)
+            .with_context(|| format!("{slot} is not in the mirror trash"))?;
+        let _guard = self.directory_moves.lock();
+        let original = trashed.key.clone().unwrap_or_else(|| slot.to_string());
+        let key = if self.store.entry(&original).is_some() || self.local.exists(&original) {
+            super::restored_copy_key(&original, chrono::Utc::now())
+        } else {
+            original
+        };
+        let key = key.as_str();
+        let h = self.local.trash_restore(slot, key)?;
         self.store.remove_base(key)?;
         let entry = Entry {
             sha256: h.sha256,
@@ -1094,13 +1116,14 @@ impl Mirror {
         };
         self.store.put_entry(key, &entry)?;
         self.record_dirs_for(key);
-        self.store.remove_trashed(key)?;
+        self.store.remove_trashed(slot)?;
+        self.local.trash_remove(slot);
         self.store.enqueue(JobKind::Push {
             key: key.to_string(),
         })?;
         self.view_upsert(key, entry.size, entry.mtime);
         self.wake();
-        Ok(())
+        Ok(key.to_string())
     }
 
     pub fn conflicts(&self) -> Vec<Conflict> {
@@ -1149,6 +1172,7 @@ impl Mirror {
             device_id: self.device.id.clone(),
             protected: self.opts.protected,
             blocked: self.store.blocked_actions().len() as u64,
+            held_deletes: rt.held_deletes.len() as u64,
         }
     }
 
@@ -1265,9 +1289,14 @@ impl Mirror {
             return ScanReport::default();
         }
         let epoch = self.directory_epoch.load(Ordering::Relaxed);
+        let root_dev = self.local.root_dev();
         let mut report = ScanReport::default();
         let mut seen_files: HashSet<String> = HashSet::new();
         let mut seen_dirs: HashSet<String> = HashSet::new();
+        // New folders and files wait for the end of the walk: one that pairs
+        // with something that went missing is a move, not an upload.
+        let mut new_dirs: Vec<String> = Vec::new();
+        let mut added: Vec<NewFile> = Vec::new();
         let affected = |key: &str| {
             paths
                 .iter()
@@ -1289,14 +1318,14 @@ impl Mirror {
             }
             if st.is_dir {
                 seen_dirs.insert(key.clone());
-                if !self.store.has_dir(&key) {
-                    let _ = self.store.add_dir(&key);
-                    self.view_ensure_dir(&key);
-                    if !self.is_ignored(&key) {
-                        let _ = self
-                            .store
-                            .enqueue_with_priority(JobKind::Mkdir { key }, priority);
+                if root_dev.is_some_and(|root| root != st.dev) {
+                    let name = format!("{META_FOREIGN_DIR}{key}");
+                    if self.store.meta(&name).is_none() {
+                        let _ = self.store.set_meta(&name, "1");
                     }
+                }
+                if !self.store.has_dir(&key) {
+                    new_dirs.push(key);
                 }
                 continue;
             }
@@ -1359,8 +1388,6 @@ impl Mirror {
                     continue;
                 }
                 report.changed += 1;
-            } else {
-                report.added += 1;
             }
             let new = Entry {
                 sha256: h.sha256,
@@ -1368,22 +1395,18 @@ impl Mirror {
                 mtime: h.mtime,
                 state: EntryState::Dirty,
             };
-            let _ = self.store.put_entry(&key, &new);
-            self.clear_obsolete_trash(&key);
-            if self.is_ignored(&key) {
-                self.rt.lock().skipped.insert(
-                    key.clone(),
-                    "matches an exclusion rule; kept local only".into(),
-                );
-            } else {
-                self.rt.lock().skipped.remove(&key);
-                // `enqueue`, not `ensure_job`: the user did something new,
-                // so a push in backoff starts over.
-                let _ = self
-                    .store
-                    .enqueue_with_priority(JobKind::Push { key: key.clone() }, priority);
+            if entry.is_none() {
+                added.push(NewFile {
+                    key,
+                    entry: new,
+                    fingerprint: st.fingerprint,
+                });
+                continue;
             }
-            self.view_upsert(&key, new.size, new.mtime);
+            if live.is_none() {
+                report.added += 1;
+            }
+            self.record_local_file(&key, &new, priority);
         }
         let _guard = self.directory_moves.lock();
         if self.directory_epoch.load(Ordering::Relaxed) != epoch {
@@ -1392,6 +1415,7 @@ impl Mirror {
         if let Some(progress) = progress {
             progress.phase("checking for locally removed files and directories");
         }
+        let mut missing = Vec::new();
         for (key, e) in self.store.entries("") {
             if !affected(&key)
                 || e.state == EntryState::Tombstone
@@ -1403,12 +1427,36 @@ impl Mirror {
             {
                 continue;
             }
+            missing.push(key);
+        }
+        let mut missing = self.attached_missing(missing, root_dev);
+        report.moved = self.infer_moves(&mut missing, &mut added, &mut new_dirs);
+        for key in new_dirs {
+            let _ = self.store.add_dir(&key);
+            self.view_ensure_dir(&key);
+            if !self.is_ignored(&key) {
+                let _ = self
+                    .store
+                    .enqueue_with_priority(JobKind::Mkdir { key }, priority);
+            }
+        }
+        for file in added {
+            report.added += 1;
+            let _ = self
+                .store
+                .set_meta(&format!("local-stamp:{}", file.key), &file.fingerprint);
+            self.record_local_file(&file.key, &file.entry, priority);
+        }
+        let full = paths.iter().any(|p| p.is_empty());
+        for key in self.settle_missing(missing, &affected, full) {
             report.removed += 1;
             let _ = self.note_local_gone(&key);
             self.view_remove(&key);
         }
+        let held = self.rt.lock().held_deletes.clone();
         for d in self.store.dirs() {
             if !affected(&d)
+                || held.iter().any(|key| super::store::under(key, &d))
                 || seen_dirs.contains(&d)
                 || self.pending_directory_move(&d)
                 || !matches!(std::fs::symlink_metadata(self.local.path(&d)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -1428,6 +1476,336 @@ impl Mirror {
             self.wake();
         }
         report
+    }
+
+    /// A file the scan found changed or new: index it and queue its upload.
+    fn record_local_file(&self, key: &str, new: &Entry, priority: JobPriority) {
+        let _ = self.store.put_entry(key, new);
+        if self.is_ignored(key) {
+            self.rt.lock().skipped.insert(
+                key.to_string(),
+                "matches an exclusion rule; kept local only".into(),
+            );
+        } else {
+            self.rt.lock().skipped.remove(key);
+            // `enqueue`, not `ensure_job`: the user did something new, so a
+            // push in backoff starts over.
+            let _ = self.store.enqueue_with_priority(
+                JobKind::Push {
+                    key: key.to_string(),
+                },
+                priority,
+            );
+        }
+        self.view_upsert(key, new.size, new.mtime);
+    }
+
+    /// The missing files that are really gone. Left out: files under a link
+    /// or under a mount point whose filesystem is not there (reported as
+    /// skipped, kept on the hub).
+    fn attached_missing(&self, missing: Vec<String>, root_dev: Option<u64>) -> Vec<String> {
+        let mut detached_dirs: HashMap<String, bool> = HashMap::new();
+        let mut candidates = Vec::new();
+        for key in missing {
+            let parent = super::parent_key(&key).to_string();
+            let detached = match detached_dirs.get(&parent) {
+                Some(known) => *known,
+                None => {
+                    let found = self.detached(&parent, root_dev);
+                    detached_dirs.insert(parent, found);
+                    found
+                }
+            };
+            if detached {
+                self.rt.lock().skipped.insert(
+                    key,
+                    "its folder is a link or a filesystem that is not mounted; kept on the hub"
+                        .into(),
+                );
+            } else {
+                candidates.push(key);
+            }
+        }
+        candidates
+    }
+
+    /// Moves made while nothing was watching. A whole folder that vanished
+    /// and reappears elsewhere with the same files becomes one directory
+    /// move; a single file that vanished and reappears with the same content
+    /// becomes a rename. Both keep the hub's document, its history and its
+    /// curation, and neither counts as a deletion. What pairs is taken out
+    /// of the three lists; the count is returned.
+    fn infer_moves(
+        &self,
+        missing: &mut Vec<String>,
+        added: &mut Vec<NewFile>,
+        new_dirs: &mut Vec<String>,
+    ) -> u64 {
+        if missing.is_empty() || added.is_empty() {
+            return 0;
+        }
+        let mut moved = 0;
+        let gone = |key: &str| matches!(std::fs::symlink_metadata(self.local.path(key)), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let mut fresh = new_dirs.clone();
+        fresh.sort();
+        for to in fresh {
+            if !new_dirs.contains(&to) {
+                continue; // inside a folder that already paired
+            }
+            let inside: BTreeMap<String, String> = added
+                .iter()
+                .filter(|f| f.key != to && super::store::under(&f.key, &to))
+                .map(|f| (f.key[to.len() + 1..].to_string(), f.entry.sha256.clone()))
+                .collect();
+            let Some((rel, sha)) = inside.iter().next() else {
+                continue;
+            };
+            let suffix = format!("/{rel}");
+            let from = missing.iter().find_map(|key| {
+                let dir = key.strip_suffix(suffix.as_str())?;
+                (self.store.entry(key).is_some_and(|e| &e.sha256 == sha)
+                    && self.store.has_dir(dir)
+                    && gone(dir))
+                .then(|| dir.to_string())
+            });
+            let Some(from) = from else { continue };
+            let tracked = self.store.entries_under(&from);
+            let same = tracked.len() == inside.len()
+                && tracked.iter().all(|(key, e)| {
+                    e.state != EntryState::Tombstone
+                        && missing.contains(key)
+                        && inside.get(&key[from.len() + 1..]) == Some(&e.sha256)
+                });
+            if !same
+                || super::store::overlaps(&from, &to)
+                || self.pending_path_move(&from)
+                || self.is_ignored(&from)
+                || self.is_ignored(&to)
+                || inside
+                    .keys()
+                    .any(|rel| self.is_ignored(&format!("{to}/{rel}")))
+            {
+                continue;
+            }
+            if let Err(e) = self.adopt_directory_move(&from, &to) {
+                log::warn!("{from} → {to}: not treated as a folder move ({e:#})");
+                continue;
+            }
+            for file in added.iter().filter(|f| super::store::under(&f.key, &to)) {
+                let _ = self
+                    .store
+                    .set_meta(&format!("local-stamp:{}", file.key), &file.fingerprint);
+                if let Some(e) = self.store.entry(&file.key) {
+                    let _ = self.store.put_entry(
+                        &file.key,
+                        &Entry {
+                            size: file.entry.size,
+                            mtime: file.entry.mtime,
+                            ..e
+                        },
+                    );
+                }
+            }
+            self.view_rename(&from, &to);
+            log::info!("{from} → {to}: folder moved while the mirror was not watching");
+            missing.retain(|key| !super::store::under(key, &from));
+            added.retain(|f| !super::store::under(&f.key, &to));
+            new_dirs.retain(|dir| !super::store::under(dir, &to));
+            moved += 1;
+        }
+
+        let mut by_content: HashMap<String, Vec<String>> = HashMap::new();
+        for key in missing.iter() {
+            let Some(e) = self.store.entry(key) else {
+                continue;
+            };
+            let known_upstream = self.store.base(key).is_some()
+                || self.store.meta(&format!("upload-pending:{key}")).is_some();
+            if e.state == EntryState::Tombstone
+                || !known_upstream
+                || self.is_ignored(key)
+                || self.pending_path_move(key)
+            {
+                continue;
+            }
+            by_content.entry(e.sha256).or_default().push(key.clone());
+        }
+        let mut renamed: HashSet<String> = HashSet::new();
+        added.retain(|file| {
+            if self.is_ignored(&file.key) || self.store.entry(&file.key).is_some() {
+                return true;
+            }
+            let Some(sources) = by_content.get_mut(&file.entry.sha256) else {
+                return true;
+            };
+            if sources.is_empty() {
+                return true;
+            }
+            let leaf = super::leaf_of(&file.key);
+            let at = sources
+                .iter()
+                .position(|key| super::leaf_of(key) == leaf)
+                .unwrap_or(0);
+            let from = sources.remove(at);
+            if let Err(e) = self.rekey_entry(&from, &file.key) {
+                log::warn!("{from} → {}: not treated as a move ({e:#})", file.key);
+                return true;
+            }
+            if let Some(e) = self.store.entry(&file.key) {
+                let _ = self.store.put_entry(
+                    &file.key,
+                    &Entry {
+                        size: file.entry.size,
+                        mtime: file.entry.mtime,
+                        ..e
+                    },
+                );
+            }
+            let _ = self
+                .store
+                .set_meta(&format!("local-stamp:{}", file.key), &file.fingerprint);
+            self.view_rename(&from, &file.key);
+            log::info!(
+                "{from} → {}: moved while the mirror was not watching",
+                file.key
+            );
+            renamed.insert(from);
+            moved += 1;
+            false
+        });
+        missing.retain(|key| !renamed.contains(key));
+        if moved > 0 {
+            self.directory_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+        moved
+    }
+
+    /// Record a directory move the folder already shows: the same durable
+    /// operation a `mv` through the mount queues, with the bytes in place.
+    fn adopt_directory_move(&self, from: &str, to: &str) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let path = self.local.path(to);
+        let st = std::fs::metadata(&path)?;
+        let seq = self.store.enqueue(JobKind::RenameDir {
+            from: from.to_string(),
+            to: to.to_string(),
+            operation_id: super::operation_id()?,
+            dev: st.dev(),
+            ino: st.ino(),
+            directory_identity: Some(super::identity::persistent_directory_identity(&path)?),
+            local_applied: false,
+            remote: !self.store.bases(&format!("{from}/")).is_empty(),
+        })?;
+        let job = self
+            .store
+            .jobs()
+            .into_iter()
+            .find(|j| j.seq == seq)
+            .expect("queued directory move");
+        if let Err(error) = self.finish_directory_move(&job) {
+            let _ = self.store.remove_job(seq);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Which of the files that are really gone may be deleted on the hub. A
+    /// bulk disappearance is held until the user approves or restores it.
+    fn settle_missing(
+        &self,
+        candidates: Vec<String>,
+        affected: &dyn Fn(&str) -> bool,
+        full: bool,
+    ) -> Vec<String> {
+        let approved = full && self.store.meta(META_DELETES_APPROVED).is_some();
+        let mut rt = self.rt.lock();
+        // Files that are back, or settled another way, leave the hold.
+        rt.held_deletes
+            .retain(|key| !affected(key) || candidates.contains(key));
+        if approved {
+            rt.held_deletes.clear();
+            drop(rt);
+            let _ = self.store.remove_meta(META_DELETES_APPROVED);
+            return candidates;
+        }
+        let tracked = self.store.entry_count() as usize;
+        let bulk = candidates.len() >= DELETE_HOLD_MIN
+            && candidates.len() * DELETE_HOLD_DIVISOR >= tracked;
+        if rt.held_deletes.is_empty() && !bulk {
+            return candidates;
+        }
+        if !candidates.is_empty() && rt.held_deletes.is_empty() {
+            log::warn!(
+                "mirror: {} of {tracked} tracked files are missing from the folder; holding their deletion (canvas-fuse deletes approve|restore)",
+                candidates.len()
+            );
+        }
+        rt.held_deletes.extend(candidates);
+        Vec::new()
+    }
+
+    /// Is `dir`, or a directory above it, a symlink or a mount point whose
+    /// filesystem is no longer there?
+    fn detached(&self, dir: &str, root_dev: Option<u64>) -> bool {
+        let mut dir = dir;
+        while !dir.is_empty() {
+            let meta = std::fs::symlink_metadata(self.local.path(dir)).ok();
+            if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+                return true;
+            }
+            if self
+                .store
+                .meta(&format!("{META_FOREIGN_DIR}{dir}"))
+                .is_some()
+            {
+                use std::os::unix::fs::MetadataExt;
+                let mounted = meta.is_some_and(|m| root_dev.is_some_and(|root| m.dev() != root));
+                if !mounted {
+                    return true;
+                }
+            }
+            dir = super::parent_key(dir);
+        }
+        false
+    }
+
+    fn hold_message(&self) -> Option<String> {
+        let held = self.rt.lock().held_deletes.len();
+        (held > 0).then(|| {
+            format!("{held} files are missing from the folder; their deletion is held (canvas-fuse deletes approve|restore)")
+        })
+    }
+
+    /// Files whose deletion is held, in key order.
+    pub fn held_deletes(&self) -> Vec<String> {
+        self.rt.lock().held_deletes.iter().cloned().collect()
+    }
+
+    /// The held deletions were meant: the next full scan sends them.
+    pub fn approve_deletes(&self) -> Result<usize> {
+        let held = self.rt.lock().held_deletes.len();
+        self.store.set_meta(META_DELETES_APPROVED, "1")?;
+        if let Some(tx) = self.engine_tx.lock().as_ref() {
+            let _ = tx.send(EngineMsg::SyncNow(None));
+        }
+        Ok(held)
+    }
+
+    /// The held deletions were not meant: forget those files so the next
+    /// listing downloads the hub's copies again.
+    pub fn restore_deletes(&self) -> Result<usize> {
+        let _guard = self.directory_moves.lock();
+        let held = std::mem::take(&mut self.rt.lock().held_deletes);
+        for key in &held {
+            self.store.remove_jobs_for(key)?;
+            self.store.remove_entry(key)?;
+            self.store.remove_base(key)?;
+            self.view_remove(key);
+        }
+        if let Some(tx) = self.engine_tx.lock().as_ref() {
+            let _ = tx.send(EngineMsg::SyncNow(None));
+        }
+        Ok(held.len())
     }
 
     // ── the engine ───────────────────────────────────────────────────────────
@@ -1501,7 +1879,7 @@ impl Mirror {
         match result {
             Ok(()) => {
                 self.rt.lock().last_sync = Some(chrono::Utc::now().to_rfc3339());
-                self.set_error(None);
+                self.set_error(self.hold_message());
                 self.set_state(SyncState::Idle);
             }
             Err(e) => {
@@ -1552,15 +1930,20 @@ impl Mirror {
             let report = self.scan_local();
             if report != ScanReport::default() {
                 log::info!(
-                    "mirror: folder scan found {} new, {} changed, {} removed",
+                    "mirror: folder scan found {} new, {} changed, {} removed, {} moved",
                     report.added,
                     report.changed,
-                    report.removed
+                    report.removed,
+                    report.moved
                 );
             }
         }
         self.process_local_events();
         self.refresh_hub_rules()?;
+        // The hub's moves come first. A queued upload must go to the name
+        // the file has on the hub now, and a listing alone shows a moved
+        // file as one that vanished and another that appeared.
+        self.replay_feed_renames()?;
         self.recover_jobs();
         self.drain_jobs(64)?;
         if full
@@ -1725,6 +2108,7 @@ impl Mirror {
             }
         }
         self.prepare_listing_directories(&remote, &touched, epoch)?;
+        self.infer_remote_moves(&remote, &touched)?;
         let mut keys: HashSet<String> = remote.keys().cloned().collect();
         keys.extend(self.store.entries("").into_iter().map(|(k, _)| k));
         keys.extend(self.store.bases("").into_iter().map(|(k, _)| k));
@@ -1763,6 +2147,7 @@ impl Mirror {
             let _ = self.store.set_number(HEAD_KEY, page.head);
             let n = page.changes.len();
             let mut last = since;
+            self.apply_renames(&page.changes)?;
             for change in &page.changes {
                 self.drain_jobs(16)?;
                 if self.store.meta("directory-refresh").as_deref() == Some("1") {
@@ -1777,6 +2162,136 @@ impl Mirror {
             if n < CHANGES_PAGE {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// The renames the hub logged since the cursor, applied to the folder.
+    /// The cursor stays where it is; the listing pass that follows moves it.
+    fn replay_feed_renames(&self) -> Result<(), HubError> {
+        let Some(mut since) = self.store.cursor() else {
+            return Ok(());
+        };
+        if self.store.meta(META_LISTED).is_none() {
+            return Ok(());
+        }
+        let mut renames = Vec::new();
+        loop {
+            let page = match self.hub.changes(since, CHANGES_PAGE) {
+                Ok(page) => page,
+                // The log no longer reaches back: the listing pairs moved
+                // files by content instead.
+                Err(HubError::CursorTooOld { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let n = page.changes.len();
+            since = page
+                .changes
+                .iter()
+                .map(|change| change.seq)
+                .fold(since, u64::max);
+            renames.extend(
+                page.changes
+                    .into_iter()
+                    .filter(|change| change.op == ChangeOp::Rename),
+            );
+            if n < CHANGES_PAGE {
+                break;
+            }
+        }
+        self.apply_renames(&renames)
+    }
+
+    /// Follow the hub's renames in a batch of feed entries. A file renamed
+    /// several times moves once, from the name this mirror knows to the name
+    /// it has now.
+    fn apply_renames(&self, changes: &[Change]) -> Result<(), HubError> {
+        let mut origin_of: HashMap<String, String> = HashMap::new();
+        let mut last_seq: HashMap<String, u64> = HashMap::new();
+        for change in changes {
+            if change.op != ChangeOp::Rename {
+                continue;
+            }
+            let Some(from) = change.from.as_deref().map(super::normalize_key) else {
+                continue;
+            };
+            let to = super::normalize_key(&change.key);
+            let origin = origin_of.remove(&from).unwrap_or(from);
+            last_seq.insert(origin.clone(), change.seq);
+            origin_of.insert(to, origin);
+        }
+        let mut moves: Vec<(String, String)> = origin_of
+            .into_iter()
+            .filter(|(to, origin)| to != origin)
+            .map(|(to, origin)| (origin, to))
+            .collect();
+        moves.sort();
+        for (from, to) in moves {
+            if self.store.entry(&from).is_none()
+                || self.pending_directory_move(&from)
+                || self.pending_directory_move(&to)
+            {
+                continue;
+            }
+            let epoch = self.directory_epoch.load(Ordering::Relaxed);
+            let source = self.hub.head_object(&from)?;
+            let target = self.hub.head_object(&to)?;
+            if self.directory_epoch.load(Ordering::Relaxed) != epoch {
+                continue;
+            }
+            // A recreated source or a target that is gone again is not this
+            // move any more; those keys reconcile on their own.
+            if source.is_none() && target.is_some() {
+                let seq = last_seq.get(&from).copied().unwrap_or(0);
+                self.apply_remote_rename(&from, &to, seq)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A listing has no rename entries. A file this mirror holds unchanged
+    /// that is gone from the hub, next to an unknown hub file with the same
+    /// content, moved on the hub: move it here too instead of trashing one
+    /// copy and downloading the other.
+    fn infer_remote_moves(
+        &self,
+        remote: &BTreeMap<String, RemoteStat>,
+        touched: &HashSet<String>,
+    ) -> Result<(), HubError> {
+        let skip = |key: &str| {
+            self.is_ignored(key) || touched.iter().any(|path| super::store::under(key, path))
+        };
+        let mut by_content: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, base) in self.store.bases("") {
+            if remote.contains_key(&key) || skip(&key) || self.store.entry(&key).is_none() {
+                continue;
+            }
+            by_content.entry(base.sha256).or_default().push(key);
+        }
+        if by_content.is_empty() {
+            return Ok(());
+        }
+        for (to, stat) in remote {
+            if skip(to)
+                || self.store.entry(to).is_some()
+                || self.store.base(to).is_some()
+                || self.local.exists(to)
+            {
+                continue;
+            }
+            let Some(sources) = by_content.get_mut(&stat.sha256) else {
+                continue;
+            };
+            if sources.is_empty() {
+                continue;
+            }
+            let leaf = super::leaf_of(to);
+            let at = sources
+                .iter()
+                .position(|key| super::leaf_of(key) == leaf)
+                .unwrap_or(0);
+            let from = sources.remove(at);
+            self.apply_remote_rename(&from, to, 0)?;
         }
         Ok(())
     }
@@ -1822,9 +2337,10 @@ impl Mirror {
         self.reconcile_key(&key, stat.as_ref(), change.seq)
     }
 
-    /// A hub-side rename: move the file and re-key locally when our copy is
-    /// clean; a dirty source is a new file under the old name (delete + add
-    /// semantics), so it stays put and pushes as new.
+    /// A hub-side rename: move the file and re-key locally. A local edit
+    /// that was not pushed yet moves with the file and is pushed under the
+    /// new name against the version the hub renamed. A file that is open
+    /// for writing or was deleted here stays out of the move.
     fn apply_remote_rename(&self, from: &str, to: &str, seq: u64) -> Result<(), HubError> {
         let _guard = self.directory_moves.lock();
         if self.opts.protected && (self.local.exists(from) || self.store.entry(from).is_some()) {
@@ -1843,6 +2359,42 @@ impl Mirror {
                 .as_ref()
                 .map(|b| b.sha256 == entry.sha256)
                 .unwrap_or(false);
+        let edited = entry.state == EntryState::Dirty
+            && base.is_some()
+            && !self.is_open_for_write(from)
+            && self.store.entry(to).is_none()
+            && !self.local.exists(to)
+            && !self.is_ignored(to)
+            && self.store.conflict(from).is_none();
+        if edited {
+            if let Err(e) = self.local.rename(from, to) {
+                log::warn!(
+                    "{from} → {to}: local move failed ({e:#}); the edit stays at the old name"
+                );
+                let _ = self.store.remove_base(from);
+                return Ok(());
+            }
+            let dropped = self.store.remove_jobs_for(from).unwrap_or_default();
+            let _ = self.store.rekey(from, to);
+            self.record_dirs_for(to);
+            if let Some(mut b) = self.store.base(to) {
+                b.remote_seq = seq;
+                let _ = self.store.put_base(to, &b);
+            }
+            let priority = dropped
+                .iter()
+                .map(|job| job.priority)
+                .next()
+                .unwrap_or(JobPriority::Discovered);
+            let _ = self.store.enqueue_with_priority(
+                JobKind::Push {
+                    key: to.to_string(),
+                },
+                priority,
+            );
+            self.view_rename(from, to);
+            return Ok(());
+        }
         if !clean || self.is_open_for_write(from) {
             let _ = self.store.remove_base(from);
             if entry.state == EntryState::Dirty && !self.is_ignored(from) {
@@ -1973,14 +2525,25 @@ impl Mirror {
             }
             Action::TrashLocal => {
                 if let Some(e) = entry {
-                    match self.local.trash_put(key) {
+                    // An older trashed copy of this key keeps its place: every
+                    // deletion stays restorable until it expires.
+                    let ts = super::now_ms();
+                    let slot = if self.store.trashed(key).is_some()
+                        || self.local.trash_path(key).exists()
+                    {
+                        format!("{key}~{ts}")
+                    } else {
+                        key.to_string()
+                    };
+                    match self.local.trash_put(key, &slot) {
                         Ok(()) => {
                             let _ = self.store.put_trashed(
-                                key,
+                                &slot,
                                 &Trashed {
                                     sha256: e.sha256.clone(),
                                     size: e.size,
-                                    ts: super::now_ms(),
+                                    ts,
+                                    key: (slot != key).then(|| key.to_string()),
                                 },
                             );
                             log::info!(
@@ -2103,7 +2666,6 @@ impl Mirror {
             },
         );
         self.record_dirs_for(key);
-        self.clear_obsolete_trash(key);
         let _ = self.store.remove_jobs_for(key);
         self.view_upsert(key, h.size, h.mtime);
         Ok(())
