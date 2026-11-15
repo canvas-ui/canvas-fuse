@@ -41,7 +41,7 @@ impl DirectoryId {
 /// st_dev is a mount-time identifier (notably for ZFS and Btrfs). Persist
 /// filesystem identity instead, together with inode and birth time when
 /// available. Keep st_dev only as a fail-closed fallback for zero fsids.
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistentDirectoryId {
     filesystem_type: i64,
@@ -54,6 +54,7 @@ struct PersistentDirectoryId {
 impl PersistentDirectoryId {
     fn read(file: &File) -> Result<Self> {
         let metadata = file.metadata()?;
+        let created = birth_time(file);
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // fstatfs fills the entire structure on success. Linux fsid_t consists
         // of two 32-bit words; libc keeps those fields private on some targets.
@@ -64,11 +65,6 @@ impl PersistentDirectoryId {
         }
         let stat = unsafe { stat.assume_init() };
         let filesystem_id: [i32; 2] = unsafe { std::mem::transmute(stat.f_fsid) };
-        let created = metadata
-            .created()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| (t.as_secs(), t.subsec_nanos()));
         // libc's f_type varies with the target ABI; persist the same i64 on
         // glibc and musl, including targets where this cast is a no-op.
         #[allow(clippy::unnecessary_cast)]
@@ -81,6 +77,82 @@ impl PersistentDirectoryId {
             created,
         })
     }
+}
+
+impl PersistentDirectoryId {
+    /// The same directory. A birth time is compared when both observations
+    /// have one: not every filesystem or kernel reports it, and its absence
+    /// says nothing about the directory.
+    fn same(&self, other: &Self) -> bool {
+        self.filesystem_type == other.filesystem_type
+            && self.filesystem_id == other.filesystem_id
+            && self.device_fallback == other.device_fallback
+            && self.inode == other.inode
+            && match (self.created, other.created) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
+
+/// Whether a recorded (mountpoint, Home) identity pair describes the
+/// directories observed now. An unreadable record never matches.
+pub(super) fn same_directories(recorded: &str, current: &str) -> bool {
+    type Pair = (PersistentDirectoryId, PersistentDirectoryId);
+    match (
+        serde_json::from_str::<Pair>(recorded),
+        serde_json::from_str::<Pair>(current),
+    ) {
+        (Ok(recorded), Ok(current)) => {
+            recorded.0.same(&current.0) && recorded.1.same(&current.1)
+        }
+        _ => false,
+    }
+}
+
+/// When the directory was created (seconds, nanoseconds), where the
+/// filesystem records it. Asked of the kernel directly: the identity must
+/// not depend on which libc a binary is linked with, and std reads birth
+/// times on glibc only.
+fn birth_time(file: &File) -> Option<(u64, u32)> {
+    const STATX_BTIME: libc::c_uint = 0x800;
+    #[repr(C)]
+    struct Timestamp {
+        seconds: i64,
+        nanoseconds: u32,
+        _reserved: i32,
+    }
+    /// `struct statx`, up to the field read here; 256 bytes in the kernel ABI.
+    #[repr(C)]
+    struct Statx {
+        mask: u32,
+        _before_times: [u8; 60],
+        _accessed: Timestamp,
+        created: Timestamp,
+        _rest: [u8; 160],
+    }
+    let mut stat = std::mem::MaybeUninit::<Statx>::zeroed();
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            STATX_BTIME,
+            stat.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.mask & STATX_BTIME == 0 {
+        return None;
+    }
+    Some((
+        u64::try_from(stat.created.seconds).ok()?,
+        stat.created.nanoseconds,
+    ))
 }
 
 pub(super) fn persistent_directory_identity(path: &Path) -> Result<String> {
@@ -526,5 +598,67 @@ impl Destination {
             "mirror Home changed while opening it; refusing to sync"
         );
         self.verify()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(created: Option<(u64, u32)>, inode: u64) -> PersistentDirectoryId {
+        PersistentDirectoryId {
+            filesystem_type: 0x2fc1_2fc1,
+            filesystem_id: [7, 9],
+            device_fallback: None,
+            inode,
+            created,
+        }
+    }
+
+    fn pair(root: &PersistentDirectoryId, home: &PersistentDirectoryId) -> String {
+        serde_json::to_string(&(root, home)).unwrap()
+    }
+
+    #[test]
+    fn a_missing_birth_time_is_not_a_different_directory() {
+        // The same folder seen by a build that reads birth times and one
+        // that does not must stay the same replica, in either order.
+        let with = pair(&id(Some((1_794_700_000, 5)), 768), &id(Some((1, 2)), 896));
+        let without = pair(&id(None, 768), &id(None, 896));
+        assert!(same_directories(&with, &without));
+        assert!(same_directories(&without, &with));
+        assert!(same_directories(&with, &with));
+    }
+
+    #[test]
+    fn a_replaced_directory_is_still_refused() {
+        let original = pair(&id(Some((10, 0)), 768), &id(Some((11, 0)), 896));
+        let recreated = pair(&id(Some((99, 0)), 768), &id(Some((11, 0)), 896));
+        let other_inode = pair(&id(Some((10, 0)), 769), &id(Some((11, 0)), 896));
+        let mut moved = id(Some((10, 0)), 768);
+        moved.filesystem_id = [8, 9];
+        let other_filesystem = pair(&moved, &id(Some((11, 0)), 896));
+        assert!(!same_directories(&original, &recreated));
+        assert!(!same_directories(&original, &other_inode));
+        assert!(!same_directories(&original, &other_filesystem));
+        assert!(!same_directories("not json", &original));
+    }
+
+    #[test]
+    fn birth_time_matches_what_the_filesystem_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::open(dir.path()).unwrap();
+        let expected = file
+            .metadata()
+            .unwrap()
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| (t.as_secs(), t.subsec_nanos()));
+        // std knows the birth time on glibc only; where it does, the direct
+        // read must agree with it exactly (records made either way compare).
+        if expected.is_some() {
+            assert_eq!(birth_time(&file), expected);
+        }
     }
 }

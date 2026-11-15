@@ -731,17 +731,17 @@ fn cmd_mount(
         }
     }
 
-    let log_file = if detach {
+    let (log_file, detached) = if detach {
         let log = runtime::default_log_file(&mountpoint);
         eprintln!("detaching; logs: {}", log.display());
-        runtime::daemonize(&log)?;
-        Some(log)
+        let detached = runtime::daemonize(&log)?;
+        (Some(log), Some(detached))
     } else {
-        None
+        (None, None)
     };
     init_logger();
 
-    let handle = canvas_fuse::mount(MountOptions {
+    let mounted = canvas_fuse::mount(MountOptions {
         server: endpoint.server.clone(),
         token: endpoint.token,
         tls: endpoint.tls,
@@ -762,7 +762,16 @@ fn cmd_mount(
         context_workspace: workspace.clone(),
         blob_cache_bytes: blob_cache_mb * 1024 * 1024,
         mirror: mirror.clone(),
-    })?;
+    });
+    let handle = match mounted {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(detached) = detached {
+                detached.failed(&format!("{error:#}"));
+            }
+            return Err(error);
+        }
+    };
 
     runtime::write_state(&runtime::MountState {
         mountpoint: mountpoint.clone(),
@@ -784,6 +793,9 @@ fn cmd_mount(
         let _ = sig_tx.send(());
     })?;
     log::info!("ready");
+    if let Some(detached) = detached {
+        detached.ready();
+    }
     let _ = sig_rx.recv();
     runtime::remove_state(&mountpoint);
     handle.unmount();

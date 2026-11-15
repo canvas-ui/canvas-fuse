@@ -375,7 +375,7 @@ impl Store {
                 None
             };
             match directories {
-                Some(stored) => anyhow::ensure!(stored == binding.directories,
+                Some(stored) => anyhow::ensure!(super::identity::same_directories(&stored, binding.directories),
                     "mirror directory identity changed: filesystem, inode or creation time differs from the bound replica; refusing to reuse sync history"),
                 None => {
                     anyhow::ensure!(binding.legacy_matches || stored.as_deref() == Some(binding.marker),

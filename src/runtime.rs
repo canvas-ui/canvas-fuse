@@ -231,25 +231,81 @@ pub fn is_mounted(mountpoint: &Path) -> bool {
 /// Detach from the terminal (fork + setsid via libc::daemon) and send all
 /// further output to a log file. Must be called before any threads exist —
 /// fork() does not carry them over.
-pub fn daemonize(log_file: &Path) -> Result<()> {
+/// The background half of a detached mount. The foreground process that
+/// started it waits on the other end of the pipe and exits with the outcome,
+/// so `mount -d` succeeds only when the mount is really there.
+pub struct Detached {
+    outcome: std::fs::File,
+}
+
+impl Detached {
+    /// The mount is up: let the waiting foreground process exit 0.
+    pub fn ready(mut self) {
+        use std::io::Write;
+        let _ = self.outcome.write_all(b"ok");
+    }
+
+    /// The mount failed: the foreground process prints this and exits 1.
+    pub fn failed(mut self, error: &str) {
+        use std::io::Write;
+        let _ = self.outcome.write_all(error.as_bytes());
+    }
+}
+
+/// Continue in a background process with stdout/stderr in `log_file`. The
+/// calling process never returns from here: it waits for the background
+/// one to report (`Detached::ready` / `failed`) and exits accordingly.
+pub fn daemonize(log_file: &Path) -> Result<Detached> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
     std::fs::create_dir_all(log_file.parent().unwrap())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_file)
         .with_context(|| format!("opening log file {}", log_file.display()))?;
-
-    // nochdir=1: caller already canonicalized paths, keep cwd valid for them
-    if unsafe { libc::daemon(1, 0) } != 0 {
-        anyhow::bail!("daemon() failed: {}", std::io::Error::last_os_error());
+    let mut ends = [0; 2];
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        anyhow::bail!("pipe() failed: {}", std::io::Error::last_os_error());
     }
-    use std::os::fd::AsRawFd;
+    let (mut outcome, report) = unsafe {
+        (
+            std::fs::File::from_raw_fd(ends[0]),
+            std::fs::File::from_raw_fd(ends[1]),
+        )
+    };
+    match unsafe { libc::fork() } {
+        -1 => anyhow::bail!("fork() failed: {}", std::io::Error::last_os_error()),
+        0 => {}
+        _ => {
+            drop(report);
+            let mut message = String::new();
+            let _ = outcome.read_to_string(&mut message);
+            if message == "ok" {
+                std::process::exit(0);
+            }
+            if message.is_empty() {
+                eprintln!("Error: the mount did not start; see {}", log_file.display());
+            } else {
+                eprintln!("Error: {message}");
+            }
+            std::process::exit(1);
+        }
+    }
+    drop(outcome);
+    // Own session, so the terminal that started the mount can close. The
+    // working directory stays: the caller already canonicalized its paths.
     unsafe {
+        libc::setsid();
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null >= 0 {
+            libc::dup2(null, libc::STDIN_FILENO);
+            libc::close(null);
+        }
         libc::dup2(log.as_raw_fd(), libc::STDOUT_FILENO);
         libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
     }
-    std::mem::forget(log); // fd now owned by stdout/stderr
-    Ok(())
+    Ok(Detached { outcome: report })
 }
 
 pub fn default_log_file(mountpoint: &Path) -> PathBuf {
