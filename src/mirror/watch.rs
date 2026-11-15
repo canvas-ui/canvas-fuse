@@ -262,8 +262,7 @@ mod tests {
     #[test]
     fn a_file_notification_waits_for_close_and_names_only_the_changed_path() {
         let dir = tempfile::tempdir().unwrap();
-        let local =
-            Arc::new(Local::open(&dir.path().join("home"), &dir.path().join("state")).unwrap());
+        let local = Arc::new(Local::open(&dir.path().join("home"), dir.path()).unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         let _watcher = Watcher::start(
             local.clone(),

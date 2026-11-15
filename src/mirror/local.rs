@@ -12,9 +12,14 @@
 //! Everything here is local disk I/O: writes land atomically (a dotted
 //! `.<name>.canvas-part` next to the target, renamed into place once the
 //! bytes are complete and, for a download, the digest verified), hub-deleted
-//! files move to `<data_dir>/trash/<key>` for 30 days, and the local side of
-//! a conflict is snapshotted to `<data_dir>/conflicts/<sha256>` before the
+//! files move to `.canvas-fuse/trash/<key>` for 30 days, and the local side of
+//! a conflict is snapshotted to `.canvas-fuse/conflicts/<sha256>` before the
 //! hub's version takes the name.
+//!
+//! `.canvas-fuse/` sits in the mountpoint, next to `.workspace.json`: kept
+//! bytes share a filesystem with the files they came from, so trashing is a
+//! rename and the space they take is the mirror's own. It is reached through
+//! a held fd like the folder itself, and is never synced.
 
 use super::hub::{HubClient, HubError};
 use anyhow::{Context as _, Result};
@@ -28,6 +33,16 @@ use std::time::{Duration, SystemTime};
 /// Suffix of an in-progress write. Dotted so the hub's rules ignore it, and
 /// skipped by the scan so a crash mid-download never shows up as a file.
 pub const PART_SUFFIX: &str = ".canvas-part";
+
+/// The mirror's own directory in the mountpoint: trash, conflict snapshots
+/// and upload staging. With Home at the mount root it is a sibling of the
+/// user's files, so the name is reserved there.
+pub const STATE_DIR: &str = ".canvas-fuse";
+
+/// Top-level names in the folder that belong to the mirror, not the user.
+fn reserved(name: &str) -> bool {
+    name == super::identity::MARKER || name == STATE_DIR
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalStat {
@@ -85,6 +100,7 @@ pub struct Local {
     /// The directory the user sees (for messages and status).
     display: PathBuf,
     _fd: OwnedFd,
+    _state_fd: OwnedFd,
     trash_root: PathBuf,
     conflicts_root: PathBuf,
     uploads_root: PathBuf,
@@ -107,8 +123,8 @@ fn io_err(e: impl std::fmt::Display) -> HubError {
 pub(super) fn check_key(key: &str) -> Result<()> {
     anyhow::ensure!(!key.is_empty(), "empty key");
     anyhow::ensure!(
-        key.split('/').next() != Some(super::identity::MARKER),
-        ".workspace.json is reserved local mirror identity metadata"
+        !key.split('/').next().is_some_and(reserved),
+        ".workspace.json and .canvas-fuse are reserved for the local mirror"
     );
     for seg in key.split('/') {
         anyhow::ensure!(
@@ -119,31 +135,40 @@ pub(super) fn check_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create `dir` if missing and hold it open; the returned path resolves
+/// through the fd.
+fn open_dir(dir: &Path) -> Result<(OwnedFd, PathBuf)> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+        .context("directory path contains a NUL byte")?;
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening {}", dir.display()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    Ok((fd, path))
+}
+
 impl Local {
-    /// Open the directory (created if missing) and hold an fd to it. Must be
-    /// called BEFORE a FUSE mount covers `dir` — afterwards a fresh open
-    /// would land in the mount, not in the real folder.
-    pub fn open(dir: &Path, data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-            .context("directory path contains a NUL byte")?;
-        let raw = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("opening {}", dir.display()));
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let root = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
-        let trash_root = data_dir.join("trash");
-        let conflicts_root = data_dir.join("conflicts");
+    /// Open the directory and the mirror's `.canvas-fuse` in `mountpoint`
+    /// (both created if missing) and hold an fd to each. Must be called
+    /// BEFORE a FUSE mount covers `mountpoint` — afterwards a fresh open
+    /// would land in the mount, not in the real folders.
+    pub fn open(dir: &Path, mountpoint: &Path) -> Result<Self> {
+        let (fd, root) = open_dir(dir)?;
+        let (state_fd, state_root) = open_dir(&mountpoint.join(STATE_DIR))?;
+        let trash_root = state_root.join("trash");
+        let conflicts_root = state_root.join("conflicts");
         std::fs::create_dir_all(&trash_root)?;
         std::fs::create_dir_all(&conflicts_root)?;
-        let uploads_root = data_dir.join("uploads");
+        let uploads_root = state_root.join("uploads");
         std::fs::create_dir_all(&uploads_root)?;
         // Store::open has acquired the exclusive mirror database lock. Upload
         // bodies are transient; recover pending work from Home after a crash.
@@ -156,6 +181,7 @@ impl Local {
             root,
             display: dir.to_path_buf(),
             _fd: fd,
+            _state_fd: state_fd,
             trash_root,
             conflicts_root,
             uploads_root,
@@ -543,7 +569,8 @@ impl Local {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => {
-                // Another filesystem for the data dir: copy, then remove.
+                // Home is its own filesystem under the mountpoint: copy,
+                // then remove.
                 if e.raw_os_error() == Some(libc::EXDEV) {
                     std::fs::copy(self.path(key), &dest)?;
                     std::fs::remove_file(self.path(key))?;
@@ -626,7 +653,7 @@ impl Local {
     /// require walking the rest of the workspace.
     pub fn walk_from(&self, key: &str) -> Vec<(String, LocalStat)> {
         let mut out = Vec::new();
-        if key.split('/').next() == Some(super::identity::MARKER) {
+        if key.split('/').next().is_some_and(reserved) {
             return out;
         }
         if !key.is_empty() {
@@ -646,9 +673,7 @@ impl Local {
             };
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(PART_SUFFIX)
-                    || (dir.is_empty() && name == super::identity::MARKER)
-                {
+                if name.ends_with(PART_SUFFIX) || (dir.is_empty() && reserved(&name)) {
                     continue;
                 }
                 let Ok(ft) = entry.file_type() else {
@@ -713,7 +738,7 @@ mod tests {
 
     fn local() -> (tempfile::TempDir, Local) {
         let dir = tempfile::tempdir().unwrap();
-        let l = Local::open(&dir.path().join("Home"), &dir.path().join("data")).unwrap();
+        let l = Local::open(&dir.path().join("Home"), dir.path()).unwrap();
         (dir, l)
     }
 
@@ -760,7 +785,7 @@ mod tests {
 
         l.trash_put("sub/y.txt", "sub/y.txt").unwrap();
         assert!(!l.exists("sub/y.txt"));
-        assert!(d.path().join("data/trash/sub/y.txt").is_file());
+        assert!(d.path().join(".canvas-fuse/trash/sub/y.txt").is_file());
         assert_eq!(l.trash_walk().len(), 1);
         let h = l.trash_restore("sub/y.txt", "sub/y.txt").unwrap();
         assert_eq!(h.sha256, super::super::sha256_hex(b"x"));
@@ -769,7 +794,7 @@ mod tests {
 
         l.trash_put("sub/y.txt", "sub/y.txt").unwrap();
         l.trash_remove("sub/y.txt");
-        assert!(!d.path().join("data/trash/sub").exists(), "pruned");
+        assert!(!d.path().join(".canvas-fuse/trash/sub").exists(), "pruned");
     }
 
     #[test]

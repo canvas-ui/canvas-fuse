@@ -63,6 +63,32 @@ const META_FOREIGN_DIR: &str = "foreign-dir:";
 const STATUS_THROTTLE: Duration = Duration::from_secs(1);
 const REPORT_THROTTLE: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
+const DOWNLOAD_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// The downloads of a full listing pass: how much the hub holds that the
+/// folder does not, and how far along the pass is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+impl std::fmt::Display for DownloadProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MIB: f64 = 1024.0 * 1024.0;
+        write!(
+            f,
+            "{}/{} files, {:.1}/{:.1} MiB",
+            self.files_done,
+            self.files_total,
+            self.bytes_done as f64 / MIB,
+            self.bytes_total as f64 / MIB
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +132,9 @@ pub struct MirrorStatus {
     /// Files missing from the folder whose deletion waits for `deletes approve|restore`.
     #[serde(default)]
     pub held_deletes: u64,
+    /// Set while a full listing pass is fetching files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloading: Option<DownloadProgress>,
 }
 
 pub enum EngineMsg {
@@ -162,6 +191,8 @@ struct Runtime {
     /// back folder looks the same as a deliberate `rm -rf`, so nothing is
     /// sent until the user decides. Recomputed by every scan.
     held_deletes: BTreeSet<String>,
+    /// The running listing pass's downloads, and when they were last logged.
+    downloading: Option<(DownloadProgress, Instant)>,
 }
 
 /// A file the scan found that the index does not know.
@@ -323,7 +354,7 @@ impl Mirror {
             .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
         let store = Arc::new(destination.open_store(&cfg.data_dir)?);
         destination.commit()?;
-        let local = Arc::new(Local::open(&cfg.home_dir, &cfg.data_dir)?);
+        let local = Arc::new(Local::open(&cfg.home_dir, &cfg.mountpoint)?);
         destination.verify_local(&local)?;
         let hub = Arc::new(HubClient::with_tls(
             &cfg.server,
@@ -383,6 +414,7 @@ impl Mirror {
                 recheck: HashSet::new(),
                 protected_jobs: HashSet::new(),
                 held_deletes: BTreeSet::new(),
+                downloading: None,
             }),
             engine_tx: Arc::new(Mutex::new(None)),
             local_changes: Arc::new(Mutex::new(super::watch::Changes::default())),
@@ -1173,6 +1205,7 @@ impl Mirror {
             protected: self.opts.protected,
             blocked: self.store.blocked_actions().len() as u64,
             held_deletes: rt.held_deletes.len() as u64,
+            downloading: rt.downloading.map(|(progress, _)| progress),
         }
     }
 
@@ -2114,15 +2147,18 @@ impl Mirror {
         keys.extend(self.store.bases("").into_iter().map(|(k, _)| k));
         let mut sorted: Vec<String> = keys.into_iter().collect();
         sorted.sort();
-        for key in sorted {
+        self.begin_downloads(&remote);
+        let reconciled = sorted.into_iter().try_for_each(|key| {
             touched.extend(self.drain_jobs(16)?);
             // This snapshot predates a prioritized mutation. Its feed echo
             // (after `head`) will reconcile it against current server state.
             if touched.iter().any(|path| super::store::under(&key, path)) {
-                continue;
+                return Ok(());
             }
-            self.reconcile_key(&key, remote.get(&key), 0)?;
-        }
+            self.reconcile_key(&key, remote.get(&key), 0)
+        });
+        self.end_downloads();
+        reconciled?;
         let _ = self.store.set_cursor(head);
         let _ = self.store.set_number(HEAD_KEY, head);
         let _ = self.store.set_meta(META_LISTED, "1");
@@ -2594,6 +2630,71 @@ impl Mirror {
         Ok(())
     }
 
+    /// Announce what a listing pass is about to fetch: every hub file whose
+    /// bytes the folder does not hold. An estimate, since a key can still
+    /// turn out to be a conflict or change before its turn.
+    fn begin_downloads(&self, remote: &BTreeMap<String, RemoteStat>) {
+        let mut progress = DownloadProgress::default();
+        for (key, r) in remote {
+            if self.is_ignored(key) {
+                continue;
+            }
+            let held = self
+                .store
+                .entry(key)
+                .is_some_and(|e| e.state != EntryState::Tombstone && e.sha256 == r.sha256);
+            if !held && self.store.base(key).is_none_or(|b| b.sha256 != r.sha256) {
+                progress.files_total += 1;
+                progress.bytes_total += r.size;
+            }
+        }
+        if progress.files_total == 0 {
+            return;
+        }
+        log::info!(
+            "mirror: downloading {} files ({:.1} MiB) into {}",
+            progress.files_total,
+            progress.bytes_total as f64 / (1024.0 * 1024.0),
+            self.local.display_path().display()
+        );
+        self.rt.lock().downloading = Some((progress, Instant::now()));
+        self.write_status(true);
+    }
+
+    fn end_downloads(&self) {
+        if let Some((progress, _)) = self.rt.lock().downloading.take() {
+            log::info!("mirror: downloads done: {progress}");
+            self.write_status(true);
+        }
+    }
+
+    /// One file landed. Inside a listing pass it advances the pass's
+    /// progress (logged every few seconds); a lone pull is logged by name.
+    fn downloaded(&self, key: &str, size: u64) {
+        let report = {
+            let mut rt = self.rt.lock();
+            match rt.downloading.as_mut() {
+                Some((progress, logged)) => {
+                    progress.files_done += 1;
+                    progress.bytes_done += size;
+                    (logged.elapsed() >= DOWNLOAD_LOG_EVERY).then(|| {
+                        *logged = Instant::now();
+                        *progress
+                    })
+                }
+                None => {
+                    drop(rt);
+                    log::info!("{key}: downloaded ({size} bytes)");
+                    return;
+                }
+            }
+        };
+        if let Some(progress) = report {
+            log::info!("mirror: downloading: {progress}");
+        }
+        self.write_status(false);
+    }
+
     /// Take the hub's version of a key: the bytes land in the folder (an
     /// atomic replace), and entry + base follow.
     fn pull_key(
@@ -2668,6 +2769,7 @@ impl Mirror {
         self.record_dirs_for(key);
         let _ = self.store.remove_jobs_for(key);
         self.view_upsert(key, h.size, h.mtime);
+        self.downloaded(key, h.size);
         Ok(())
     }
 

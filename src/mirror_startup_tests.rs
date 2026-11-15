@@ -97,7 +97,11 @@ fn remote_alias_changes_reuse_original_history_and_cache_offline() {
             },
         )
         .unwrap();
-        std::fs::write(original.join("trash/retained.txt"), b"keep recovery bytes").unwrap();
+        std::fs::write(
+            opts.mountpoint.join(".canvas-fuse/trash/retained.txt"),
+            b"keep recovery bytes",
+        )
+        .unwrap();
         let marker = simulate_legacy_reboot(&opts);
         let store = Store::open(&original.join("mirror.redb")).unwrap();
         let jobs = store.jobs();
@@ -142,7 +146,7 @@ fn remote_alias_changes_reuse_original_history_and_cache_offline() {
             marker
         );
         assert_eq!(
-            std::fs::read(original.join("trash/retained.txt")).unwrap(),
+            std::fs::read(dir.path().join("Augmentd/.canvas-fuse/trash/retained.txt")).unwrap(),
             b"keep recovery bytes"
         );
         let store = Store::open(&original.join("mirror.redb")).unwrap();

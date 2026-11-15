@@ -894,8 +894,9 @@ fn cmd_status(as_json: bool) -> Result<()> {
         if s.mirror {
             match runtime::read_mirror_status(&s.mountpoint) {
                 Some(m) => println!(
-                    "          mirror: {:?}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}  protected {}  recorded blocks {}{}",
+                    "          mirror: {:?}{}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}  protected {}  recorded blocks {}{}",
                     m.state,
+                    m.downloading.map(|d| format!("  downloading {d}")).unwrap_or_default(),
                     m.cursor.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     m.head.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     m.pending,

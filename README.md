@@ -285,7 +285,7 @@ What the daemon does:
   the CLI instead. Existing configurations that explicitly select `prompt`
   keep that policy; change them to `rename` to use conflict copies.
   `canvas-fuse conflicts <mountpoint>` lists what this device recorded. A
-  copy of your bytes is kept under the data dir (`conflicts/<sha256>`)
+  copy of your bytes is kept in `<mountpoint>/.canvas-fuse/conflicts/<sha256>`
   until the conflict is resolved.
 - **Files that go missing in bulk are not deleted on the hub.** A `rm`
   through the mount is sent at once. Files a folder scan finds missing
@@ -308,7 +308,7 @@ What the daemon does:
   name. When the same file was moved to different names on both sides, both
   names are kept.
 - **Hub deletes go to a local trash.** A file deleted on the hub leaves the
-  folder but is kept for 30 days in `<data dir>/trash/<path>`:
+  folder but is kept for 30 days in `<mountpoint>/.canvas-fuse/trash/<path>`:
   `canvas-fuse trash list|restore <mountpoint> [<key>]` (restore = push as a
   new file). Every deleted version is kept: a second deletion of the same
   name gets its own entry, and a new file under that name does not discard
@@ -406,7 +406,9 @@ it is sent as `X-Canvas-Origin` so the mirror recognizes its own echoes.
 State lives in the mount's data dir
 (`~/.canvas/<server-host>/fuse/workspaces/<ws>/mounts/<mount-path>.<hash>/`
 or `--data-dir`): `mirror.redb` (index, base ledger, cursor, jobs,
-conflicts, trash records), `trash/` and `conflicts/`. The bytes themselves
+conflicts, trash records). Kept bytes live in `<mountpoint>/.canvas-fuse/`
+(`trash/`, `conflicts/`, upload staging): on the mirror's own filesystem,
+hidden by the mount while it runs and never synced. The files themselves
 are only ever in `Home/`. Hub document ids are never stored — keys and
 digests are the identity.
 
