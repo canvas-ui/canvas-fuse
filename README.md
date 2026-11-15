@@ -431,6 +431,14 @@ preconditions). Preserve both the retained bytes and Stored's metadata database
 before incident recovery. Local mirror trash contains only local copies
 preserved after hub deletions, so it is not a complete server recovery archive.
 
+**Pause.** `canvas-fuse sync pause <mountpoint>` holds every transfer — for
+a metered connection, say — while the mount stays up: files read and write
+normally and local changes queue. A request already on the wire finishes;
+nothing new starts. The pause is kept across restarts until
+`canvas-fuse sync resume <mountpoint>`, which uploads what queued and
+catches up. `status` shows it as `paused (by user)`, `userPaused: true` in
+the JSON.
+
 **Status and control.** `canvas-fuse status [--json]` shows a `mirror`
 block per mirror mount (`state` idle|syncing|offline|paused, `home`,
 `cursor`/`head`, `pending`, `failed`, `conflicts`, `skipped`, `entries`,
@@ -446,6 +454,7 @@ shows its lag.
 canvas-fuse mount -w myws ~/Workspaces --mirror --conflicts rename
 canvas-fuse status --json
 canvas-fuse sync now ~/Workspaces/myws
+canvas-fuse sync pause ~/Workspaces/myws   # … sync resume
 canvas-fuse conflicts ~/Workspaces/myws
 canvas-fuse trash list ~/Workspaces/myws
 canvas-fuse unmount ~/Workspaces/myws      # ~/Workspaces/myws/Home stays, as files

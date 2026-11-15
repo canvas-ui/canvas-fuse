@@ -132,6 +132,8 @@ pub enum HubError {
     LocalChanged(String),
     /// Protected mode deferred this job without executing or acknowledging it.
     Protected(String),
+    /// The user paused sync; the work stays queued for `resume`.
+    Paused,
 }
 
 impl std::fmt::Display for HubError {
@@ -161,6 +163,7 @@ impl std::fmt::Display for HubError {
             HubError::Other(m) => write!(f, "{m}"),
             HubError::LocalChanged(key) => write!(f, "{key}: changed locally during download"),
             HubError::Protected(key) => write!(f, "{key}: deferred by protected mirror mode"),
+            HubError::Paused => write!(f, "sync is paused"),
         }
     }
 }

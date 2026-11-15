@@ -291,6 +291,16 @@ enum SyncCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Hold all transfers; the mount stays up and local edits queue. Kept across restarts
+    Pause {
+        /// Mountpoint of a --mirror mount
+        mountpoint: PathBuf,
+    },
+    /// Lift `sync pause` and catch up
+    Resume {
+        /// Mountpoint of a --mirror mount
+        mountpoint: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -446,6 +456,12 @@ fn main() -> Result<()> {
         Command::Sync {
             what: SyncCommand::Blocked { mountpoint, json },
         } => cmd_sync_blocked(&mountpoint, json),
+        Command::Sync {
+            what: SyncCommand::Pause { mountpoint },
+        } => cmd_sync_pause(&mountpoint, true),
+        Command::Sync {
+            what: SyncCommand::Resume { mountpoint },
+        } => cmd_sync_pause(&mountpoint, false),
         Command::Conflicts { mountpoint, json } => cmd_conflicts(&mountpoint, json),
         Command::Deletes { what } => match what {
             DeletesCommand::List { mountpoint } => cmd_deletes(&mountpoint, "list"),
@@ -894,8 +910,9 @@ fn cmd_status(as_json: bool) -> Result<()> {
         if s.mirror {
             match runtime::read_mirror_status(&s.mountpoint) {
                 Some(m) => println!(
-                    "          mirror: {:?}{}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}  protected {}  recorded blocks {}{}",
+                    "          mirror: {:?}{}{}  cursor {}/{}  pending {}  failed {}  conflicts {}  skipped {}  files {}  home {}  protected {}  recorded blocks {}{}",
                     m.state,
+                    if m.user_paused { " (by user)" } else { "" },
                     m.downloading.map(|d| format!("  downloading {d}")).unwrap_or_default(),
                     m.cursor.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
                     m.head.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
@@ -935,6 +952,22 @@ fn mirror_socket(mountpoint: &Path) -> Result<PathBuf> {
         );
     }
     Ok(runtime::control_socket_for(&state.mountpoint))
+}
+
+fn cmd_sync_pause(mountpoint: &Path, pause: bool) -> Result<()> {
+    let sock = mirror_socket(mountpoint)?;
+    let cmd = if pause { "pause" } else { "resume" };
+    let resp = control::request(&sock, &json!({ "cmd": cmd }))?;
+    let pending = resp
+        .pointer("/mirror/pending")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if pause {
+        println!("sync paused ({pending} queued); `canvas-fuse sync resume` continues");
+    } else {
+        println!("sync resumed ({pending} queued)");
+    }
+    Ok(())
 }
 
 fn cmd_sync_now(mountpoint: &Path) -> Result<()> {

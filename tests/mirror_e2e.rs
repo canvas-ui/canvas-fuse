@@ -1494,6 +1494,53 @@ fn files_moved_in_that_the_hub_already_holds_are_adopted_without_any_transfer() 
 }
 
 #[test]
+fn a_user_pause_holds_every_transfer_across_a_restart_until_resume() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    hub.lock().put("before.txt", b"before");
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert_eq!(m.status().state, SyncState::Idle);
+
+    m.pause().unwrap();
+    assert!(m.is_offline(), "the mount serves local data while paused");
+    hub.lock().requests.clear();
+    hub.lock().put("remote.txt", b"from the hub");
+    m.commit_write("local.txt", b"written while paused")
+        .unwrap();
+    m.cycle(false);
+    m.cycle(true);
+    let st = m.status();
+    assert_eq!(st.state, SyncState::Paused);
+    assert!(st.user_paused);
+    assert_eq!(st.pending, 1);
+    assert!(hub.lock().requests.is_empty(), "{:?}", hub.lock().requests);
+
+    // The pause is the user's decision, not this process's.
+    drop(m);
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    assert!(m.status().user_paused);
+    assert!(hub.lock().requests.is_empty(), "{:?}", hub.lock().requests);
+    assert!(hub.lock().bytes_of("local.txt").is_none());
+
+    m.resume().unwrap();
+    settle(&m);
+    let st = m.status();
+    assert_eq!(st.state, SyncState::Idle);
+    assert!(!st.user_paused);
+    assert_eq!(st.pending, 0);
+    assert_eq!(
+        hub.lock().bytes_of("local.txt").unwrap(),
+        b"written while paused"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("Home/remote.txt")).unwrap(),
+        b"from the hub"
+    );
+}
+
+#[test]
 fn fresh_activity_preempts_a_discovered_upload_backlog() {
     use canvas_fuse::mirror::store::JobPriority;
     let r = rig(opts());

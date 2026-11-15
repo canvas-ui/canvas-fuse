@@ -9,6 +9,7 @@
 //! store itself; it asks.
 //!
 //! Requests: `{"cmd":"sync"}`, `{"cmd":"conflicts"}`, `{"cmd":"deletes","op":"list|approve|restore"}`, `{"cmd":"trash","op":"list|restore","key":…}`,
+//! `{"cmd":"pause"}`, `{"cmd":"resume"}`,
 //! `{"cmd":"status"}`, `{"cmd":"blocked"}`, `{"cmd":"push","dryRun":true}`, `{"cmd":"pull","dryRun":true}`.
 //! Responses: `{"ok":true, …}` or
 //! `{"ok":false,"error":"…"}`.
@@ -119,6 +120,20 @@ fn dispatch(req: &Value, mirror: &Mirror) -> Value {
                 Ok(report) => json!({"ok": true, "report": report}),
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             }
+        }
+        "pause" | "resume" => {
+            let result = if cmd == "pause" {
+                mirror.pause()
+            } else {
+                mirror.resume()
+            };
+            match result {
+                Ok(()) => json!({ "ok": true, "mirror": mirror.status() }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            }
+        }
+        "sync" if mirror.is_user_paused() => {
+            json!({ "ok": false, "error": "sync is paused; run `sync resume` first" })
         }
         "sync" => {
             let finished = mirror.sync_now(Duration::from_secs(600));

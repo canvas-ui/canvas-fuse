@@ -64,6 +64,8 @@ const STATUS_THROTTLE: Duration = Duration::from_secs(1);
 const REPORT_THROTTLE: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 const DOWNLOAD_LOG_EVERY: Duration = Duration::from_secs(10);
+/// Store meta: present while the user holds sync paused, across restarts.
+const META_USER_PAUSED: &str = "user-paused";
 
 /// The downloads of a full listing pass: how much the hub holds that the
 /// folder does not, and how far along the pass is.
@@ -135,6 +137,9 @@ pub struct MirrorStatus {
     /// Set while a full listing pass is fetching files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloading: Option<DownloadProgress>,
+    /// The user paused sync (`sync pause`): nothing moves until `sync resume`.
+    #[serde(default)]
+    pub user_paused: bool,
 }
 
 pub enum EngineMsg {
@@ -232,6 +237,9 @@ pub struct Mirror {
     directory_epoch: std::sync::atomic::AtomicU64,
     /// Recovery pushes exclude background synchronization, but never local I/O.
     cycle_gate: Mutex<()>,
+    /// The user's pause, mirrored from the store so every transfer step can
+    /// check it without a database read.
+    user_paused: AtomicBool,
     // Release destination locks after the database, local handles and watcher.
     destination: super::identity::Destination,
 }
@@ -393,8 +401,10 @@ impl Mirror {
             );
         }
 
+        let user_paused = store.meta(META_USER_PAUSED).is_some();
         let mirror = Arc::new(Self {
             destination,
+            user_paused: AtomicBool::new(user_paused),
             store,
             local,
             hub,
@@ -404,7 +414,11 @@ impl Mirror {
             status_path: cfg.status_path,
             ignore: Arc::new(RwLock::new(IgnoreRules::new(patterns))),
             rt: Mutex::new(Runtime {
-                state: SyncState::Idle,
+                state: if user_paused {
+                    SyncState::Paused
+                } else {
+                    SyncState::Idle
+                },
                 last_sync: None,
                 last_error: None,
                 last_full: None,
@@ -1206,7 +1220,41 @@ impl Mirror {
             blocked: self.store.blocked_actions().len() as u64,
             held_deletes: rt.held_deletes.len() as u64,
             downloading: rt.downloading.map(|(progress, _)| progress),
+            user_paused: self.is_user_paused(),
         }
+    }
+
+    pub fn is_user_paused(&self) -> bool {
+        self.user_paused.load(Ordering::Relaxed)
+    }
+
+    /// Hold all transfers until `resume`. The mount stays up and local edits
+    /// keep queueing; a request already on the wire finishes, nothing new
+    /// starts. Survives a restart.
+    pub fn pause(&self) -> Result<()> {
+        self.store.set_meta(META_USER_PAUSED, "1")?;
+        if !self.user_paused.swap(true, Ordering::Relaxed) {
+            log::info!("mirror: sync paused by the user");
+        }
+        self.set_state(SyncState::Paused);
+        Ok(())
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        self.store.remove_meta(META_USER_PAUSED)?;
+        if self.user_paused.swap(false, Ordering::Relaxed) {
+            log::info!("mirror: sync resumed by the user");
+            self.set_state(SyncState::Idle);
+        }
+        self.wake();
+        Ok(())
+    }
+
+    fn check_not_paused(&self) -> Result<(), HubError> {
+        if self.is_user_paused() {
+            return Err(HubError::Paused);
+        }
+        Ok(())
     }
 
     /// Write the status file (throttled to once a second unless forced).
@@ -1902,6 +1950,10 @@ impl Mirror {
     /// Public so tests drive it without a thread.
     pub fn cycle(&self, full: bool) {
         let _cycle = self.cycle_gate.lock();
+        if self.is_user_paused() {
+            self.set_state(SyncState::Paused);
+            return;
+        }
         self.rt.lock().protected_jobs.clear();
         let before = self.rt.lock().state;
         if before == SyncState::Paused && !full {
@@ -1928,6 +1980,10 @@ impl Mirror {
                         }
                         self.set_error(Some(msg));
                         self.set_state(SyncState::Offline);
+                    }
+                    HubError::Paused => {
+                        self.set_state(SyncState::Paused);
+                        return;
                     }
                     HubError::Unauthorized | HubError::UnsafeMirror(_) => {
                         log::error!("mirror: {msg}; pausing");
@@ -2157,7 +2213,7 @@ impl Mirror {
             }
             self.reconcile_key(&key, remote.get(&key), 0)
         });
-        self.end_downloads();
+        self.end_downloads(reconciled.is_ok());
         reconciled?;
         let _ = self.store.set_cursor(head);
         let _ = self.store.set_number(HEAD_KEY, head);
@@ -2661,12 +2717,13 @@ impl Mirror {
         self.write_status(true);
     }
 
-    fn end_downloads(&self) {
+    fn end_downloads(&self, completed: bool) {
         // Bound first: a guard in the `if let` scrutinee would still be held
         // when write_status locks again.
         let finished = self.rt.lock().downloading.take();
         if let Some((progress, _)) = finished {
-            log::info!("mirror: downloads done: {progress}");
+            let outcome = if completed { "done" } else { "interrupted" };
+            log::info!("mirror: downloads {outcome}: {progress}");
             self.write_status(true);
         }
     }
@@ -2707,6 +2764,7 @@ impl Mirror {
         seq: u64,
         expected: Option<Entry>,
     ) -> Result<(), HubError> {
+        self.check_not_paused()?;
         let guard = self.directory_moves.lock();
         if self.store.entry(key) != expected
             || self.is_open_for_write(key)
@@ -2917,6 +2975,7 @@ impl Mirror {
     fn drain_jobs(&self, budget: usize) -> Result<HashSet<String>, HubError> {
         let mut touched = HashSet::new();
         for _ in 0..budget {
+            self.check_not_paused()?;
             self.process_local_events();
             let now = super::now_ms();
             let mut jobs = self.store.jobs();
@@ -3017,7 +3076,9 @@ impl Mirror {
                 }
                 self.write_status(false);
             }
-            Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized) => return Err(e),
+            Err(e) if e.is_offline() || matches!(e, HubError::Unauthorized | HubError::Paused) => {
+                return Err(e)
+            }
             Err(HubError::LocalChanged(_)) => {
                 // A user edit won the race with background preparation.
                 // Keep the current job ready; this is not a server failure
