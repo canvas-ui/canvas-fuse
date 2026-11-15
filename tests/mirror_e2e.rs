@@ -1458,6 +1458,42 @@ fn offline_additions_upload_before_the_first_remote_listing_or_download() {
 }
 
 #[test]
+fn files_moved_in_that_the_hub_already_holds_are_adopted_without_any_transfer() {
+    let hub = FakeHub::start();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..20 {
+        hub.lock()
+            .put(&format!("Photos/{n}.jpg"), format!("photo {n}").as_bytes());
+    }
+    drop(open_mirror(&dir, &hub.url, opts()));
+    std::fs::create_dir_all(dir.path().join("Home/Photos")).unwrap();
+    for n in 0..20 {
+        std::fs::write(
+            dir.path().join(format!("Home/Photos/{n}.jpg")),
+            format!("photo {n}"),
+        )
+        .unwrap();
+    }
+    let m = open_mirror(&dir, &hub.url, opts());
+    m.cycle(true);
+    let st = hub.lock();
+    assert!(
+        !st.requests
+            .iter()
+            .any(|q| q.starts_with("PUT ") || q.starts_with("GET ") && q.contains("/Photos/")),
+        "{:?}",
+        st.requests
+    );
+    assert_eq!(m.status().pending, 0);
+    for n in 0..20 {
+        assert_eq!(
+            m.entry(&format!("Photos/{n}.jpg")).unwrap().state,
+            EntryState::Clean
+        );
+    }
+}
+
+#[test]
 fn fresh_activity_preempts_a_discovered_upload_backlog() {
     use canvas_fuse::mirror::store::JobPriority;
     let r = rig(opts());

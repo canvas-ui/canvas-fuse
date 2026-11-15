@@ -3145,6 +3145,17 @@ impl Mirror {
             return Err(HubError::Protected(key.into()));
         }
         drop(guard);
+        // A file the folder gained may be one the hub already holds (a copy
+        // moved in, a restored backup). The scan knows its digest: ask
+        // before staging and sending the bytes, and adopt a match as synced.
+        if base.is_none() {
+            if let Some(remote) = self.hub.head_object(key)? {
+                if remote.sha256 == entry.sha256 {
+                    log::info!("{key}: already on the hub with the same content");
+                    return self.reconcile_key(key, Some(&remote), 0);
+                }
+            }
+        }
         // Hash/copy on the engine thread, without blocking local operations.
         let snapshot = self
             .local
