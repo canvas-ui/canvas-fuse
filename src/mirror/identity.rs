@@ -103,9 +103,7 @@ pub(super) fn same_directories(recorded: &str, current: &str) -> bool {
         serde_json::from_str::<Pair>(recorded),
         serde_json::from_str::<Pair>(current),
     ) {
-        (Ok(recorded), Ok(current)) => {
-            recorded.0.same(&current.0) && recorded.1.same(&current.1)
-        }
+        (Ok(recorded), Ok(current)) => recorded.0.same(&current.0) && recorded.1.same(&current.1),
         _ => false,
     }
 }

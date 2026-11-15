@@ -412,6 +412,16 @@ hidden by the mount while it runs and never synced. The files themselves
 are only ever in `Home/`. Hub document ids are never stored — keys and
 digests are the identity.
 
+**The folder and its history belong together.** A mirror refuses to start
+when the mountpoint or `Home` is not the directory its sync history was
+recorded for (another filesystem, another inode, or a directory created at
+another time): a replaced or copied folder would otherwise read as "the user
+deleted everything". The check does not depend on how canvas-fuse was built —
+the static (musl) and glibc binaries identify a folder the same way, and a
+filesystem or kernel that reports no creation time is compared on filesystem
+id and inode alone. To put a mirror somewhere else, mount the new location as
+a new mirror; do not move `.workspace.json` or the state directory by hand.
+
 Starting with 0.13.7, switching between `--server` and `--remote` reuses the
 same mirror history. Older state directories under a remote alias are located
 by their exact `.workspace.json` binding and reused in place, including their
@@ -606,7 +616,7 @@ for `unmount` and `sync` commands.
 | `--include-backends` | false | Include `Trees/backends/` in a full workspace mount. With source selectors, use `--tree backends` instead. |
 | `--no-backends` | false | Explicitly exclude the backend tree (already the default); Home and mirroring remain enabled. |
 | `--root <selector>` | - | The selector as a flag, for when it comes from config or a script. |
-| `-d/--detach` | false | Daemonize after pre-flight; logs written to the state dir. |
+| `-d/--detach` | false | Run the mount in the background; logs written to the state dir. The command returns once the mount is up (exit 0) or has failed (exit 1, with the error), so a script can trust the exit code. A mirror scans its folder first, which can take a while on a large one. |
 | `--no-ws` | false | Disable the websocket event bridge (poll-only). |
 | `--no-nudge` | false | Disable the inotify nudge (see below). Also `CANVAS_FUSE_NO_NUDGE`. |
 | `--resync <secs>` | 30 | Full resync interval in seconds. |
