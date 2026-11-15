@@ -798,6 +798,20 @@ mod tests {
     }
 
     #[test]
+    fn the_mirrors_own_directory_is_never_part_of_a_root_level_home() {
+        // Home at the mount root: `.canvas-fuse` is a sibling of user files.
+        let dir = tempfile::tempdir().unwrap();
+        let l = Local::open(dir.path(), dir.path()).unwrap();
+        l.write_atomic("a.txt", b"a").unwrap();
+        l.trash_put("a.txt", "a.txt").unwrap();
+        assert!(dir.path().join(".canvas-fuse/trash/a.txt").is_file());
+        assert!(l.walk().is_empty());
+        assert!(l.walk_from(".canvas-fuse/trash").is_empty());
+        assert!(l.write_atomic(".canvas-fuse/trash/a.txt", b"no").is_err());
+        assert!(l.remove_file(".canvas-fuse/trash/a.txt").is_err());
+    }
+
+    #[test]
     fn keys_cannot_escape_the_folder() {
         let (_d, l) = local();
         assert!(l.write_atomic("../escape.txt", b"no").is_err());

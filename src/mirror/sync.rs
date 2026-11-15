@@ -2662,7 +2662,10 @@ impl Mirror {
     }
 
     fn end_downloads(&self) {
-        if let Some((progress, _)) = self.rt.lock().downloading.take() {
+        // Bound first: a guard in the `if let` scrutinee would still be held
+        // when write_status locks again.
+        let finished = self.rt.lock().downloading.take();
+        if let Some((progress, _)) = finished {
             log::info!("mirror: downloads done: {progress}");
             self.write_status(true);
         }

@@ -247,7 +247,7 @@ fn a_failed_local_trash_move_keeps_the_ledger_and_retries() {
     let r = rig(opts());
     r.hub.lock().put("Docs/a.txt", b"recoverable");
     r.mirror.cycle(true);
-    let blocker = r._dir.path().join("data/trash/Docs");
+    let blocker = r._dir.path().join("Home/.canvas-fuse/trash/Docs");
     std::fs::write(&blocker, b"not a directory").unwrap();
     r.hub.lock().delete("Docs/a.txt");
     r.mirror.cycle(false);
@@ -707,7 +707,7 @@ fn hub_delete_goes_to_trash_and_restore_pushes_as_new() {
     assert_eq!(trash[0].0, "keep.txt");
     assert!(r.home_read("keep.txt").is_none(), "gone from the folder");
     assert_eq!(
-        std::fs::read(r._dir.path().join("data/trash/keep.txt")).unwrap(),
+        std::fs::read(r._dir.path().join("Home/.canvas-fuse/trash/keep.txt")).unwrap(),
         b"precious",
         "bytes survive in the local trash"
     );

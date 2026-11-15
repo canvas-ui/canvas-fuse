@@ -213,6 +213,8 @@ fn protection_keeps_expired_trash_and_conflict_bytes_even_after_new_additions() 
         std::fs::read(m.local.trash_path("old.txt")).unwrap(),
         b"retained"
     );
+    // Paths resolve through the mirror's own directory fd: ask the new one.
+    let conflict_path = m.local.conflict_path(&sha_hex(b"conflict"));
     assert_eq!(std::fs::read(&conflict_path).unwrap(), b"conflict");
     hub.lock().put("old.txt", b"new remote file");
     settle(&m);
@@ -290,7 +292,7 @@ fn recovery_preview_is_read_only_and_push_keeps_remote_extras_with_conditional_u
         .iter()
         .all(|r| r.starts_with("GET ") || r.starts_with("HEAD ")));
     assert_eq!(
-        std::fs::read_dir(dir.path().join("data/uploads"))
+        std::fs::read_dir(dir.path().join("Home/.canvas-fuse/uploads"))
             .unwrap()
             .count(),
         0
